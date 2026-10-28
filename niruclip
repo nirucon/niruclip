@@ -1,7 +1,7 @@
 #!/bin/sh
 # NIRUCLIP — small X11 screen/webcam capture orchestrator.
 set -eu
-VERSION=0.1.8
+VERSION=0.1.9
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/niruclip"
 STATE="$STATE_DIR/session.json"
 OUTDIR="${NIRUCLIP_OUTPUT:-$HOME/Videos}"
@@ -54,8 +54,11 @@ if [ "$MODE" = region ] || [ "$MODE" = window ]; then
   geom=$(slop -f '%x %y %w %h' 2>/dev/null) || { echo 'niruclip: selection cancelled' >&2; exit 1; }
   set -- $geom; [ "$#" = 4 ] || exit 1; RX=$1; RY=$2; RW=$3; RH=$4
 else
-  RX=0; RY=0; RW=$(xrandr --current 2>/dev/null | awk '/ primary /{print $4; exit}' | cut -dx -f1); RH=$(xrandr --current 2>/dev/null | awk '/ primary /{print $4; exit}' | cut -dx -f2)
-  [ -n "${RW:-}" ] && [ -n "${RH:-}" ] || { echo 'niruclip: cannot determine X11 display size' >&2; exit 1; }
+  RX=0; RY=0
+  geometry=$(xrandr --current 2>/dev/null | awk '/ primary /{print $4; exit}')
+  [ -n "$geometry" ] || geometry=$(xrandr --current 2>/dev/null | awk '/ connected /{print $3; exit}')
+  RW=${geometry%%x*}; rest=${geometry#*x}; RH=${rest%%+*}
+  case "$RW$RH" in ''|*[!0-9]*) echo 'niruclip: cannot determine X11 display size' >&2; exit 1;; esac
 fi
 if [ -n "$OUTPUT" ]; then
   case "$OUTPUT" in */) mkdir -p "$OUTPUT"; final="$OUTPUT/NIRUCLIP-$(date +%F_%H-%M-%S).mkv";; *) final=$OUTPUT;; esac
@@ -105,8 +108,8 @@ import json,sys
 p,pid=sys.argv[1],int(sys.argv[2]); d=json.load(open(p)); d['pid']=pid; open(p,'w').write(json.dumps(d))
 PY
 printf 'NIRUCLIP recording: %s\n' "$final"
-wait "$pid"; rc=$?
-if [ "$rc" = 0 ] && [ -f "$partial" ]; then mv "$partial" "$final"; state=finished; else state=failed; fi
+if wait "$pid"; then rc=0; else rc=$?; fi
+case "$rc" in 0|129|130|143|255) if [ -f "$partial" ]; then mv "$partial" "$final"; state=finished; else state=failed; fi;; *) state=failed;; esac
 printf '%s' "$(python3 -c 'import json,sys,time; print(json.dumps({"state":sys.argv[1],"pid":0,"output":sys.argv[2],"partial":sys.argv[3],"mode":sys.argv[4],"preset":sys.argv[5],"audio":sys.argv[6],"webcam":sys.argv[7]}))' "$state" "$final" "$partial" "$MODE" "$PRESET" "$AUDIO" "$WEBCAM")" > "$STATE"
 [ "$state" = failed ] && printf 'NIRUCLIP: ffmpeg failed; partial retained at %s\n' "$partial" >&2 || :
 exit "$rc"
