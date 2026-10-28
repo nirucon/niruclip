@@ -9,7 +9,7 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const VERSION: &str = "0.2.0";
+const VERSION: &str = "0.2.1";
 const SCHEMA: u32 = 1;
 const ACTIVE_STATES: &[&str] = &["countdown", "starting", "recording", "finalizing"];
 const TERMINAL_STATES: &[&str] = &["finished", "failed", "interrupted", "cancelled", "idle"];
@@ -909,6 +909,57 @@ struct Plan {
     height: u32,
 }
 
+struct CameraControl {
+    device: String,
+    previous: Option<String>,
+}
+
+impl CameraControl {
+    fn apply(device: &str) -> Self {
+        let command = command_path("v4l2-ctl", "NIRUCLIP_V4L2CTL");
+        let previous = Command::new(&command)
+            .args(["--device", device, "--get-ctrl", "exposure_dynamic_framerate"])
+            .stdin(Stdio::null())
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .and_then(|output| {
+                String::from_utf8_lossy(&output.stdout)
+                    .split_once(':')
+                    .map(|(_, value)| value.trim().to_string())
+            })
+            .filter(|value| value == "0" || value == "1");
+        if previous.as_deref() != Some("0") {
+            let _ = Command::new(&command)
+                .args(["--device", device, "--set-ctrl", "exposure_dynamic_framerate=0"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        Self { device: device.to_string(), previous }
+    }
+}
+
+impl Drop for CameraControl {
+    fn drop(&mut self) {
+        if let Some(previous) = &self.previous {
+            let command = command_path("v4l2-ctl", "NIRUCLIP_V4L2CTL");
+            let _ = Command::new(&command)
+                .args([
+                    "--device",
+                    &self.device,
+                    "--set-ctrl",
+                    &format!("exposure_dynamic_framerate={previous}"),
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
+}
+
 fn capture_input(
     resolved: &Options,
     display: &str,
@@ -943,11 +994,11 @@ fn capture_input(
                 format!("{display}+{},{}", geometry.x, geometry.y),
             ]);
             if resolved.webcam == Webcam::Corner {
-                inputs.extend(["-f".into(), "v4l2".into(), "-i".into(), camera]);
+                inputs.extend(["-f".into(), "v4l2".into(), "-framerate".into(), "30".into(), "-i".into(), camera]);
             }
         }
         Mode::WebcamOnly => {
-            inputs.extend(["-f".into(), "v4l2".into(), "-i".into(), camera]);
+            inputs.extend(["-f".into(), "v4l2".into(), "-framerate".into(), "30".into(), "-i".into(), camera]);
         }
     }
     Ok((inputs, geometry))
@@ -1393,6 +1444,12 @@ fn run_recording(options: Options) -> Result<(), String> {
         None
     } else {
         Some(current_display()?)
+    };
+    let camera_device = std::env::var("NIRUCLIP_CAMERA").unwrap_or_else(|_| "/dev/video0".into());
+    let _camera_control = if options.mode == Mode::WebcamOnly || options.webcam != Webcam::Off {
+        Some(CameraControl::apply(&camera_device))
+    } else {
+        None
     };
     let requested = output_path(options.output.as_deref())?;
     let (output, partial) = unique_pair(&requested);

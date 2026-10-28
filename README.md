@@ -30,7 +30,7 @@ niruclip --recover
 | Countdown | `--countdown 0..10` |
 
 Camera size is a target share of the **final video width**. The camera is never
-upscaled beyond its native width. The default is `medium`. An overlay is placed
+upscaled beyond its native width. The camera is requested at 30 fps and dynamic exposure framerate is disabled during capture so a 30 fps screen overlay does not show a 15 fps camera. The default is `medium`. An overlay is placed
 16 pixels from the selected corner.
 
 `--full` and an overlay use the primary connected RandR output at its real X11
