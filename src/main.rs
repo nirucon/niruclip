@@ -9,7 +9,7 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const VERSION: &str = "0.2.1";
+const VERSION: &str = "0.2.2";
 const SCHEMA: u32 = 1;
 const ACTIVE_STATES: &[&str] = &["countdown", "starting", "recording", "finalizing"];
 const TERMINAL_STATES: &[&str] = &["finished", "failed", "interrupted", "cancelled", "idle"];
@@ -918,7 +918,12 @@ impl CameraControl {
     fn apply(device: &str) -> Self {
         let command = command_path("v4l2-ctl", "NIRUCLIP_V4L2CTL");
         let previous = Command::new(&command)
-            .args(["--device", device, "--get-ctrl", "exposure_dynamic_framerate"])
+            .args([
+                "--device",
+                device,
+                "--get-ctrl",
+                "exposure_dynamic_framerate",
+            ])
             .stdin(Stdio::null())
             .output()
             .ok()
@@ -931,13 +936,21 @@ impl CameraControl {
             .filter(|value| value == "0" || value == "1");
         if previous.as_deref() != Some("0") {
             let _ = Command::new(&command)
-                .args(["--device", device, "--set-ctrl", "exposure_dynamic_framerate=0"])
+                .args([
+                    "--device",
+                    device,
+                    "--set-ctrl",
+                    "exposure_dynamic_framerate=0",
+                ])
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status();
         }
-        Self { device: device.to_string(), previous }
+        Self {
+            device: device.to_string(),
+            previous,
+        }
     }
 }
 
@@ -994,11 +1007,25 @@ fn capture_input(
                 format!("{display}+{},{}", geometry.x, geometry.y),
             ]);
             if resolved.webcam == Webcam::Corner {
-                inputs.extend(["-f".into(), "v4l2".into(), "-framerate".into(), "30".into(), "-i".into(), camera]);
+                inputs.extend([
+                    "-f".into(),
+                    "v4l2".into(),
+                    "-framerate".into(),
+                    "30".into(),
+                    "-i".into(),
+                    camera,
+                ]);
             }
         }
         Mode::WebcamOnly => {
-            inputs.extend(["-f".into(), "v4l2".into(), "-framerate".into(), "30".into(), "-i".into(), camera]);
+            inputs.extend([
+                "-f".into(),
+                "v4l2".into(),
+                "-framerate".into(),
+                "30".into(),
+                "-i".into(),
+                camera,
+            ]);
         }
     }
     Ok((inputs, geometry))

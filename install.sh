@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-VERSION=0.2.1
+VERSION=0.2.2
 REPO=${NIRUCLIP_REPO:-nirucon/niruclip}
 PREFIX=${NIRUCLIP_PREFIX:-$HOME/.local}
 BINDIR=$PREFIX/bin
