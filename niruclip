@@ -105,5 +105,5 @@ printf 'NIRUCLIP recording: %s\n' "$final"
 wait "$pid"; rc=$?
 if [ "$rc" = 0 ] && [ -f "$partial" ]; then mv "$partial" "$final"; state=finished; else state=failed; fi
 printf '%s' "$(python3 -c 'import json,sys,time; print(json.dumps({"state":sys.argv[1],"pid":0,"output":sys.argv[2],"partial":sys.argv[3],"mode":sys.argv[4],"preset":sys.argv[5],"audio":sys.argv[6],"webcam":sys.argv[7]}))' "$state" "$final" "$partial" "$MODE" "$PRESET" "$AUDIO" "$WEBCAM")" > "$STATE"
-[ "$rc" = 0 ] || printf 'NIRUCLIP: ffmpeg failed; partial retained at %s\n' "$partial" >&2
+[ "$state" = failed ] && printf 'NIRUCLIP: ffmpeg failed; partial retained at %s\n' "$partial" >&2 || :
 exit "$rc"
