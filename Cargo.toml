@@ -1,0 +1,18 @@
+[package]
+name = "niruclip"
+version = "0.2.0"
+edition = "2021"
+rust-version = "1.77"
+license = "MIT"
+description = "Small X11 screen and camera recorder for NIRUX"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+libc = "0.2"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

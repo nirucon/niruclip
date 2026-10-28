@@ -1,0 +1,46 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: write
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+          components: clippy, rustfmt
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Verify release identity
+        run: |
+          version=$(awk -F '"' '/^version = / {print $2; exit}' Cargo.toml)
+          test "v$version" = "${GITHUB_REF_NAME}" || { echo "Cargo.toml is v$version, tag is $GITHUB_REF_NAME"; exit 1; }
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      - run: cargo build --release --locked --target x86_64-unknown-linux-musl
+      - name: Verify static binary and lifecycle
+        run: |
+          file target/x86_64-unknown-linux-musl/release/niruclip
+          if ldd target/x86_64-unknown-linux-musl/release/niruclip 2>&1 | grep -q '=>'; then
+            echo 'release binary is dynamically linked'; exit 1
+          fi
+          test "$(target/x86_64-unknown-linux-musl/release/niruclip --version)" = "NIRUCLIP $(awk -F '\"' '/^version = / {print $2; exit}' Cargo.toml)"
+          sh tests/lifecycle.sh target/x86_64-unknown-linux-musl/release/niruclip
+      - name: Package
+        run: |
+          mkdir dist
+          cp target/x86_64-unknown-linux-musl/release/niruclip dist/
+          cp install.sh dist/
+          (cd dist && sha256sum niruclip install.sh > SHA256SUMS)
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/niruclip
+            dist/install.sh
+            dist/SHA256SUMS
+          make_latest: true
+          generate_release_notes: true
