@@ -7,10 +7,13 @@ Small X11 screen, region and webcam recorder. Uses `ffmpeg` for capture and
 ```sh
 niruclip --full --audio mic --countdown 3
 niruclip --region --audio both --webcam off
+niruclip --full --webcam corner --corner bottom-right --webcam-size large
 niruclip --webcam-only --audio mic
 niruclip --stop
 niruclip --status
 ```
+
+Webcam overlay defaults to `medium` (30 % of output width); use `--webcam-size small|medium|large`.
 
 Default output: `~/Videos/NIRUCLIP-YYYY-MM-DD_HH-MM-SS.mkv`. MKV is written as a
 `.part.mkv` and renamed only after a clean ffmpeg exit; an interrupted recording

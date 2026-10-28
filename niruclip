@@ -5,7 +5,7 @@ VERSION=0.1.0
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/niruclip"
 STATE="$STATE_DIR/session.json"
 OUTDIR="${NIRUCLIP_OUTPUT:-$HOME/Videos}"
-MODE=full; AUDIO=mic; WEBCAM=off; CORNER=bottom-right; PRESET=share; COUNTDOWN=3; OUTPUT=""
+MODE=full; AUDIO=mic; WEBCAM=off; CORNER=bottom-right; PRESET=share; COUNTDOWN=3; OUTPUT=""; WEBCAM_SIZE=medium
 usage(){ printf '%s\n' "Usage: niruclip --full|--region|--window|--webcam-only [options]" "       niruclip --stop|--status|--version"; }
 if [ "${1:-}" = --stop ]; then
   [ -f "$STATE" ] || { echo 'niruclip: no active recording' >&2; exit 1; }
@@ -21,6 +21,7 @@ while [ "$#" -gt 0 ]; do
     --audio) shift; AUDIO=${1:?missing audio mode};;
     --webcam) shift; WEBCAM=${1:?missing webcam mode};;
     --corner) shift; CORNER=${1:?missing corner};;
+    --webcam-size) shift; WEBCAM_SIZE=${1:?missing webcam size};;
     --preset) shift; PRESET=${1:?missing preset};;
     --countdown) shift; COUNTDOWN=${1:?missing countdown};;
     --output) shift; OUTPUT=${1:?missing output};;
@@ -34,6 +35,7 @@ done
 case "$AUDIO" in none|mic|desktop|both);; *) echo 'niruclip: audio must be none, mic, desktop or both' >&2; exit 2;; esac
 case "$WEBCAM" in off|corner|only);; *) echo 'niruclip: webcam must be off, corner or only' >&2; exit 2;; esac
 case "$CORNER" in top-left|top-right|bottom-left|bottom-right);; *) echo 'niruclip: invalid corner' >&2; exit 2;; esac
+case "$WEBCAM_SIZE" in small|medium|large);; *) echo 'niruclip: webcam-size must be small, medium or large' >&2; exit 2;; esac
 case "$PRESET" in share|small|quality);; *) echo 'niruclip: invalid preset' >&2; exit 2;; esac
 case "$COUNTDOWN" in ''|*[!0-9]*) echo 'niruclip: countdown must be 0..10' >&2; exit 2;; esac
 [ "$COUNTDOWN" -le 10 ] || { echo 'niruclip: countdown must be 0..10' >&2; exit 2; }
@@ -75,7 +77,8 @@ if [ "$MODE" = webcam-only ] || [ "$WEBCAM" = only ]; then
 elif [ "$WEBCAM" = corner ]; then
   inputs="-f x11grab -framerate $rate -video_size ${RW}x${RH} -i :0.0+$RX,$RY -f v4l2 -i ${NIRUCLIP_CAMERA:-/dev/video0}"
   case "$CORNER" in top-left) ox=16; oy=16;; top-right) ox="main_w-overlay_w-16"; oy=16;; bottom-left) ox=16; oy="main_h-overlay_h-16";; *) ox="main_w-overlay_w-16"; oy="main_h-overlay_h-16";; esac
-  filter="[0:v]${scale}[base];[1:v]scale=iw*0.20:-2[wc];[base][wc]overlay=$ox:$oy[v]"; map="-map [v]"; audio_idx=2
+  case "$WEBCAM_SIZE" in small) webcam_scale=0.20;; medium) webcam_scale=0.30;; large) webcam_scale=0.40;; esac
+  filter="[0:v]${scale}[base];[1:v]scale=iw*$webcam_scale:-2[wc];[base][wc]overlay=$ox:$oy[v]"; map="-map [v]"; audio_idx=2
 else
   inputs="-f x11grab -framerate $rate -video_size ${RW}x${RH} -i :0.0+$RX,$RY"; map="-map 0:v:0"; audio_idx=1
 fi
