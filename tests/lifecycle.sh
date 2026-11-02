@@ -8,11 +8,16 @@ mkdir -p "$TMP/state" "$TMP/config" "$TMP/out"
 
 cat > "$TMP/ffmpeg-ok" <<'EOF'
 #!/bin/sh
-last=
-for arg in "$@"; do last=$arg; done
+last=; progress=; prev=
+for arg in "$@"; do
+  [ "$prev" = "-progress" ] && progress=$arg
+  prev=$arg
+  last=$arg
+done
 if [ -n "${FAKE_LOG:-}" ]; then printf '%s\n' "$@" > "$FAKE_LOG"; fi
 : > "$last"
 printf 'partial' >> "$last"
+[ -z "$progress" ] || printf 'frame=1\nfps=30.0\ndrop_frames=0\ndup_frames=0\nspeed=1.0x\nout_time_us=33333\nprogress=continue\n' > "$progress"
 trap 'exit 0' INT TERM
 sleep 30 &
 wait $!
@@ -27,12 +32,26 @@ exit 1
 EOF
 cat > "$TMP/ffmpeg-interrupt" <<'EOF'
 #!/bin/sh
+last=; progress=; prev=
+for arg in "$@"; do
+  [ "$prev" = "-progress" ] && progress=$arg
+  prev=$arg
+  last=$arg
+done
+: > "$last"
+printf 'partial' >> "$last"
+[ -z "$progress" ] || printf 'frame=1\nfps=30.0\ndrop_frames=0\ndup_frames=0\nspeed=1.0x\nout_time_us=33333\nprogress=continue\n' > "$progress"
+sleep 0.2
+exit 1
+EOF
+cat > "$TMP/ffmpeg-silent" <<'EOF'
+#!/bin/sh
 last=
 for arg in "$@"; do last=$arg; done
 : > "$last"
-printf 'partial' >> "$last"
-sleep 0.2
-exit 1
+trap 'exit 1' INT TERM
+sleep 30 &
+wait $!
 EOF
 cat > "$TMP/ffprobe" <<'EOF'
 #!/bin/sh
@@ -52,7 +71,7 @@ cat > "$TMP/slop" <<'EOF'
 #!/bin/sh
 printf '%s\n' '10 20 800 600'
 EOF
-chmod +x "$TMP"/ffmpeg-ok "$TMP"/ffmpeg-fail "$TMP"/ffmpeg-interrupt "$TMP"/ffprobe "$TMP"/xrandr "$TMP"/slop
+chmod +x "$TMP"/ffmpeg-ok "$TMP"/ffmpeg-fail "$TMP"/ffmpeg-interrupt "$TMP"/ffmpeg-silent "$TMP"/ffprobe "$TMP"/xrandr "$TMP"/slop
 
 common() {
   NIRUCLIP_STATE_DIR="$TMP/state" \
@@ -114,6 +133,14 @@ if common "$BIN" --recover >/dev/null 2>&1; then
   exit 1
 fi
 
+# A source that never delivers a frame is a clear failure, not a recording.
+if NIRUCLIP_FFMPEG="$TMP/ffmpeg-silent" common "$BIN" --webcam-only --audio none --countdown 0 --output "$TMP/out/silent.mkv" >/dev/null 2>&1; then
+  echo 'silent capture reported success' >&2
+  exit 1
+fi
+common "$BIN" --status --json | grep -q '"state": "failed"'
+common "$BIN" --status --json | grep -q 'capture produced no frames'
+
 # An interrupted valid partial is recoverable and --recover preserves it.
 if NIRUCLIP_FFMPEG="$TMP/ffmpeg-interrupt" common "$BIN" --webcam-only --audio none --countdown 0 --output "$TMP/out/interrupted.mkv" >/dev/null 2>&1; then
   echo 'interrupted recording reported success' >&2
@@ -140,6 +167,14 @@ grep -q 'min(iw,690)' "$TMP/args.log"
 grep -q '@DEFAULT_SOURCE@' "$TMP/args.log"
 grep -q '@DEFAULT_MONITOR@' "$TMP/args.log"
 grep -q 'amix=inputs=2' "$TMP/args.log"
+cam_line=$(grep -n '/dev/zero' "$TMP/args.log" | head -1 | cut -d: -f1)
+screen_line=$(grep -n ':0+0,0' "$TMP/args.log" | head -1 | cut -d: -f1)
+[ -n "$cam_line" ] && [ -n "$screen_line" ] && [ "$cam_line" -lt "$screen_line" ] || {
+  echo 'camera input was not opened before the screen input' >&2
+  exit 1
+}
+common "$BIN" --status --json | grep -q '"performance"'
+common "$BIN" --status --json | grep -q '"fps"'
 
 # Region uses the selected rectangle rather than a hardcoded display.
 export FAKE_LOG="$TMP/region.log"; NIRUCLIP_FFMPEG="$TMP/ffmpeg-ok" common "$BIN" --region --audio none --countdown 0 --output "$TMP/out/region.mkv" >/dev/null 2>&1 &

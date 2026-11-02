@@ -30,8 +30,7 @@ niruclip --recover
 | Countdown | `--countdown 0..10` |
 
 Camera size is a target share of the **final video width**. The camera is never
-upscaled beyond its native width. The camera is requested at 30 fps and dynamic exposure framerate is disabled during capture so a 30 fps screen overlay does not show a 15 fps camera. The default is `medium`. An overlay is placed
-16 pixels from the selected corner.
+upscaled beyond its native width. The camera is requested at 30 fps and dynamic exposure framerate is disabled during capture so a 30 fps screen overlay does not show a 15 fps camera. When a camera overlay is used, the camera input is opened before the screen input; the reverse order made FFmpeg drop or duplicate most frames on the tested laptops even though either source worked alone. The default is `medium`. An overlay is placed 16 pixels from the selected corner.
 
 `--full` and an overlay use the primary connected RandR output at its real X11
 origin. `--screen OUTPUT` chooses another connected output. `--region` asks for
@@ -59,7 +58,14 @@ next status/stop check does not signal a reused PID.
 
 State is stored at `${XDG_STATE_HOME:-$HOME/.local/state}/niruclip/session.json`
 and published atomically with schema version 1. NIRUBAR reads the same file and
-shows the active recording, an interrupted recovery, or a failure.
+shows the active recording, an interrupted recovery, or a failure. While
+recording, the state also carries an optional `performance` object with encoded
+frames, fps, dropped/duplicated frames and encoder speed. `niruclip --status`
+prints a warning when the captured stream is losing more than 2% frames or
+duplicating more than 5%; NIRUBAR shows the same warning in its recording
+detail. A recording is only announced as started after FFmpeg has produced its
+first frame, and a source that never delivers frames fails clearly instead of
+leaving a false "recording" state.
 
 ## Profiles and notifications
 

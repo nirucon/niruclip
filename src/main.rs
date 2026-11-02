@@ -9,7 +9,7 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const VERSION: &str = "0.2.2";
+const VERSION: &str = "0.2.3";
 const SCHEMA: u32 = 1;
 const ACTIVE_STATES: &[&str] = &["countdown", "starting", "recording", "finalizing"];
 const TERMINAL_STATES: &[&str] = &["finished", "failed", "interrupted", "cancelled", "idle"];
@@ -468,6 +468,103 @@ fn apply_profile(options: &mut Options, profile: &Profile) -> Result<(), String>
     Ok(())
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+struct Performance {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    frame: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fps: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    drop_frames: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dup_frames: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    speed: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    out_time_us: Option<u64>,
+}
+
+impl Performance {
+    fn has_frames(&self) -> bool {
+        self.frame.unwrap_or(0) > 0 || self.out_time_us.unwrap_or(0) > 0
+    }
+
+    fn needs_attention(&self) -> bool {
+        let frames = self.frame.unwrap_or(0);
+        let dropped = self.drop_frames.unwrap_or(0);
+        let duplicated = self.dup_frames.unwrap_or(0);
+        if frames == 0 {
+            return dropped > 0 || duplicated >= 10;
+        }
+        let frames = frames as f64;
+        dropped as f64 / frames > 0.02 || duplicated as f64 / frames > 0.05
+    }
+
+    fn summary(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(fps) = self.fps {
+            parts.push(format!("{fps:.1} fps"));
+        }
+        if let Some(dropped) = self.drop_frames {
+            parts.push(format!("{dropped} dropped"));
+        }
+        if let Some(duplicated) = self.dup_frames {
+            parts.push(format!("{duplicated} duplicated"));
+        }
+        if let Some(speed) = self.speed {
+            parts.push(format!("{speed:.2}x"));
+        }
+        parts.join(", ")
+    }
+}
+
+fn parse_progress(text: &str) -> Option<Performance> {
+    let mut performance = Performance::default();
+    for line in text.lines() {
+        let Some((key, value)) = line.trim().split_once('=') else {
+            continue;
+        };
+        match key {
+            "frame" => {
+                if let Ok(value) = value.parse() {
+                    performance.frame = Some(value);
+                }
+            }
+            "fps" => {
+                if let Ok(value) = value.parse() {
+                    performance.fps = Some(value);
+                }
+            }
+            "drop_frames" => {
+                if let Ok(value) = value.parse() {
+                    performance.drop_frames = Some(value);
+                }
+            }
+            "dup_frames" => {
+                if let Ok(value) = value.parse() {
+                    performance.dup_frames = Some(value);
+                }
+            }
+            "speed" => {
+                if let Ok(value) = value.trim_end_matches('x').parse() {
+                    performance.speed = Some(value);
+                }
+            }
+            "out_time_us" => {
+                if let Ok(value) = value.parse() {
+                    performance.out_time_us = Some(value);
+                }
+            }
+            _ => {}
+        }
+    }
+    performance.has_frames().then_some(performance)
+}
+
+fn read_progress(path: &Path) -> Option<Performance> {
+    parse_progress(&fs::read_to_string(path).ok()?)
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Session {
     schema: u32,
@@ -489,6 +586,8 @@ struct Session {
     width: u32,
     height: u32,
     recoverable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    performance: Option<Performance>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
 }
@@ -515,6 +614,7 @@ impl Session {
             width: 0,
             height: 0,
             recoverable: false,
+            performance: None,
             reason: None,
         }
     }
@@ -973,10 +1073,47 @@ impl Drop for CameraControl {
     }
 }
 
-fn capture_input(
-    resolved: &Options,
-    display: &str,
-) -> Result<(Vec<String>, Option<Geometry>), String> {
+struct CaptureInputs {
+    argv: Vec<String>,
+    geometry: Option<Geometry>,
+    screen_index: Option<usize>,
+    camera_index: Option<usize>,
+    audio_index: usize,
+}
+
+fn camera_input(camera: &str) -> Vec<String> {
+    [
+        "-thread_queue_size",
+        "32",
+        "-f",
+        "v4l2",
+        "-framerate",
+        "30",
+        "-i",
+        camera,
+    ]
+    .iter()
+    .map(|value| (*value).to_string())
+    .collect()
+}
+
+fn screen_input(display: &str, geometry: &Geometry) -> Vec<String> {
+    [
+        "-thread_queue_size".to_string(),
+        "8".to_string(),
+        "-f".to_string(),
+        "x11grab".to_string(),
+        "-framerate".to_string(),
+        "30".to_string(),
+        "-video_size".to_string(),
+        format!("{}x{}", geometry.width, geometry.height),
+        "-i".to_string(),
+        format!("{display}+{},{}", geometry.x, geometry.y),
+    ]
+    .to_vec()
+}
+
+fn capture_input(resolved: &Options, display: &str) -> Result<CaptureInputs, String> {
     let camera = std::env::var("NIRUCLIP_CAMERA").unwrap_or_else(|_| "/dev/video0".into());
     if resolved.mode == Mode::WebcamOnly || resolved.webcam != Webcam::Off {
         let metadata =
@@ -992,63 +1129,70 @@ fn capture_input(
     } else {
         Some(xrandr_geometry(resolved.screen.as_deref())?)
     };
-    let mut inputs = Vec::new();
+    let mut argv = Vec::new();
+    let mut screen_index = None;
+    let mut camera_index = None;
+    let mut video_inputs = 0usize;
     match resolved.mode {
         Mode::Full | Mode::Region | Mode::Window => {
-            let geometry = geometry.ok_or_else(|| "screen geometry is missing".to_string())?;
-            inputs.extend([
-                "-f".into(),
-                "x11grab".into(),
-                "-framerate".into(),
-                "30".into(),
-                "-video_size".into(),
-                format!("{}x{}", geometry.width, geometry.height),
-                "-i".into(),
-                format!("{display}+{},{}", geometry.x, geometry.y),
-            ]);
+            let geometry = geometry
+                .as_ref()
+                .ok_or_else(|| "screen geometry is missing".to_string())?;
             if resolved.webcam == Webcam::Corner {
-                inputs.extend([
-                    "-f".into(),
-                    "v4l2".into(),
-                    "-framerate".into(),
-                    "30".into(),
-                    "-i".into(),
-                    camera,
-                ]);
+                // The camera is opened first on purpose. With x11grab first,
+                // FFmpeg's two live inputs drift apart and the overlay path
+                // duplicates or drops most of the frame stream even though
+                // either source is fine on its own.
+                camera_index = Some(video_inputs);
+                video_inputs += 1;
+                argv.extend(camera_input(&camera));
             }
+            screen_index = Some(video_inputs);
+            video_inputs += 1;
+            argv.extend(screen_input(display, geometry));
         }
         Mode::WebcamOnly => {
-            inputs.extend([
-                "-f".into(),
-                "v4l2".into(),
-                "-framerate".into(),
-                "30".into(),
-                "-i".into(),
-                camera,
-            ]);
+            camera_index = Some(video_inputs);
+            video_inputs += 1;
+            argv.extend(camera_input(&camera));
         }
     }
-    Ok((inputs, geometry))
+    Ok(CaptureInputs {
+        argv,
+        geometry,
+        screen_index,
+        camera_index,
+        audio_index: video_inputs,
+    })
 }
 
-fn build_plan(resolved: &Options, display: &str, partial: &Path) -> Result<Plan, String> {
-    let (mut inputs, geometry) = capture_input(resolved, display)?;
+fn build_plan(
+    resolved: &Options,
+    display: &str,
+    partial: &Path,
+    progress: &Path,
+) -> Result<Plan, String> {
+    let capture = capture_input(resolved, display)?;
     let mut argv: Vec<String> = ["-hide_banner", "-loglevel", "warning", "-nostdin", "-n"]
         .iter()
         .map(|value| (*value).to_string())
         .collect();
-    argv.append(&mut inputs);
-    let screen = geometry.map(|geometry| {
+    // A plain "process is still alive" check cannot tell a working capture
+    // from a camera that has not delivered a single frame. FFmpeg writes
+    // machine-readable progress here; run_recording uses it for both startup
+    // confirmation and the live performance summary.
+    argv.extend([
+        "-progress".into(),
+        progress.display().to_string(),
+        "-stats_period".into(),
+        "0.5".into(),
+    ]);
+    argv.extend(capture.argv.iter().cloned());
+    let screen = capture.geometry.map(|geometry| {
         let (width, height) = scaled_screen(geometry.width, geometry.height, resolved.preset);
         (geometry, width, height)
     });
-    let video_index = 0;
-    let mut audio_index = if resolved.webcam == Webcam::Corner && resolved.mode != Mode::WebcamOnly
-    {
-        2
-    } else {
-        1
-    };
+    let audio_index = capture.audio_index;
     if resolved.audio == Audio::Mic
         || resolved.audio == Audio::Desktop
         || resolved.audio == Audio::Both
@@ -1074,45 +1218,48 @@ fn build_plan(resolved: &Options, display: &str, partial: &Path) -> Result<Plan,
     let width;
     let height;
     if resolved.mode == Mode::WebcamOnly {
+        let camera_index = capture
+            .camera_index
+            .ok_or_else(|| "camera input is missing".to_string())?;
         let max_width = resolved.preset.camera_max_width();
         filters.push(format!(
-            "[0:v]scale=w='trunc(min(iw,{max_width})/2)*2':h=-2:flags=bicubic,setsar=1[v]"
+            "[{camera_index}:v]scale=w='trunc(min(iw,{max_width})/2)*2':h=-2:flags=bicubic,setsar=1[v]"
         ));
         width = max_width;
         height = 0;
     } else {
+        let screen_index = capture
+            .screen_index
+            .ok_or_else(|| "screen input is missing".to_string())?;
         let (_, out_width, out_height) =
             screen.ok_or_else(|| "screen geometry is missing".to_string())?;
         width = out_width;
         height = out_height;
         if resolved.webcam == Webcam::Corner {
+            let camera_index = capture
+                .camera_index
+                .ok_or_else(|| "camera input is missing".to_string())?;
             let target = even(((out_width as f64) * resolved.webcam_size.factor()).round() as u32);
             let (x, y) = resolved.corner.overlay();
             filters.push(format!(
-                "[0:v]scale={out_width}:{out_height}:flags=bicubic,setsar=1[base]"
+                "[{screen_index}:v]scale={out_width}:{out_height}:flags=bicubic,setsar=1[base]"
             ));
             filters.push(format!(
-                "[1:v]scale=w='trunc(min(iw,{target})/2)*2':h=-2:flags=bicubic,setsar=1[wc]"
+                "[{camera_index}:v]scale=w='trunc(min(iw,{target})/2)*2':h=-2:flags=bicubic,setsar=1[wc]"
             ));
             filters.push(format!("[base][wc]overlay={x}:{y}:format=auto[v]"));
         } else {
             filters.push(format!(
-                "[{video_index}:v]scale={out_width}:{out_height}:flags=bicubic,setsar=1[v]"
+                "[{screen_index}:v]scale={out_width}:{out_height}:flags=bicubic,setsar=1[v]"
             ));
         }
     }
-    if resolved.webcam == Webcam::Corner && resolved.mode != Mode::WebcamOnly {
-        audio_index = 2;
-    }
     let has_audio = resolved.audio != Audio::None;
     if resolved.audio == Audio::Both {
-        let second = if audio_index == 1 { 2 } else { audio_index + 1 };
         filters.push(format!(
-            "[{audio_index}:a][{second}:a]amix=inputs=2:normalize=0[a]"
+            "[{audio_index}:a][{}:a]amix=inputs=2:normalize=0[a]",
+            audio_index + 1
         ));
-    }
-    if resolved.mode == Mode::WebcamOnly && resolved.audio == Audio::None {
-        filters.retain(|filter| !filter.starts_with("[0:a]"));
     }
     argv.extend([
         "-filter_complex".into(),
@@ -1379,6 +1526,17 @@ fn status(options: &Options) {
     if let Some(reason) = &session.reason {
         println!("reason: {reason}");
     }
+    if let Some(performance) = &session.performance {
+        let summary = performance.summary();
+        if !summary.is_empty() {
+            println!("performance: {summary}");
+        }
+        if performance.needs_attention() {
+            println!(
+                "warning: capture cannot keep up; try preset small or disable the camera overlay"
+            );
+        }
+    }
     if session.recoverable {
         println!("recovery: available (niruclip --recover)");
     }
@@ -1483,7 +1641,14 @@ fn run_recording(options: Options) -> Result<(), String> {
     if output.exists() || partial.exists() {
         return Err(format!("output already exists: {}", output.display()));
     }
-    let plan = build_plan(&options, display.as_deref().unwrap_or_default(), &partial)?;
+    let progress_path = state_dir().join("ffmpeg.progress");
+    let _ = fs::remove_file(&progress_path);
+    let plan = build_plan(
+        &options,
+        display.as_deref().unwrap_or_default(),
+        &partial,
+        &progress_path,
+    )?;
     let width = plan.width;
     let height = plan.height;
     let pid = std::process::id();
@@ -1507,6 +1672,7 @@ fn run_recording(options: Options) -> Result<(), String> {
         width,
         height,
         recoverable: false,
+        performance: None,
         reason: None,
     };
     write_state(&session)?;
@@ -1572,7 +1738,11 @@ fn run_recording(options: Options) -> Result<(), String> {
     session.child_pid = child.id();
     session.child_start = proc_start(child.id()).unwrap_or(0);
     write_state(&session)?;
-    let startup_deadline = Instant::now() + Duration::from_millis(300);
+    // "ffmpeg is alive" is not the same as "frames are arriving". Wait for
+    // encoded progress before announcing a recording, and fail clearly when a
+    // camera or screen source never delivers its first frame.
+    let startup_deadline = Instant::now() + Duration::from_secs(5);
+    let mut saw_frames = false;
     while Instant::now() < startup_deadline {
         if SIGNAL.load(Ordering::SeqCst) != 0 {
             break;
@@ -1594,7 +1764,45 @@ fn run_recording(options: Options) -> Result<(), String> {
             );
             return Err("ffmpeg exited during startup".into());
         }
+        if let Some(performance) = read_progress(&progress_path) {
+            if performance.has_frames() {
+                session.performance = Some(performance);
+                saw_frames = true;
+                break;
+            }
+        }
         std::thread::sleep(Duration::from_millis(50));
+    }
+    if SIGNAL.load(Ordering::SeqCst) == 0 && !saw_frames {
+        session.state = "finalizing".into();
+        let _ = write_state(&session);
+        signal_group(child.id(), libc::SIGINT);
+        let stop_deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < stop_deadline {
+            if child.try_wait().ok().flatten().is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if child.try_wait().ok().flatten().is_none() {
+            signal_group(child.id(), libc::SIGTERM);
+            std::thread::sleep(Duration::from_secs(1));
+            if child.try_wait().ok().flatten().is_none() {
+                signal_group(child.id(), libc::SIGKILL);
+            }
+        }
+        let _ = child.wait();
+        session.performance = read_progress(&progress_path);
+        let reason = "capture produced no frames; check the camera and screen source";
+        let recoverable = validate_media(&partial);
+        session.recoverable = recoverable;
+        finish_session(
+            &mut session,
+            if recoverable { "interrupted" } else { "failed" },
+            Some(reason.into()),
+        );
+        notify(&options, "NIRUCLIP", "Recording failed: no frames arrived");
+        return Err(reason.into());
     }
     if SIGNAL.load(Ordering::SeqCst) == 0 {
         session.state = "recording".into();
@@ -1610,6 +1818,12 @@ fn run_recording(options: Options) -> Result<(), String> {
             session.state = "finalizing".into();
             let _ = write_state(&session);
             signal_group(child.id(), libc::SIGINT);
+        }
+        if let Some(performance) = read_progress(&progress_path) {
+            if session.performance.as_ref() != Some(&performance) {
+                session.performance = Some(performance);
+                let _ = write_state(&session);
+            }
         }
         match child.try_wait() {
             Ok(Some(exit)) => {
@@ -1655,6 +1869,9 @@ fn run_recording(options: Options) -> Result<(), String> {
         }
         exit_status = child.wait().ok();
     }
+    if let Some(performance) = read_progress(&progress_path) {
+        session.performance = Some(performance);
+    }
     session.state = "finalizing".into();
     let _ = write_state(&session);
     let valid = validate_media(&partial);
@@ -1676,6 +1893,7 @@ fn run_recording(options: Options) -> Result<(), String> {
                     session.recoverable = false;
                     finish_session(&mut session, "finished", None);
                     let _ = fs::remove_file(state_dir().join("ffmpeg.log"));
+                    let _ = fs::remove_file(&progress_path);
                     notify(&options, "NIRUCLIP", &format!("Saved {}", output.display()));
                     println!("NIRUCLIP saved: {}", output.display());
                     return Ok(());
@@ -1940,6 +2158,27 @@ mod tests {
         assert!(valid_profile_name("min_profil.1"));
         assert!(!valid_profile_name("../escape"));
         assert!(!valid_profile_name("bad name"));
+    }
+
+    #[test]
+    fn progress_reports_frames_and_capture_health() {
+        let text = "frame=120\nfps=29.8\ndrop_frames=0\ndup_frames=0\nspeed=0.99x\nout_time_us=4000000\nprogress=continue\n";
+        let progress = parse_progress(text).unwrap();
+        assert_eq!(progress.frame, Some(120));
+        assert_eq!(progress.drop_frames, Some(0));
+        assert_eq!(progress.dup_frames, Some(0));
+        assert!(!progress.needs_attention());
+        assert!(progress.has_frames());
+    }
+
+    #[test]
+    fn progress_flags_a_stream_that_cannot_keep_up() {
+        let text = "frame=90\nfps=20.0\ndrop_frames=4\ndup_frames=55\nspeed=0.68x\nout_time_us=3000000\nprogress=continue\n";
+        let progress = parse_progress(text).unwrap();
+        assert!(progress.needs_attention());
+        assert!(progress.summary().contains("4 dropped"));
+        assert!(progress.summary().contains("55 duplicated"));
+        assert!(parse_progress("frame=0\nfps=0\nprogress=continue\n").is_none());
     }
 
     #[test]
