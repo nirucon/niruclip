@@ -28,6 +28,7 @@ niruclip --recover
 | Camera size | `--webcam-size small` (20%), `medium` (30%), `large` (40%) |
 | Preset | `--preset share` (up to 1080p), `small` (up to 720p), `quality` |
 | Countdown | `--countdown 0..10` |
+| Encoder | `--encoder auto` (default), `software`, `vaapi` |
 
 Camera size is a target share of the **final video width**. The camera is never
 upscaled beyond its native width. The camera is requested at 30 fps and dynamic exposure framerate is disabled during capture so a 30 fps screen overlay does not show a 15 fps camera. When a camera overlay is used, the camera input is opened before the screen input; the reverse order made FFmpeg drop or duplicate most frames on the tested laptops even though either source worked alone. The default is `medium`. An overlay is placed 16 pixels from the selected corner.
@@ -41,6 +42,22 @@ usable X11 screen geometry.
 The `share` and `small` presets avoid upscaling a smaller screen. `quality`
 keeps the screen dimensions, rounded down to even values. Camera-only capture
 is capped at 1920 pixels wide (1280 with `small`) and keeps the camera aspect.
+
+## Encoding
+
+`--encoder auto` (config key `encoder = "auto"` in `config.toml`) uses VAAPI
+(`h264_vaapi`) when a render node `/dev/dri/renderD*` exists **and** a one-frame
+synthetic probe encode succeeds within 3 seconds. The probe result is cached per
+boot, ffmpeg binary and render node in `${XDG_STATE_HOME}/niruclip/vaapi-probe.json`.
+VAAPI uses constant QP mapped from the preset (`share` 25, `small` 30,
+`quality` 22). `software` always uses `libx264 -preset veryfast` with the
+preset CRF (23/28/20). `vaapi` skips the probe but still needs a render node;
+`NIRUCLIP_VAAPI_DEVICE` selects a node explicitly.
+
+Software encoding is the guaranteed fallback: when the hardware encoder stops
+before the first frame, NIRUCLIP retries once in software, marks that node as
+failed for the rest of the boot, and records `encoder` and `fallback` in the
+state and the start notification. `--status` shows the encoder in use.
 
 ## Output and recovery
 

@@ -8,13 +8,25 @@ mkdir -p "$TMP/state" "$TMP/config" "$TMP/out"
 
 cat > "$TMP/ffmpeg-ok" <<'EOF'
 #!/bin/sh
-last=; progress=; prev=
+last=; progress=; prev=; vaapi=
 for arg in "$@"; do
   [ "$prev" = "-progress" ] && progress=$arg
+  [ "$arg" = "h264_vaapi" ] && vaapi=1
   prev=$arg
   last=$arg
 done
+# The one-frame VAAPI probe writes to the null muxer ("-").
+if [ "$last" = "-" ]; then
+  [ -z "${FAKE_PROBE_COUNT:-}" ] || printf 'probe\n' >> "$FAKE_PROBE_COUNT"
+  [ "${FAKE_VAAPI_PROBE:-fail}" = ok ] && exit 0
+  exit 1
+fi
 if [ -n "${FAKE_LOG:-}" ]; then printf '%s\n' "$@" > "$FAKE_LOG"; fi
+if [ -n "$vaapi" ] && [ "${FAKE_VAAPI_RUNTIME:-ok}" = fail ]; then
+  echo 'Failed to initialise VAAPI connection' >&2
+  : > "$last"
+  exit 1
+fi
 : > "$last"
 printf 'partial' >> "$last"
 [ -z "$progress" ] || printf 'frame=1\nfps=30.0\ndrop_frames=0\ndup_frames=0\nspeed=1.0x\nout_time_us=33333\nprogress=continue\n' > "$progress"
@@ -81,6 +93,7 @@ common() {
   NIRUCLIP_SLOP="$TMP/slop" \
   NIRUCLIP_FFPROBE="$TMP/ffprobe" \
   NIRUCLIP_NOTIFY=0 \
+  NIRUCLIP_VAAPI_DEVICE="${FAKE_RENDER_NODE:-$TMP/no-render-node}" \
   DISPLAY=:0 \
   "$@"
 }
@@ -184,6 +197,79 @@ common "$BIN" --stop >/dev/null
 wait "$pid"
 grep -q '800x600' "$TMP/region.log"
 grep -q ':0+10,20' "$TMP/region.log"
+
+# C1: auto selects VAAPI when a render node exists and the probe succeeds,
+# and the probe result is cached for the boot.
+touch "$TMP/renderD128" "$TMP/renderD129" "$TMP/renderD130"
+export FAKE_PROBE_COUNT="$TMP/probe.count"
+export FAKE_LOG="$TMP/vaapi.log"
+FAKE_RENDER_NODE="$TMP/renderD128" FAKE_VAAPI_PROBE=ok NIRUCLIP_FFMPEG="$TMP/ffmpeg-ok" common "$BIN" --full --audio none --countdown 0 --output "$TMP/out/vaapi.mkv" >/dev/null 2>&1 &
+pid=$!
+wait_state recording
+common "$BIN" --status --json | grep -q '"encoder": "vaapi"'
+common "$BIN" --status | grep -q '^encoder: vaapi'
+common "$BIN" --stop >/dev/null
+wait "$pid"
+[ -s "$TMP/out/vaapi.mkv" ]
+grep -q '^h264_vaapi$' "$TMP/vaapi.log"
+grep -q '^-vaapi_device$' "$TMP/vaapi.log"
+grep -q "^$TMP/renderD128\$" "$TMP/vaapi.log"
+grep -q 'format=nv12,hwupload\[v\]' "$TMP/vaapi.log"
+grep -q '^CQP$' "$TMP/vaapi.log"
+if grep -q 'libx264' "$TMP/vaapi.log"; then echo 'VAAPI plan still used libx264' >&2; exit 1; fi
+[ "$(wc -l < "$FAKE_PROBE_COUNT")" -eq 1 ]
+FAKE_RENDER_NODE="$TMP/renderD128" FAKE_VAAPI_PROBE=ok NIRUCLIP_FFMPEG="$TMP/ffmpeg-ok" common "$BIN" --full --audio none --countdown 0 --output "$TMP/out/vaapi-cached.mkv" >/dev/null 2>&1 &
+pid=$!
+wait_state recording
+common "$BIN" --stop >/dev/null
+wait "$pid"
+[ "$(wc -l < "$FAKE_PROBE_COUNT")" -eq 1 ] || { echo 'VAAPI probe was not cached' >&2; exit 1; }
+grep -q '^h264_vaapi$' "$TMP/vaapi.log"
+
+# C1: a failed probe records in software and says why.
+FAKE_RENDER_NODE="$TMP/renderD129" FAKE_VAAPI_PROBE=fail NIRUCLIP_FFMPEG="$TMP/ffmpeg-ok" common "$BIN" --full --audio none --countdown 0 --output "$TMP/out/probe-failed.mkv" >/dev/null 2>&1 &
+pid=$!
+wait_state recording
+common "$BIN" --status --json | grep -q '"encoder": "software"'
+common "$BIN" --status --json | grep -q '"fallback": "VAAPI probe failed"'
+common "$BIN" --stop >/dev/null
+wait "$pid"
+[ -s "$TMP/out/probe-failed.mkv" ]
+grep -q '^libx264$' "$TMP/vaapi.log"
+if grep -q 'vaapi' "$TMP/vaapi.log"; then echo 'software plan mentions VAAPI' >&2; exit 1; fi
+
+# C1: no render node means plain software without a fallback note, and
+# --encoder software never probes.
+NIRUCLIP_FFMPEG="$TMP/ffmpeg-ok" common "$BIN" --full --audio none --countdown 0 --output "$TMP/out/no-node.mkv" >/dev/null 2>&1 &
+pid=$!
+wait_state recording
+common "$BIN" --status --json | grep -q '"encoder": "software"'
+if common "$BIN" --status --json | grep -q '"fallback"'; then echo 'no render node reported a fallback' >&2; exit 1; fi
+common "$BIN" --stop >/dev/null
+wait "$pid"
+probes=$(wc -l < "$FAKE_PROBE_COUNT")
+FAKE_RENDER_NODE="$TMP/renderD130" FAKE_VAAPI_PROBE=ok NIRUCLIP_FFMPEG="$TMP/ffmpeg-ok" common "$BIN" --full --audio none --encoder software --countdown 0 --output "$TMP/out/forced-sw.mkv" >/dev/null 2>&1 &
+pid=$!
+wait_state recording
+common "$BIN" --stop >/dev/null
+wait "$pid"
+[ "$(wc -l < "$FAKE_PROBE_COUNT")" -eq "$probes" ]
+grep -q '^libx264$' "$TMP/vaapi.log"
+
+# C1: a VAAPI encoder that fails before the first frame is retried once in
+# software; the recording succeeds and the fallback is recorded and cached.
+FAKE_RENDER_NODE="$TMP/renderD130" FAKE_VAAPI_PROBE=ok FAKE_VAAPI_RUNTIME=fail NIRUCLIP_FFMPEG="$TMP/ffmpeg-ok" common "$BIN" --full --audio none --countdown 0 --output "$TMP/out/retry.mkv" >/dev/null 2>&1 &
+pid=$!
+wait_state recording
+common "$BIN" --status --json | grep -q '"encoder": "software"'
+common "$BIN" --status --json | grep -q '"fallback": "h264_vaapi on '
+common "$BIN" --stop >/dev/null
+wait "$pid"
+[ -s "$TMP/out/retry.mkv" ]
+[ ! -e "$TMP/out/retry.part.mkv" ]
+grep -q '^libx264$' "$TMP/vaapi.log"
+grep -q "\"$TMP/renderD130\":false" "$TMP/state/vaapi-probe.json"
+unset FAKE_PROBE_COUNT FAKE_LOG
 
 # Profiles are listable, saveable and apply the camera-only mode.
 common "$BIN" --list-profiles | grep -q '^camera-mic'

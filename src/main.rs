@@ -227,6 +227,41 @@ impl Preset {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EncoderChoice {
+    Auto,
+    Software,
+    Vaapi,
+}
+
+impl EncoderChoice {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            "software" => Ok(Self::Software),
+            "vaapi" => Ok(Self::Vaapi),
+            _ => Err(format!("encoder must be auto, software or vaapi: {value}")),
+        }
+    }
+}
+
+/// The encoder a capture actually uses. Software (libx264) is always
+/// available and is the guaranteed fallback for every hardware failure.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Encoder {
+    Software,
+    Vaapi(String),
+}
+
+impl Encoder {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Software => "software",
+            Self::Vaapi(_) => "vaapi",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct Options {
     mode: Mode,
@@ -235,6 +270,7 @@ struct Options {
     corner: Corner,
     webcam_size: Size,
     preset: Preset,
+    encoder: EncoderChoice,
     countdown: u64,
     output: Option<PathBuf>,
     screen: Option<String>,
@@ -259,6 +295,7 @@ impl Default for Options {
             corner: Corner::BottomRight,
             webcam_size: Size::Medium,
             preset: Preset::Share,
+            encoder: EncoderChoice::Auto,
             countdown: 3,
             output: None,
             screen: None,
@@ -304,6 +341,9 @@ struct Config {
     schema: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     default_profile: Option<String>,
+    /// `auto` (default), `software` or `vaapi`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    encoder: Option<String>,
     #[serde(default)]
     profiles: BTreeMap<String, Profile>,
 }
@@ -313,6 +353,7 @@ impl Config {
         let mut config = Self {
             schema: 1,
             default_profile: None,
+            encoder: None,
             profiles: BTreeMap::new(),
         };
         for (name, profile) in builtin_profiles() {
@@ -332,6 +373,7 @@ impl Config {
                 ));
             }
             config.default_profile = loaded.default_profile;
+            config.encoder = loaded.encoder;
             config.profiles.extend(loaded.profiles);
         }
         Ok(config)
@@ -590,6 +632,12 @@ struct Session {
     performance: Option<Performance>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
+    /// `software` or `vaapi`: the encoder that is producing the file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    encoder: Option<String>,
+    /// Why a requested or detected hardware encoder was not used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fallback: Option<String>,
 }
 
 impl Session {
@@ -616,6 +664,8 @@ impl Session {
             recoverable: false,
             performance: None,
             reason: None,
+            encoder: None,
+            fallback: None,
         }
     }
 
@@ -1166,17 +1216,206 @@ fn capture_input(resolved: &Options, display: &str) -> Result<CaptureInputs, Str
     })
 }
 
+/// Render nodes that may carry a VAAPI encoder, in a stable order.
+/// `NIRUCLIP_VAAPI_DEVICE` selects one explicitly (and lets tests point at a
+/// fixture); a path that does not exist means "no render node".
+fn render_nodes() -> Vec<String> {
+    if let Some(device) = std::env::var_os("NIRUCLIP_VAAPI_DEVICE") {
+        let device = PathBuf::from(device);
+        return if device.exists() {
+            vec![device.display().to_string()]
+        } else {
+            Vec::new()
+        };
+    }
+    let mut nodes: Vec<String> = fs::read_dir("/dev/dri")
+        .map(|entries| {
+            entries
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| entry.file_name().to_string_lossy().starts_with("renderD"))
+                .filter(|entry| {
+                    entry
+                        .file_type()
+                        .map(|kind| kind.is_char_device())
+                        .unwrap_or(false)
+                })
+                .map(|entry| entry.path().display().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    nodes.sort();
+    nodes
+}
+
+fn boot_id() -> String {
+    fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .map(|text| text.trim().to_string())
+        .unwrap_or_default()
+}
+
+/// One VAAPI probe result per boot, ffmpeg binary and render node. A driver
+/// or ffmpeg change normally comes with a reboot or a different binary path.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct ProbeCache {
+    schema: u32,
+    boot_id: String,
+    ffmpeg: String,
+    #[serde(default)]
+    devices: BTreeMap<String, bool>,
+}
+
+fn probe_cache_path() -> PathBuf {
+    state_dir().join("vaapi-probe.json")
+}
+
+fn read_probe_cache(ffmpeg: &str) -> ProbeCache {
+    let boot = boot_id();
+    fs::read_to_string(probe_cache_path())
+        .ok()
+        .and_then(|text| serde_json::from_str::<ProbeCache>(&text).ok())
+        .filter(|cache| cache.schema == 1 && cache.boot_id == boot && cache.ffmpeg == ffmpeg)
+        .unwrap_or(ProbeCache {
+            schema: 1,
+            boot_id: boot,
+            ffmpeg: ffmpeg.to_string(),
+            devices: BTreeMap::new(),
+        })
+}
+
+fn store_probe_result(ffmpeg: &str, device: &str, ok: bool) {
+    let mut cache = read_probe_cache(ffmpeg);
+    cache.devices.insert(device.to_string(), ok);
+    if let Ok(text) = serde_json::to_vec(&cache) {
+        let _ = write_atomic(&probe_cache_path(), &text);
+    }
+}
+
+/// A one-frame synthetic encode with a 3 s deadline. It touches no capture
+/// device and writes nothing to disk.
+fn probe_vaapi(ffmpeg: &str, device: &str) -> bool {
+    let child = Command::new(ffmpeg)
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-vaapi_device",
+            device,
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=256x144:rate=30",
+            "-frames:v",
+            "1",
+            "-vf",
+            "format=nv12,hwupload",
+            "-c:v",
+            "h264_vaapi",
+            "-f",
+            "null",
+            "-",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn();
+    let Ok(mut child) = child else {
+        return false;
+    };
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+            _ => {
+                signal_group(child.id(), libc::SIGKILL);
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+}
+
+struct EncoderSelection {
+    encoder: Encoder,
+    fallback: Option<String>,
+}
+
+fn select_encoder(choice: EncoderChoice, ffmpeg: &str) -> EncoderSelection {
+    let software = |fallback: Option<&str>| EncoderSelection {
+        encoder: Encoder::Software,
+        fallback: fallback.map(str::to_string),
+    };
+    match choice {
+        EncoderChoice::Software => software(None),
+        EncoderChoice::Vaapi => match render_nodes().into_iter().next() {
+            // Forced VAAPI skips the probe; the first-frame retry still
+            // guarantees a software recording if the encoder fails.
+            Some(device) => EncoderSelection {
+                encoder: Encoder::Vaapi(device),
+                fallback: None,
+            },
+            None => software(Some("no VAAPI render node")),
+        },
+        EncoderChoice::Auto => {
+            let nodes = render_nodes();
+            if nodes.is_empty() {
+                // Expected on hosts without a GPU: not a fallback worth reporting.
+                return software(None);
+            }
+            let cache = read_probe_cache(ffmpeg);
+            for device in &nodes {
+                let ok = match cache.devices.get(device) {
+                    Some(ok) => *ok,
+                    None => {
+                        let ok = probe_vaapi(ffmpeg, device);
+                        store_probe_result(ffmpeg, device, ok);
+                        ok
+                    }
+                };
+                if ok {
+                    return EncoderSelection {
+                        encoder: Encoder::Vaapi(device.clone()),
+                        fallback: None,
+                    };
+                }
+            }
+            software(Some("VAAPI probe failed"))
+        }
+    }
+}
+
+impl Preset {
+    /// Constant QP for h264_vaapi, chosen a little above the libx264 CRF
+    /// because CQP has no psycho-visual tuning; sizes stay comparable.
+    fn vaapi_qp(self) -> &'static str {
+        match self {
+            Self::Share => "25",
+            Self::Small => "30",
+            Self::Quality => "22",
+        }
+    }
+}
+
 fn build_plan(
     resolved: &Options,
-    display: &str,
+    capture: &CaptureInputs,
     partial: &Path,
     progress: &Path,
+    encoder: &Encoder,
 ) -> Result<Plan, String> {
-    let capture = capture_input(resolved, display)?;
     let mut argv: Vec<String> = ["-hide_banner", "-loglevel", "warning", "-nostdin", "-n"]
         .iter()
         .map(|value| (*value).to_string())
         .collect();
+    if let Encoder::Vaapi(device) = encoder {
+        argv.extend(["-vaapi_device".into(), device.clone()]);
+    }
+    // With VAAPI the filters end in [vsrc] and an upload tail produces [v];
+    // the software graph is unchanged.
+    let vaapi = matches!(encoder, Encoder::Vaapi(_));
+    let vout = if vaapi { "vsrc" } else { "v" };
     // A plain "process is still alive" check cannot tell a working capture
     // from a camera that has not delivered a single frame. FFmpeg writes
     // machine-readable progress here; run_recording uses it for both startup
@@ -1223,7 +1462,7 @@ fn build_plan(
             .ok_or_else(|| "camera input is missing".to_string())?;
         let max_width = resolved.preset.camera_max_width();
         filters.push(format!(
-            "[{camera_index}:v]scale=w='trunc(min(iw,{max_width})/2)*2':h=-2:flags=bicubic,setsar=1[v]"
+            "[{camera_index}:v]scale=w='trunc(min(iw,{max_width})/2)*2':h=-2:flags=bicubic,setsar=1[{vout}]"
         ));
         width = max_width;
         height = 0;
@@ -1247,12 +1486,15 @@ fn build_plan(
             filters.push(format!(
                 "[{camera_index}:v]scale=w='trunc(min(iw,{target})/2)*2':h=-2:flags=bicubic,setsar=1[wc]"
             ));
-            filters.push(format!("[base][wc]overlay={x}:{y}:format=auto[v]"));
+            filters.push(format!("[base][wc]overlay={x}:{y}:format=auto[{vout}]"));
         } else {
             filters.push(format!(
-                "[{screen_index}:v]scale={out_width}:{out_height}:flags=bicubic,setsar=1[v]"
+                "[{screen_index}:v]scale={out_width}:{out_height}:flags=bicubic,setsar=1[{vout}]"
             ));
         }
+    }
+    if vaapi {
+        filters.push("[vsrc]format=nv12,hwupload[v]".to_string());
     }
     let has_audio = resolved.audio != Audio::None;
     if resolved.audio == Audio::Both {
@@ -1272,18 +1514,31 @@ fn build_plan(
     } else if has_audio {
         argv.extend(["-map".into(), format!("{audio_index}:a:0")]);
     }
-    argv.extend([
-        "-c:v".into(),
-        "libx264".into(),
-        "-preset".into(),
-        "veryfast".into(),
-        "-crf".into(),
-        resolved.preset.crf().into(),
-        "-r".into(),
-        "30".into(),
-        "-pix_fmt".into(),
-        "yuv420p".into(),
-    ]);
+    if vaapi {
+        argv.extend([
+            "-c:v".into(),
+            "h264_vaapi".into(),
+            "-rc_mode".into(),
+            "CQP".into(),
+            "-qp".into(),
+            resolved.preset.vaapi_qp().into(),
+            "-r".into(),
+            "30".into(),
+        ]);
+    } else {
+        argv.extend([
+            "-c:v".into(),
+            "libx264".into(),
+            "-preset".into(),
+            "veryfast".into(),
+            "-crf".into(),
+            resolved.preset.crf().into(),
+            "-r".into(),
+            "30".into(),
+            "-pix_fmt".into(),
+            "yuv420p".into(),
+        ]);
+    }
     if has_audio {
         argv.extend(["-c:a".into(), "aac".into(), "-b:a".into(), "160k".into()]);
     }
@@ -1378,6 +1633,9 @@ fn chrono_stamp() -> String {
 
 fn parse_args(argv: &[String], config: &Config) -> Result<Options, String> {
     let mut options = Options::default();
+    if let Some(value) = &config.encoder {
+        options.encoder = EncoderChoice::parse(value)?;
+    }
     let profile_name = argv
         .windows(2)
         .find(|pair| pair[0] == "--profile")
@@ -1430,6 +1688,10 @@ fn parse_args(argv: &[String], config: &Config) -> Result<Options, String> {
             }
             "--preset" => {
                 options.preset = Preset::parse(&next()?)?;
+                index += 1;
+            }
+            "--encoder" => {
+                options.encoder = EncoderChoice::parse(&next()?)?;
                 index += 1;
             }
             "--countdown" => {
@@ -1495,6 +1757,7 @@ Options:\n\
   --corner top-left|top-right|bottom-left|bottom-right\n\
   --webcam-size small|medium|large  target share of final video width\n\
   --preset share|small|quality\n\
+  --encoder auto|software|vaapi     auto uses VAAPI when a probe succeeds\n\
   --countdown 0..10\n\
   --output PATH                     existing file or directory\n\
   --screen OUTPUT                   connected RandR output for full/overlay\n\
@@ -1525,6 +1788,12 @@ fn status(options: &Options) {
     }
     if let Some(reason) = &session.reason {
         println!("reason: {reason}");
+    }
+    if let Some(encoder) = &session.encoder {
+        println!("encoder: {encoder}");
+    }
+    if let Some(fallback) = &session.fallback {
+        println!("fallback: {fallback}");
     }
     if let Some(performance) = &session.performance {
         let summary = performance.summary();
@@ -1643,11 +1912,15 @@ fn run_recording(options: Options) -> Result<(), String> {
     }
     let progress_path = state_dir().join("ffmpeg.progress");
     let _ = fs::remove_file(&progress_path);
-    let plan = build_plan(
+    let capture = capture_input(&options, display.as_deref().unwrap_or_default())?;
+    let ffmpeg = command_path("ffmpeg", "NIRUCLIP_FFMPEG");
+    let mut selection = select_encoder(options.encoder, &ffmpeg);
+    let mut plan = build_plan(
         &options,
-        display.as_deref().unwrap_or_default(),
+        &capture,
         &partial,
         &progress_path,
+        &selection.encoder,
     )?;
     let width = plan.width;
     let height = plan.height;
@@ -1674,6 +1947,8 @@ fn run_recording(options: Options) -> Result<(), String> {
         recoverable: false,
         performance: None,
         reason: None,
+        encoder: Some(selection.encoder.as_str().into()),
+        fallback: selection.fallback.clone(),
     };
     write_state(&session)?;
     if options.countdown > 0 {
@@ -1713,41 +1988,67 @@ fn run_recording(options: Options) -> Result<(), String> {
         println!("NIRUCLIP countdown cancelled");
         return Ok(());
     }
-    let log_path = state_dir().join("ffmpeg.log");
-    let log = File::create(&log_path)
-        .map_err(|error| format!("could not create {}: {error}", log_path.display()))?;
-    let mut command = Command::new(command_path("ffmpeg", "NIRUCLIP_FFMPEG"));
-    command
-        .args(&plan.argv)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(log));
-    command.process_group(0);
-    let mut child = match command.spawn() {
+    let mut child = match spawn_ffmpeg(&ffmpeg, &plan.argv) {
         Ok(child) => child,
         Err(error) => {
-            finish_session(
-                &mut session,
-                "failed",
-                Some(format!("could not start ffmpeg: {error}")),
-            );
-            return Err(format!("could not start ffmpeg: {error}"));
+            finish_session(&mut session, "failed", Some(error.clone()));
+            return Err(error);
         }
     };
     session.state = "starting".into();
     session.child_pid = child.id();
     session.child_start = proc_start(child.id()).unwrap_or(0);
     write_state(&session)?;
-    // "ffmpeg is alive" is not the same as "frames are arriving". Wait for
-    // encoded progress before announcing a recording, and fail clearly when a
-    // camera or screen source never delivers its first frame.
-    let startup_deadline = Instant::now() + Duration::from_secs(5);
-    let mut saw_frames = false;
-    while Instant::now() < startup_deadline {
-        if SIGNAL.load(Ordering::SeqCst) != 0 {
-            break;
+    let mut startup = wait_first_frame(&mut child, &progress_path);
+    if let (Startup::Exited(status), Encoder::Vaapi(device)) = (&startup, &selection.encoder) {
+        // Hardware encoding must never turn a working recording into a
+        // failed one: a VAAPI encoder that dies before the first frame is
+        // retried exactly once with libx264, and the reason is recorded.
+        if !validate_media(&partial) {
+            let detail = log_tail().unwrap_or_else(|| "no ffmpeg output".into());
+            let reason = format!(
+                "h264_vaapi on {device} failed before the first frame ({status}): {detail}"
+            );
+            let reason: String = reason.chars().take(600).collect();
+            eprintln!("niruclip: {reason}; retrying with software encoding");
+            if options.encoder == EncoderChoice::Auto {
+                store_probe_result(&ffmpeg, device, false);
+            }
+            let _ = fs::remove_file(&partial);
+            let _ = fs::remove_file(&progress_path);
+            selection = EncoderSelection {
+                encoder: Encoder::Software,
+                fallback: Some(reason),
+            };
+            plan = build_plan(
+                &options,
+                &capture,
+                &partial,
+                &progress_path,
+                &selection.encoder,
+            )?;
+            session.encoder = Some(selection.encoder.as_str().into());
+            session.fallback = selection.fallback.clone();
+            child = match spawn_ffmpeg(&ffmpeg, &plan.argv) {
+                Ok(child) => child,
+                Err(error) => {
+                    finish_session(&mut session, "failed", Some(error.clone()));
+                    return Err(error);
+                }
+            };
+            session.child_pid = child.id();
+            session.child_start = proc_start(child.id()).unwrap_or(0);
+            write_state(&session)?;
+            startup = wait_first_frame(&mut child, &progress_path);
         }
-        if let Ok(Some(status)) = child.try_wait() {
+    }
+    let saw_frames = match startup {
+        Startup::Frames(performance) => {
+            session.performance = Some(performance);
+            true
+        }
+        Startup::Signalled | Startup::NoFrames => false,
+        Startup::Exited(status) => {
             if validate_media(&partial) {
                 session.recoverable = true;
                 finish_session(
@@ -1764,15 +2065,7 @@ fn run_recording(options: Options) -> Result<(), String> {
             );
             return Err("ffmpeg exited during startup".into());
         }
-        if let Some(performance) = read_progress(&progress_path) {
-            if performance.has_frames() {
-                session.performance = Some(performance);
-                saw_frames = true;
-                break;
-            }
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    };
     if SIGNAL.load(Ordering::SeqCst) == 0 && !saw_frames {
         session.state = "finalizing".into();
         let _ = write_state(&session);
@@ -1807,7 +2100,7 @@ fn run_recording(options: Options) -> Result<(), String> {
     if SIGNAL.load(Ordering::SeqCst) == 0 {
         session.state = "recording".into();
         write_state(&session)?;
-        notify(&options, "NIRUCLIP", "Recording started");
+        notify(&options, "NIRUCLIP", &started_message(&session));
         eprintln!("NIRUCLIP recording: {}", output.display());
     }
     let mut requested_stop = false;
@@ -1927,6 +2220,59 @@ fn run_recording(options: Options) -> Result<(), String> {
         "Recording failed; see niruclip --status",
     );
     Err("recording failed; no usable video was produced".into())
+}
+
+fn started_message(session: &Session) -> String {
+    match (session.encoder.as_deref(), session.fallback.as_deref()) {
+        (Some("vaapi"), _) => "Recording started (VAAPI hardware encoding)".into(),
+        (_, Some(_)) => "Recording started (software encoding; VAAPI unavailable)".into(),
+        _ => "Recording started".into(),
+    }
+}
+
+fn spawn_ffmpeg(ffmpeg: &str, argv: &[String]) -> Result<std::process::Child, String> {
+    let log_path = state_dir().join("ffmpeg.log");
+    let log = File::create(&log_path)
+        .map_err(|error| format!("could not create {}: {error}", log_path.display()))?;
+    let mut command = Command::new(ffmpeg);
+    command
+        .args(argv)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(log));
+    command.process_group(0);
+    command
+        .spawn()
+        .map_err(|error| format!("could not start ffmpeg: {error}"))
+}
+
+enum Startup {
+    Frames(Performance),
+    Signalled,
+    Exited(ExitStatus),
+    NoFrames,
+}
+
+/// "ffmpeg is alive" is not the same as "frames are arriving". Wait for
+/// encoded progress before announcing a recording, and fail clearly when a
+/// camera or screen source never delivers its first frame.
+fn wait_first_frame(child: &mut std::process::Child, progress: &Path) -> Startup {
+    let startup_deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < startup_deadline {
+        if SIGNAL.load(Ordering::SeqCst) != 0 {
+            return Startup::Signalled;
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            return Startup::Exited(status);
+        }
+        if let Some(performance) = read_progress(progress) {
+            if performance.has_frames() {
+                return Startup::Frames(performance);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Startup::NoFrames
 }
 
 fn wait_for_terminal(timeout: Duration) -> Option<Session> {
