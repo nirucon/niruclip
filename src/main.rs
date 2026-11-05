@@ -1979,6 +1979,32 @@ fn record(options: Options, camera: &mut Option<CameraRestore>) -> Result<(), St
     if output.exists() || partial.exists() {
         return Err(format!("output already exists: {}", output.display()));
     }
+    let output_dir = output
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let mut disk = DiskGuard::new(&output_dir);
+    match disk.check() {
+        DiskLevel::Critical(free) => {
+            let message = format!(
+                "only {} free in {}; at least 500 MB is needed to record",
+                human_bytes(free),
+                output_dir.display()
+            );
+            notify(&options, "NIRUCLIP", &format!("Not recording: {message}"));
+            return Err(message);
+        }
+        DiskLevel::Low(free) => {
+            let message = format!(
+                "low disk space: {} free in {}",
+                human_bytes(free),
+                output_dir.display()
+            );
+            eprintln!("niruclip: {message}");
+            notify(&options, "NIRUCLIP", &format!("Warning: {message}"));
+        }
+        DiskLevel::Ok => {}
+    }
     let progress_path = state_dir().join("ffmpeg.progress");
     let _ = fs::remove_file(&progress_path);
     let capture = capture_input(&options, display.as_deref().unwrap_or_default())?;
@@ -2119,6 +2145,7 @@ fn record(options: Options, camera: &mut Option<CameraRestore>) -> Result<(), St
         eprintln!("NIRUCLIP recording: {}", output.display());
     }
     let mut stop_reason: Option<String> = None;
+    let mut low_warned = false;
     // How the last segment ended: Some(status) when ffmpeg exited by
     // itself, None when NIRUCLIP stopped it (stop, pause, low disk space).
     let mut unrequested_exit: Option<ExitStatus> = None;
@@ -2153,6 +2180,37 @@ fn record(options: Options, camera: &mut Option<CameraRestore>) -> Result<(), St
                         Some(format!("could not wait for ffmpeg: {error}")),
                     );
                     return Err(format!("could not wait for ffmpeg: {error}"));
+                }
+            }
+            if disk.due() {
+                match disk.check() {
+                    DiskLevel::Critical(free) => {
+                        let message = format!(
+                            "stopped: only {} free in {}",
+                            human_bytes(free),
+                            output_dir.display()
+                        );
+                        eprintln!("niruclip: {message}");
+                        notify(
+                            &options,
+                            "NIRUCLIP",
+                            &format!(
+                                "Recording stopped: disk almost full ({} free). Saving…",
+                                human_bytes(free)
+                            ),
+                        );
+                        stop_reason = Some(message);
+                        break;
+                    }
+                    DiskLevel::Low(free) if !low_warned => {
+                        low_warned = true;
+                        notify(
+                            &options,
+                            "NIRUCLIP",
+                            &format!("Low disk space: {} free", human_bytes(free)),
+                        );
+                    }
+                    _ => {}
                 }
             }
             std::thread::sleep(Duration::from_millis(100));
@@ -2294,6 +2352,86 @@ fn record(options: Options, camera: &mut Option<CameraRestore>) -> Result<(), St
             );
             Err(format!("could not finalize recording: {error}"))
         }
+    }
+}
+
+/// Free-space thresholds for the output directory.
+const DISK_WARN_BYTES: u64 = 2_000_000_000;
+const DISK_STOP_BYTES: u64 = 500_000_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DiskLevel {
+    Ok,
+    Low(u64),
+    Critical(u64),
+}
+
+impl DiskLevel {
+    fn classify(free: u64) -> Self {
+        if free < DISK_STOP_BYTES {
+            Self::Critical(free)
+        } else if free < DISK_WARN_BYTES {
+            Self::Low(free)
+        } else {
+            Self::Ok
+        }
+    }
+}
+
+/// Checks the free space of the output directory before a recording and
+/// every 30 s while recording, inside the existing recorder loop (one
+/// statvfs call, no process spawned).
+struct DiskGuard {
+    dir: PathBuf,
+    interval: Duration,
+    last: Instant,
+}
+
+impl DiskGuard {
+    fn new(dir: &Path) -> Self {
+        // Test hook only: shortens the 30 s interval for tests/lifecycle.sh.
+        let interval = std::env::var("NIRUCLIP_TEST_DISK_INTERVAL_MS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .map(Duration::from_millis)
+            .unwrap_or(Duration::from_secs(30));
+        Self {
+            dir: dir.to_path_buf(),
+            interval,
+            last: Instant::now(),
+        }
+    }
+
+    fn due(&self) -> bool {
+        self.last.elapsed() >= self.interval
+    }
+
+    fn check(&mut self) -> DiskLevel {
+        self.last = Instant::now();
+        free_bytes(&self.dir).map_or(DiskLevel::Ok, DiskLevel::classify)
+    }
+}
+
+fn free_bytes(dir: &Path) -> Option<u64> {
+    // Test hook only: a file holding the free byte count replaces statvfs,
+    // so the thresholds can be tested without filling a disk.
+    if let Some(path) = std::env::var_os("NIRUCLIP_TEST_FREE_BYTES_FILE") {
+        return fs::read_to_string(path).ok()?.trim().parse().ok();
+    }
+    let path = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()).ok()?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(path.as_ptr(), &mut stat) } != 0 {
+        return None;
+    }
+    #[allow(clippy::unnecessary_cast)]
+    Some(stat.f_bavail as u64 * stat.f_frsize as u64)
+}
+
+fn human_bytes(bytes: u64) -> String {
+    if bytes >= 1_000_000_000 {
+        format!("{:.1} GB", bytes as f64 / 1e9)
+    } else {
+        format!("{} MB", bytes / 1_000_000)
     }
 }
 

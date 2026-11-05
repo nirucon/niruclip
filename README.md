@@ -117,6 +117,16 @@ limiter (`alimiter=limit=0.95:level=0`). The limiter only engages when the
 sum of both sources would clip; it adds no automatic gain, so normal levels
 are unchanged.
 
+## Disk space
+
+Before a recording starts, and every 30 seconds while recording (one `statvfs`
+call in the existing recorder loop, no extra process), NIRUCLIP checks the free
+space in the output directory. Below 2 GB it warns once with a notification.
+Below 500 MB it does not start, or stops a running recording cleanly with a
+"disk almost full" notification; the file is finalized and validated like a
+normal stop, and the reason is kept in the state. (`NIRUCLIP_TEST_FREE_BYTES_FILE`
+and `NIRUCLIP_TEST_DISK_INTERVAL_MS` are test hooks for `tests/lifecycle.sh`.)
+
 ## Profiles and notifications
 
 Profiles live in `${XDG_CONFIG_HOME:-$HOME/.config}/niruclip/config.toml`.

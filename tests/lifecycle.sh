@@ -467,6 +467,42 @@ common "$BIN" --status --json | grep -q 'could not resume'
 [ -s "$TMP/out/badresume.mkv" ]
 if ls "$TMP/out" | grep -q '^badresume\..*part'; then echo 'failed resume left a partial' >&2; exit 1; fi
 
+# U2: free space is checked before a start and periodically while recording.
+export NIRUCLIP_TEST_FREE_BYTES_FILE="$TMP/free"
+export NIRUCLIP_TEST_DISK_INTERVAL_MS=200
+printf 400000000 > "$NIRUCLIP_TEST_FREE_BYTES_FILE"; : > "$FAKE_NOTIFY_LOG"
+if FAKE_NOTIFY=1 NIRUCLIP_NOTIFY_SEND="$TMP/notify-send" NIRUCLIP_FFMPEG="$TMP/ffmpeg-ok" common "$BIN" --full --audio none --countdown 0 --output "$TMP/out/nospace.mkv" >/dev/null 2>&1; then
+  echo 'recording started with less than 500 MB free' >&2; exit 1
+fi
+[ ! -e "$TMP/out/nospace.mkv" ] && [ ! -e "$TMP/out/nospace.part.mkv" ]
+grep -q '^Not recording: only 400 MB free' "$FAKE_NOTIFY_LOG"
+
+printf 1500000000 > "$NIRUCLIP_TEST_FREE_BYTES_FILE"; : > "$FAKE_NOTIFY_LOG"
+FAKE_NOTIFY=1 NIRUCLIP_NOTIFY_SEND="$TMP/notify-send" NIRUCLIP_FFMPEG="$TMP/ffmpeg-ok" common "$BIN" --full --audio none --countdown 0 --output "$TMP/out/lowspace.mkv" >/dev/null 2>&1 &
+pid=$!
+wait_state recording lowspace
+grep -q '^Warning: low disk space: 1.5 GB free' "$FAKE_NOTIFY_LOG"
+printf 300000000 > "$NIRUCLIP_TEST_FREE_BYTES_FILE"
+wait "$pid"
+sleep 0.3
+common "$BIN" --status --json | grep -q '"state": "finished"'
+common "$BIN" --status --json | grep -q '"reason": "stopped: only 300 MB free'
+[ -s "$TMP/out/lowspace.mkv" ] && [ ! -e "$TMP/out/lowspace.part.mkv" ]
+grep -q '^Recording stopped: disk almost full (300 MB free)' "$FAKE_NOTIFY_LOG"
+
+printf 9000000000 > "$NIRUCLIP_TEST_FREE_BYTES_FILE"; : > "$FAKE_NOTIFY_LOG"
+FAKE_NOTIFY=1 NIRUCLIP_NOTIFY_SEND="$TMP/notify-send" NIRUCLIP_FFMPEG="$TMP/ffmpeg-ok" common "$BIN" --full --audio none --countdown 0 --output "$TMP/out/shrinking.mkv" >/dev/null 2>&1 &
+pid=$!
+wait_state recording shrinking
+printf 1900000000 > "$NIRUCLIP_TEST_FREE_BYTES_FILE"
+sleep 1
+common "$BIN" --status --json | grep -q '"state": "recording"'
+common "$BIN" --stop >/dev/null
+wait "$pid"
+sleep 0.3
+[ "$(grep -c '^Low disk space: 1.9 GB free' "$FAKE_NOTIFY_LOG")" -eq 1 ]
+unset NIRUCLIP_TEST_FREE_BYTES_FILE NIRUCLIP_TEST_DISK_INTERVAL_MS
+
 # Profiles are listable, saveable and apply the camera-only mode.
 common "$BIN" --list-profiles | grep -q '^camera-mic'
 common "$BIN" --save-profile test-profile --webcam-only --audio none --webcam-size small
