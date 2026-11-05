@@ -200,6 +200,11 @@ grep -q 'min(iw,690)' "$TMP/args.log"
 grep -q '@DEFAULT_SOURCE@' "$TMP/args.log"
 grep -q '@DEFAULT_MONITOR@' "$TMP/args.log"
 grep -q 'amix=inputs=2' "$TMP/args.log"
+# C5: camera, screen and both pulse inputs get a 512-packet queue.
+[ "$(grep -A1 -x -- '-thread_queue_size' "$TMP/args.log" | grep -c -x 512)" -eq 4 ] || {
+  echo 'not every input has -thread_queue_size 512' >&2
+  exit 1
+}
 cam_line=$(grep -n '/dev/zero' "$TMP/args.log" | head -1 | cut -d: -f1)
 screen_line=$(grep -n ':0+0,0' "$TMP/args.log" | head -1 | cut -d: -f1)
 [ -n "$cam_line" ] && [ -n "$screen_line" ] && [ "$cam_line" -lt "$screen_line" ] || {

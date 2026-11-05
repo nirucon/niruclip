@@ -1139,10 +1139,15 @@ struct CaptureInputs {
     audio_index: usize,
 }
 
+/// Packets each live input may queue while the filter graph is busy. 8 (screen)
+/// and 32 (camera) made ffmpeg block inputs under load with a camera overlay,
+/// which shows up as dropped or duplicated frames.
+const INPUT_QUEUE: &str = "512";
+
 fn camera_input(camera: &str) -> Vec<String> {
     [
         "-thread_queue_size",
-        "32",
+        INPUT_QUEUE,
         "-f",
         "v4l2",
         "-framerate",
@@ -1158,7 +1163,7 @@ fn camera_input(camera: &str) -> Vec<String> {
 fn screen_input(display: &str, geometry: &Geometry) -> Vec<String> {
     [
         "-thread_queue_size".to_string(),
-        "8".to_string(),
+        INPUT_QUEUE.to_string(),
         "-f".to_string(),
         "x11grab".to_string(),
         "-framerate".to_string(),
@@ -1446,6 +1451,8 @@ fn build_plan(
     {
         if resolved.audio == Audio::Mic || resolved.audio == Audio::Both {
             argv.extend([
+                "-thread_queue_size".into(),
+                INPUT_QUEUE.into(),
                 "-f".into(),
                 "pulse".into(),
                 "-i".into(),
@@ -1454,6 +1461,8 @@ fn build_plan(
         }
         if resolved.audio == Audio::Desktop || resolved.audio == Audio::Both {
             argv.extend([
+                "-thread_queue_size".into(),
+                INPUT_QUEUE.into(),
                 "-f".into(),
                 "pulse".into(),
                 "-i".into(),
