@@ -89,7 +89,10 @@ overwritten; a numeric suffix is chosen instead. MKV is written as
 A controlled stop finalizes a valid partial as a normal saved recording. An
 unexpected encoder failure with a valid partial is `interrupted`: the partial is
 kept and `niruclip --recover` validates and restores it. A failed startup with
-no usable media is `failed`, not recoverable. A crash leaves stale state; the
+no usable media is `failed`, not recoverable. If ffmpeg itself was killed (a power
+loss), the partial has no duration or index; `--recover` remuxes it
+losslessly (stream copy) and replaces the unfinished partial only after the
+copy validates. A crash leaves stale state; the
 next status/stop check does not signal a reused PID.
 
 The camera's `exposure_dynamic_framerate` control is stored in `session.json`

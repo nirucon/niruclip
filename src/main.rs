@@ -2926,7 +2926,7 @@ fn stop_recording() -> Result<(), String> {
     restore_stale_camera(&mut session);
     session.recoverable = session_media(&session)
         .iter()
-        .any(|path| validate_media(path));
+        .any(|path| validate_media(path) || has_video_packets(path));
     session.state = if session.recoverable {
         "interrupted".into()
     } else {
@@ -2943,6 +2943,74 @@ fn stop_recording() -> Result<(), String> {
     } else {
         "recording process is gone and no usable partial was found".into()
     })
+}
+
+/// True when ffmpeg wrote at least one video packet, even if the file was
+/// never finalized (no duration or cues after a SIGKILL or power loss).
+fn has_video_packets(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    Command::new(command_path("ffprobe", "NIRUCLIP_FFPROBE"))
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-read_intervals",
+            "%+#1",
+            "-show_entries",
+            "packet=pts_time",
+            "-of",
+            "csv=p=0",
+        ])
+        .arg(path)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .map(|output| {
+            output.status.success() && output.stdout.iter().any(|byte| !byte.is_ascii_whitespace())
+        })
+        .unwrap_or(false)
+}
+
+/// A partial that validates is used as is. One that ffmpeg never finalized
+/// is remuxed losslessly (stream copy) into a sibling file; only when that
+/// copy validates does it replace the damaged original, under the same name.
+fn usable_or_repaired(path: &Path) -> bool {
+    if validate_media(path) {
+        return true;
+    }
+    if !has_video_packets(path) {
+        return false;
+    }
+    let repaired = path.with_file_name(format!(
+        "{}.repair.mkv",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("NIRUCLIP")
+    ));
+    if repaired.exists() {
+        return false;
+    }
+    let status = Command::new(command_path("ffmpeg", "NIRUCLIP_FFMPEG"))
+        .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-n", "-i"])
+        .arg(path)
+        .args(["-map", "0", "-c", "copy"])
+        .arg(&repaired)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    if status.map(|status| status.success()).unwrap_or(false)
+        && validate_media(&repaired)
+        && fs::rename(&repaired, path).is_ok()
+    {
+        eprintln!("niruclip: repaired unfinished file {}", path.display());
+        return true;
+    }
+    let _ = fs::remove_file(&repaired);
+    false
 }
 
 /// Every file a session may have recorded into, in order.
@@ -3018,7 +3086,7 @@ fn recover() -> Result<(), String> {
         let valid: Vec<PathBuf> = segments
             .iter()
             .map(|segment| PathBuf::from(&segment.path))
-            .filter(|path| validate_media(path))
+            .filter(|path| usable_or_repaired(path))
             .collect();
         if valid.is_empty() {
             session.recoverable = false;
@@ -3055,7 +3123,7 @@ fn recover() -> Result<(), String> {
     } else {
         return Err("no partial or saved file exists for the previous session".into());
     };
-    if !validate_media(&candidate) {
+    if !usable_or_repaired(&candidate) {
         session.recoverable = false;
         session.reason = Some("partial file is not a usable video".into());
         let _ = write_state(&session);

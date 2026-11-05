@@ -15,6 +15,15 @@ for arg in "$@"; do
   prev=$arg
   last=$arg
 done
+# Lossless remux of an unfinished file: "damaged" packets become "partial".
+if printf '%s\n' "$@" | grep -qx copy && ! printf '%s\n' "$@" | grep -qx concat; then
+  input=; prev=
+  for arg in "$@"; do [ "$prev" = "-i" ] && input=$arg; prev=$arg; done
+  [ ! -e "$last" ] || exit 1
+  grep -q damaged "$input" || exit 1
+  sed 's/damaged/partial/g' "$input" > "$last"
+  exit 0
+fi
 # Lossless concat of pause/resume segments: copy every listed file.
 if printf '%s\n' "$@" | grep -qx concat; then
   [ "${FAKE_CONCAT:-ok}" = ok ] || exit 1
@@ -81,6 +90,11 @@ cat > "$TMP/ffprobe" <<'EOF'
 #!/bin/sh
 last=
 for arg in "$@"; do last=$arg; done
+# The first-packet probe of an unfinished file.
+if printf '%s\n' "$@" | grep -qx 'packet=pts_time'; then
+  grep -q -e damaged -e partial "$last" 2>/dev/null && echo 0.000000
+  exit 0
+fi
 n=$(grep -o partial "$last" 2>/dev/null | wc -l)
 [ "$n" -gt 0 ] || exit 1
 # Every recorded segment contributes 1.5 s, so joins are checked for length.
@@ -522,6 +536,20 @@ common "$BIN" --status | grep -q '^elapsed: 0:00:01$'
 common "$BIN" --status --json | grep -qF '"elapsed_seconds": 1.5'
 common "$BIN" --stop >/dev/null
 wait "$pid"
+
+# An unfinished file (ffmpeg killed too: no duration, no cues) is offered for
+# recovery and repaired losslessly by --recover.
+NIRUCLIP_FFMPEG="$TMP/ffmpeg-ok" common "$BIN" --full --audio none --countdown 0 --output "$TMP/out/powerloss.mkv" >/dev/null 2>&1 &
+pid=$!
+wait_state recording powerloss
+kill_recorder "$pid"
+printf damaged > "$TMP/out/powerloss.part.mkv"
+common "$BIN" --stop >/dev/null 2>&1 || true
+common "$BIN" --status --json | grep -q '"recoverable": true'
+NIRUCLIP_FFMPEG="$TMP/ffmpeg-ok" common "$BIN" --recover >/dev/null 2>&1
+common "$BIN" --status --json | grep -q '"state": "finished"'
+grep -q partial "$TMP/out/powerloss.mkv"
+[ ! -e "$TMP/out/powerloss.part.mkv" ] && [ ! -e "$TMP/out/powerloss.part.mkv.repair.mkv" ]
 
 # Profiles are listable, saveable and apply the camera-only mode.
 common "$BIN" --list-profiles | grep -q '^camera-mic'
