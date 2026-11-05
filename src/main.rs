@@ -9,7 +9,7 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const VERSION: &str = "0.2.3";
+const VERSION: &str = "0.3.0";
 const SCHEMA: u32 = 1;
 const ACTIVE_STATES: &[&str] = &[
     "countdown",
