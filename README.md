@@ -12,6 +12,8 @@ niruclip --region --audio both
 niruclip --full --webcam corner --corner bottom-right --webcam-size large
 niruclip --webcam-only --audio mic
 niruclip --profile screen-camera
+niruclip --pause
+niruclip --resume
 niruclip --stop
 niruclip --status --json
 niruclip --recover
@@ -42,6 +44,23 @@ usable X11 screen geometry.
 The `share` and `small` presets avoid upscaling a smaller screen. `quality`
 keeps the screen dimensions, rounded down to even values. Camera-only capture
 is capped at 1920 pixels wide (1280 with `small`) and keeps the camera aspect.
+
+## Pause and resume
+
+`niruclip --pause` closes the current ffmpeg segment cleanly and the state
+becomes `paused`; no ffmpeg runs and the recorder sleeps without polling.
+`niruclip --resume` starts a new segment with the same capture settings and
+encoder. On stop the segments are joined losslessly with the concat demuxer
+(stream copy, no re-encode); the join is validated for length before the
+segment files are removed. If a join fails, or segments ended up with
+different encoders after a VAAPI fallback, every segment is saved as its own
+file instead (`NAME.mkv`, `NAME-2.mkv`, ...), so nothing is lost. A resume that
+cannot start keeps and saves what was already recorded. The segment list is
+stored in `session.json` (`segments`), so `--recover` joins them after a
+crash. `--stop` works while paused.
+
+NIRUBAR 0.18.84 does not know the `paused` state yet and hides its recording
+module while a recording is paused.
 
 ## Encoding
 

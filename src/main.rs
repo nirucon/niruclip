@@ -6,18 +6,35 @@ use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const VERSION: &str = "0.2.3";
 const SCHEMA: u32 = 1;
-const ACTIVE_STATES: &[&str] = &["countdown", "starting", "recording", "finalizing"];
+const ACTIVE_STATES: &[&str] = &[
+    "countdown",
+    "starting",
+    "recording",
+    "pausing",
+    "paused",
+    "finalizing",
+];
 const TERMINAL_STATES: &[&str] = &["finished", "failed", "interrupted", "cancelled", "idle"];
 
 static SIGNAL: AtomicI32 = AtomicI32::new(0);
+static PAUSE: AtomicBool = AtomicBool::new(false);
+static RESUME: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn on_signal(signal: libc::c_int) {
     SIGNAL.store(signal, Ordering::SeqCst);
+}
+
+extern "C" fn on_control(signal: libc::c_int) {
+    if signal == libc::SIGUSR1 {
+        PAUSE.store(true, Ordering::SeqCst);
+    } else {
+        RESUME.store(true, Ordering::SeqCst);
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -280,6 +297,8 @@ struct Options {
     no_notify: bool,
     list_profiles: bool,
     stop: bool,
+    pause: bool,
+    resume: bool,
     recover: bool,
     status: bool,
     version: bool,
@@ -305,6 +324,8 @@ impl Default for Options {
             no_notify: false,
             list_profiles: false,
             stop: false,
+            pause: false,
+            resume: false,
             recover: false,
             status: false,
             version: false,
@@ -640,6 +661,17 @@ struct Session {
     fallback: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     camera_restore: Option<CameraRestore>,
+    /// Version of the recorder that owns the session. --pause and --resume
+    /// only signal a recorder that understands them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recorder: Option<String>,
+    /// Present once a recording was paused: every segment in order. The
+    /// first one is `partial`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    segments: Option<Vec<Segment>>,
+    /// Seconds recorded in the segments before the current one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    elapsed_before: Option<f64>,
 }
 
 impl Session {
@@ -669,6 +701,9 @@ impl Session {
             encoder: None,
             fallback: None,
             camera_restore: None,
+            recorder: None,
+            segments: None,
+            elapsed_before: None,
         }
     }
 
@@ -872,6 +907,8 @@ fn install_signal_handlers() {
         libc::signal(libc::SIGINT, on_signal as *const () as libc::sighandler_t);
         libc::signal(libc::SIGTERM, on_signal as *const () as libc::sighandler_t);
         libc::signal(libc::SIGHUP, on_signal as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGUSR1, on_control as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGUSR2, on_control as *const () as libc::sighandler_t);
     }
 }
 
@@ -1742,6 +1779,8 @@ fn parse_args(argv: &[String], config: &Config) -> Result<Options, String> {
             "--status" => options.status = true,
             "--json" => options.json = true,
             "--stop" => options.stop = true,
+            "--pause" => options.pause = true,
+            "--resume" => options.resume = true,
             "--recover" => options.recover = true,
             "--no-notify" => options.no_notify = true,
             "--version" => options.version = true,
@@ -1769,7 +1808,7 @@ fn help() {
     println!(
         "NIRUCLIP {VERSION}\n\
 Usage: niruclip --full|--region|--window|--webcam-only [options]\n\
-       niruclip --stop | --status [--json] | --recover\n\
+       niruclip --stop | --pause | --resume | --status [--json] | --recover\n\
        niruclip --list-profiles | --save-profile NAME\n\n\
 Options:\n\
   --audio none|mic|desktop|both\n\
@@ -1832,8 +1871,13 @@ fn status(options: &Options) {
 }
 
 fn validate_media(path: &Path) -> bool {
+    media_duration(path).is_some()
+}
+
+/// The duration of a file that contains a usable video stream, else None.
+fn media_duration(path: &Path) -> Option<f64> {
     if !path.is_file() {
-        return false;
+        return None;
     }
     let command = command_path("ffprobe", "NIRUCLIP_FFPROBE");
     let output = Command::new(&command)
@@ -1852,16 +1896,9 @@ fn validate_media(path: &Path) -> bool {
         ])
         .stdin(Stdio::null())
         .output();
-    let Ok(output) = output else {
-        return false;
-    };
-    if !output.status.success() {
-        return false;
-    }
+    let output = output.ok().filter(|output| output.status.success())?;
     let text = String::from_utf8_lossy(&output.stdout);
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
-        return false;
-    };
+    let value = serde_json::from_str::<serde_json::Value>(&text).ok()?;
     let duration = value
         .get("format")
         .and_then(|format| format.get("duration"))
@@ -1873,7 +1910,7 @@ fn validate_media(path: &Path) -> bool {
         .and_then(|streams| streams.as_array())
         .map(|streams| !streams.is_empty())
         .unwrap_or(false);
-    duration > 0.05 && has_video
+    (duration > 0.05 && has_video).then_some(duration)
 }
 
 fn log_tail() -> Option<String> {
@@ -1946,16 +1983,14 @@ fn record(options: Options, camera: &mut Option<CameraRestore>) -> Result<(), St
     let _ = fs::remove_file(&progress_path);
     let capture = capture_input(&options, display.as_deref().unwrap_or_default())?;
     let ffmpeg = command_path("ffmpeg", "NIRUCLIP_FFMPEG");
-    let mut selection = select_encoder(options.encoder, &ffmpeg);
-    let mut plan = build_plan(
+    let selection = select_encoder(options.encoder, &ffmpeg);
+    let plan = build_plan(
         &options,
         &capture,
         &partial,
         &progress_path,
         &selection.encoder,
     )?;
-    let width = plan.width;
-    let height = plan.height;
     let pid = std::process::id();
     let mut session = Session {
         schema: SCHEMA,
@@ -1974,14 +2009,17 @@ fn record(options: Options, camera: &mut Option<CameraRestore>) -> Result<(), St
         webcam: options.webcam.as_str().into(),
         corner: options.corner.as_str().into(),
         webcam_size: options.webcam_size.as_str().into(),
-        width,
-        height,
+        width: plan.width,
+        height: plan.height,
         recoverable: false,
         performance: None,
         reason: None,
         encoder: Some(selection.encoder.as_str().into()),
         fallback: selection.fallback.clone(),
         camera_restore: None,
+        recorder: Some(VERSION.into()),
+        segments: None,
+        elapsed_before: None,
     };
     write_state(&session)?;
     if options.mode == Mode::WebcamOnly || options.webcam != Webcam::Off {
@@ -2037,240 +2075,528 @@ fn record(options: Options, camera: &mut Option<CameraRestore>) -> Result<(), St
         println!("NIRUCLIP countdown cancelled");
         return Ok(());
     }
-    let mut child = match spawn_ffmpeg(&ffmpeg, &plan.argv) {
-        Ok(child) => child,
-        Err(error) => {
-            finish_session(&mut session, "failed", Some(error.clone()));
-            return Err(error);
-        }
+    // A pause or resume request that arrived during the countdown is stale.
+    PAUSE.store(false, Ordering::SeqCst);
+    RESUME.store(false, Ordering::SeqCst);
+    let mut recorder = Recorder {
+        options: &options,
+        capture,
+        ffmpeg,
+        encoder: selection.encoder,
+        progress: progress_path.clone(),
     };
-    session.state = "starting".into();
-    session.child_pid = child.id();
-    session.child_start = proc_start(child.id()).unwrap_or(0);
-    write_state(&session)?;
-    let mut startup = wait_first_frame(&mut child, &progress_path);
-    if let (Startup::Exited(status), Encoder::Vaapi(device)) = (&startup, &selection.encoder) {
-        // Hardware encoding must never turn a working recording into a
-        // failed one: a VAAPI encoder that dies before the first frame is
-        // retried exactly once with libx264, and the reason is recorded.
-        if !validate_media(&partial) {
-            let detail = log_tail().unwrap_or_else(|| "no ffmpeg output".into());
-            let reason = format!(
-                "h264_vaapi on {device} failed before the first frame ({status}): {detail}"
-            );
-            let reason: String = reason.chars().take(600).collect();
-            eprintln!("niruclip: {reason}; retrying with software encoding");
-            if options.encoder == EncoderChoice::Auto {
-                store_probe_result(&ffmpeg, device, false);
-            }
-            let _ = fs::remove_file(&partial);
-            let _ = fs::remove_file(&progress_path);
-            selection = EncoderSelection {
-                encoder: Encoder::Software,
-                fallback: Some(reason),
-            };
-            plan = build_plan(
-                &options,
-                &capture,
-                &partial,
-                &progress_path,
-                &selection.encoder,
-            )?;
-            session.encoder = Some(selection.encoder.as_str().into());
-            session.fallback = selection.fallback.clone();
-            child = match spawn_ffmpeg(&ffmpeg, &plan.argv) {
-                Ok(child) => child,
-                Err(error) => {
-                    finish_session(&mut session, "failed", Some(error.clone()));
-                    return Err(error);
-                }
-            };
-            session.child_pid = child.id();
-            session.child_start = proc_start(child.id()).unwrap_or(0);
-            write_state(&session)?;
-            startup = wait_first_frame(&mut child, &progress_path);
-        }
-    }
-    let saw_frames = match startup {
-        Startup::Frames(performance) => {
-            session.performance = Some(performance);
-            true
-        }
-        Startup::Signalled | Startup::NoFrames => false,
-        Startup::Exited(status) => {
-            if validate_media(&partial) {
-                session.recoverable = true;
-                finish_session(
-                    &mut session,
-                    "interrupted",
-                    Some(format!("ffmpeg exited during startup: {status}")),
-                );
-                return Err("ffmpeg stopped during startup; a partial file is recoverable".into());
-            }
+    let mut segments = vec![Segment {
+        path: partial.display().to_string(),
+        encoder: recorder.encoder.as_str().into(),
+    }];
+    let mut child = match recorder.start_segment(&mut session, &partial)? {
+        SegmentStart::Running(child) => child,
+        SegmentStart::Failed {
+            reason,
+            valid,
+            no_frames,
+        } => {
+            session.recoverable = valid;
             finish_session(
                 &mut session,
-                "failed",
-                Some(format!("ffmpeg exited during startup: {status}")),
+                if valid { "interrupted" } else { "failed" },
+                Some(reason.clone()),
             );
-            return Err("ffmpeg exited during startup".into());
+            if no_frames {
+                notify(&options, "NIRUCLIP", "Recording failed: no frames arrived");
+            }
+            return Err(if valid {
+                "ffmpeg stopped during startup; a partial file is recoverable".into()
+            } else {
+                reason
+            });
         }
     };
-    if SIGNAL.load(Ordering::SeqCst) == 0 && !saw_frames {
-        session.state = "finalizing".into();
-        let _ = write_state(&session);
-        signal_group(child.id(), libc::SIGINT);
-        let stop_deadline = Instant::now() + Duration::from_secs(3);
-        while Instant::now() < stop_deadline {
-            if child.try_wait().ok().flatten().is_some() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        if child.try_wait().ok().flatten().is_none() {
-            signal_group(child.id(), libc::SIGTERM);
-            std::thread::sleep(Duration::from_secs(1));
-            if child.try_wait().ok().flatten().is_none() {
-                signal_group(child.id(), libc::SIGKILL);
-            }
-        }
-        let _ = child.wait();
-        session.performance = read_progress(&progress_path);
-        let reason = "capture produced no frames; check the camera and screen source";
-        let recoverable = validate_media(&partial);
-        session.recoverable = recoverable;
-        finish_session(
-            &mut session,
-            if recoverable { "interrupted" } else { "failed" },
-            Some(reason.into()),
-        );
-        notify(&options, "NIRUCLIP", "Recording failed: no frames arrived");
-        return Err(reason.into());
-    }
     if SIGNAL.load(Ordering::SeqCst) == 0 {
         session.state = "recording".into();
         write_state(&session)?;
         notify(&options, "NIRUCLIP", &started_message(&session));
         eprintln!("NIRUCLIP recording: {}", output.display());
     }
-    let mut requested_stop = false;
-    let mut status: Option<ExitStatus> = None;
-    loop {
-        if SIGNAL.load(Ordering::SeqCst) != 0 && !requested_stop {
-            requested_stop = true;
-            // Validation and the rename follow; say so at once.
-            notify(&options, "NIRUCLIP", "Saving…");
-            session.state = "finalizing".into();
-            let _ = write_state(&session);
-            signal_group(child.id(), libc::SIGINT);
-        }
-        if let Some(performance) = read_progress(&progress_path) {
-            if session.performance.as_ref() != Some(&performance) {
-                session.performance = Some(performance);
-                let _ = write_state(&session);
-            }
-        }
-        match child.try_wait() {
-            Ok(Some(exit)) => {
-                status = Some(exit);
+    let mut stop_reason: Option<String> = None;
+    // How the last segment ended: Some(status) when ffmpeg exited by
+    // itself, None when NIRUCLIP stopped it (stop, pause, low disk space).
+    let mut unrequested_exit: Option<ExitStatus> = None;
+    'capture: loop {
+        let mut pause_requested = false;
+        loop {
+            if SIGNAL.load(Ordering::SeqCst) != 0 {
+                notify(&options, "NIRUCLIP", "Saving…");
                 break;
             }
-            Ok(None) => {
-                if requested_stop {
+            if PAUSE.swap(false, Ordering::SeqCst) {
+                pause_requested = true;
+                break;
+            }
+            RESUME.store(false, Ordering::SeqCst);
+            if let Some(performance) = read_progress(&recorder.progress) {
+                if session.performance.as_ref() != Some(&performance) {
+                    session.performance = Some(performance);
+                    let _ = write_state(&session);
+                }
+            }
+            match child.try_wait() {
+                Ok(Some(exit)) => {
+                    unrequested_exit = Some(exit);
                     break;
                 }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            Err(error) => {
-                finish_session(
-                    &mut session,
-                    "failed",
-                    Some(format!("could not wait for ffmpeg: {error}")),
-                );
-                return Err(format!("could not wait for ffmpeg: {error}"));
-            }
-        }
-    }
-    if let Some(exit) = status {
-        if requested_stop {
-            signal_group(child.id(), libc::SIGINT);
-        }
-        let _ = exit;
-    }
-    let wait_deadline = Instant::now() + Duration::from_secs(8);
-    let mut exit_status = status;
-    while exit_status.is_none() && Instant::now() < wait_deadline {
-        match child.try_wait() {
-            Ok(Some(status)) => exit_status = Some(status),
-            Ok(None) => std::thread::sleep(Duration::from_millis(100)),
-            Err(_) => break,
-        }
-    }
-    if exit_status.is_none() {
-        signal_group(child.id(), libc::SIGTERM);
-        std::thread::sleep(Duration::from_secs(1));
-        if child.try_wait().ok().flatten().is_none() {
-            signal_group(child.id(), libc::SIGKILL);
-        }
-        exit_status = child.wait().ok();
-    }
-    if let Some(performance) = read_progress(&progress_path) {
-        session.performance = Some(performance);
-    }
-    session.state = "finalizing".into();
-    let _ = write_state(&session);
-    let valid = validate_media(&partial);
-    let reason = if valid {
-        None
-    } else {
-        log_tail().or_else(|| Some("no usable video was produced".into()))
-    };
-    if valid {
-        if exit_status
-            .as_ref()
-            .map(|status| status.success())
-            .unwrap_or(false)
-            || requested_stop
-        {
-            match fs::rename(&partial, &output) {
-                Ok(()) => {
-                    session.output = output.display().to_string();
-                    session.recoverable = false;
-                    finish_session(&mut session, "finished", None);
-                    let _ = fs::remove_file(state_dir().join("ffmpeg.log"));
-                    let _ = fs::remove_file(&progress_path);
-                    notify(&options, "NIRUCLIP", &format!("Saved {}", output.display()));
-                    println!("NIRUCLIP saved: {}", output.display());
-                    return Ok(());
-                }
+                Ok(None) => {}
                 Err(error) => {
-                    session.recoverable = validate_media(&partial);
                     finish_session(
                         &mut session,
                         "failed",
-                        Some(format!("could not finalize {}: {error}", partial.display())),
+                        Some(format!("could not wait for ffmpeg: {error}")),
                     );
-                    return Err(format!("could not finalize recording: {error}"));
+                    return Err(format!("could not wait for ffmpeg: {error}"));
                 }
             }
-        } else {
-            session.recoverable = true;
-            finish_session(&mut session, "interrupted", reason);
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        if unrequested_exit.is_none() {
+            session.state = if pause_requested {
+                "pausing".into()
+            } else {
+                "finalizing".into()
+            };
+            let _ = write_state(&session);
+            stop_child(&mut child, Duration::from_secs(8));
+        }
+        if let Some(performance) = read_progress(&recorder.progress) {
+            session.performance = Some(performance);
+        }
+        if !pause_requested || unrequested_exit.is_some() {
+            break 'capture;
+        }
+        // Paused: the segment is closed and on disk; no ffmpeg is running.
+        let current = segments.last().map(|segment| PathBuf::from(&segment.path));
+        if let Some(duration) = current.as_deref().and_then(media_duration) {
+            session.elapsed_before = Some(session.elapsed_before.unwrap_or(0.0) + duration);
+        }
+        session.state = "paused".into();
+        session.child_pid = 0;
+        session.child_start = 0;
+        session.performance = None;
+        write_state(&session)?;
+        notify(&options, "NIRUCLIP", "Recording paused");
+        eprintln!("NIRUCLIP paused");
+        if !wait_for_resume() {
+            notify(&options, "NIRUCLIP", "Saving…");
+            break 'capture;
+        }
+        let next = segment_path(&partial, segments.len() + 1);
+        segments.push(Segment {
+            path: next.display().to_string(),
+            encoder: recorder.encoder.as_str().into(),
+        });
+        session.segments = Some(segments.clone());
+        write_state(&session)?;
+        match recorder.start_segment(&mut session, &next)? {
+            SegmentStart::Running(next_child) => {
+                child = next_child;
+                if let Some(segment) = segments.last_mut() {
+                    // A VAAPI failure on resume falls back to software.
+                    segment.encoder = recorder.encoder.as_str().into();
+                }
+                session.segments = Some(segments.clone());
+                session.state = "recording".into();
+                write_state(&session)?;
+                notify(&options, "NIRUCLIP", "Recording resumed");
+                eprintln!("NIRUCLIP resumed");
+            }
+            SegmentStart::Failed { reason, valid, .. } => {
+                // Never lose what is already recorded: save the earlier
+                // segments and report why recording could not resume.
+                if !valid {
+                    let _ = fs::remove_file(&next);
+                    segments.pop();
+                    session.segments = (segments.len() > 1).then(|| segments.clone());
+                }
+                stop_reason = Some(format!("could not resume: {reason}"));
+                notify(&options, "NIRUCLIP", "Could not resume; saving…");
+                break 'capture;
+            }
+        }
+    }
+    session.child_pid = 0;
+    session.child_start = 0;
+    session.state = "finalizing".into();
+    let _ = write_state(&session);
+    let paths: Vec<PathBuf> = segments.iter().map(|s| PathBuf::from(&s.path)).collect();
+    let valid: Vec<PathBuf> = paths
+        .iter()
+        .filter(|path| validate_media(path))
+        .cloned()
+        .collect();
+    let completed = match unrequested_exit {
+        None => true,
+        Some(status) => status.success(),
+    };
+    if valid.is_empty() {
+        let reason = log_tail().or_else(|| Some("no usable video was produced".into()));
+        session.recoverable = false;
+        finish_session(&mut session, "failed", reason);
+        notify(
+            &options,
+            "NIRUCLIP",
+            "Recording failed; see niruclip --status",
+        );
+        return Err("recording failed; no usable video was produced".into());
+    }
+    if !completed {
+        session.recoverable = true;
+        finish_session(
+            &mut session,
+            "interrupted",
+            log_tail().or_else(|| Some("ffmpeg stopped unexpectedly".into())),
+        );
+        notify(
+            &options,
+            "NIRUCLIP",
+            "Recording interrupted; a partial file is available",
+        );
+        return Err("ffmpeg stopped before finalizing; partial retained".into());
+    }
+    let same_encoder = segments
+        .windows(2)
+        .all(|pair| pair[0].encoder == pair[1].encoder);
+    match finalize_segments(&valid, same_encoder, &output) {
+        Ok(saved) => {
+            session.output = saved.output.display().to_string();
+            session.recoverable = false;
+            session.segments = None;
+            let reason = match (stop_reason, saved.note) {
+                (Some(a), Some(b)) => Some(format!("{a}; {b}")),
+                (a, b) => a.or(b),
+            };
+            finish_session(&mut session, "finished", reason);
+            let _ = fs::remove_file(state_dir().join("ffmpeg.log"));
+            let _ = fs::remove_file(&progress_path);
             notify(
                 &options,
                 "NIRUCLIP",
-                "Recording interrupted; a partial file is available",
+                &format!("Saved {}", saved.output.display()),
             );
-            return Err("ffmpeg stopped before finalizing; partial retained".into());
+            println!("NIRUCLIP saved: {}", saved.output.display());
+            Ok(())
+        }
+        Err(error) => {
+            session.recoverable = true;
+            finish_session(&mut session, "failed", Some(error.clone()));
+            notify(
+                &options,
+                "NIRUCLIP",
+                "Recording could not be finalized; run niruclip --recover",
+            );
+            Err(format!("could not finalize recording: {error}"))
         }
     }
-    session.recoverable = false;
-    finish_session(&mut session, "failed", reason);
-    notify(
-        &options,
-        "NIRUCLIP",
-        "Recording failed; see niruclip --status",
-    );
-    Err("recording failed; no usable video was produced".into())
+}
+
+/// One ffmpeg run of a recording. Pause closes a segment; resume starts the
+/// next one; the stop concatenates them losslessly.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct Segment {
+    path: String,
+    encoder: String,
+}
+
+fn segment_path(partial: &Path, index: usize) -> PathBuf {
+    let name = partial
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("NIRUCLIP.part.mkv");
+    let base = name.strip_suffix(".part.mkv").unwrap_or(name);
+    let mut attempt = 0;
+    loop {
+        let candidate = if attempt == 0 {
+            partial.with_file_name(format!("{base}.seg{index}.part.mkv"))
+        } else {
+            partial.with_file_name(format!("{base}.seg{index}-{attempt}.part.mkv"))
+        };
+        if !candidate.exists() || attempt > 1000 {
+            return candidate;
+        }
+        attempt += 1;
+    }
+}
+
+struct Saved {
+    output: PathBuf,
+    note: Option<String>,
+}
+
+/// Turn the valid segments of a recording into saved files without ever
+/// losing one: a single segment is renamed; several are joined with the
+/// concat demuxer (stream copy) and the join is validated before the
+/// segments are removed. If they cannot be joined, each is saved on its own.
+fn finalize_segments(
+    valid: &[PathBuf],
+    same_encoder: bool,
+    output: &Path,
+) -> Result<Saved, String> {
+    let target = if output.exists() {
+        unique_pair(output).0
+    } else {
+        output.to_path_buf()
+    };
+    if valid.len() == 1 {
+        fs::rename(&valid[0], &target)
+            .map_err(|error| format!("could not finalize {}: {error}", valid[0].display()))?;
+        return Ok(Saved {
+            output: target,
+            note: None,
+        });
+    }
+    let mut join_error = if same_encoder {
+        match join_segments(valid, &target) {
+            Ok(()) => {
+                for segment in valid {
+                    let _ = fs::remove_file(segment);
+                }
+                return Ok(Saved {
+                    output: target,
+                    note: None,
+                });
+            }
+            Err(error) => error,
+        }
+    } else {
+        "segments use different encoders".to_string()
+    };
+    let mut saved = Vec::new();
+    for segment in valid {
+        let destination = if saved.is_empty() && !target.exists() {
+            target.clone()
+        } else {
+            unique_pair(&target).0
+        };
+        match fs::rename(segment, &destination) {
+            Ok(()) => saved.push(destination),
+            Err(error) => {
+                join_error = format!(
+                    "{join_error}; could not save {}: {error}",
+                    segment.display()
+                )
+            }
+        }
+    }
+    let first = saved
+        .first()
+        .cloned()
+        .ok_or_else(|| format!("could not save any segment: {join_error}"))?;
+    Ok(Saved {
+        output: first,
+        note: Some(format!(
+            "saved as {} separate parts ({join_error}): {}",
+            saved.len(),
+            saved
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    })
+}
+
+fn join_segments(valid: &[PathBuf], target: &Path) -> Result<(), String> {
+    let list = state_dir().join("concat.txt");
+    let mut text = String::from("ffconcat version 1.0\n");
+    for segment in valid {
+        let path = segment.display().to_string().replace('\'', "'\\''");
+        text.push_str(&format!("file '{path}'\n"));
+    }
+    write_atomic(&list, text.as_bytes())?;
+    let joined = target.with_file_name(format!(
+        "{}.joined.part.mkv",
+        target
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("NIRUCLIP")
+    ));
+    if joined.exists() {
+        return Err(format!("{} already exists", joined.display()));
+    }
+    let status = Command::new(command_path("ffmpeg", "NIRUCLIP_FFMPEG"))
+        .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-n"])
+        .args(["-f", "concat", "-safe", "0", "-i"])
+        .arg(&list)
+        .args(["-map", "0", "-c", "copy"])
+        .arg(&joined)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let _ = fs::remove_file(&list);
+    let ok = status.map(|status| status.success()).unwrap_or(false);
+    let expected: f64 = valid.iter().filter_map(|path| media_duration(path)).sum();
+    let joined_duration = if ok { media_duration(&joined) } else { None };
+    match joined_duration {
+        // A join that lost part of the material is not accepted.
+        Some(duration) if duration + 0.5 >= expected * 0.9 => fs::rename(&joined, target)
+            .map_err(|error| format!("could not finalize {}: {error}", joined.display())),
+        _ => {
+            let _ = fs::remove_file(&joined);
+            Err("the segments could not be joined".into())
+        }
+    }
+}
+
+struct Recorder<'a> {
+    options: &'a Options,
+    capture: CaptureInputs,
+    ffmpeg: String,
+    encoder: Encoder,
+    progress: PathBuf,
+}
+
+enum SegmentStart {
+    Running(std::process::Child),
+    Failed {
+        reason: String,
+        valid: bool,
+        no_frames: bool,
+    },
+}
+
+impl Recorder<'_> {
+    /// Start ffmpeg into `path` and wait for its first frame. A VAAPI
+    /// encoder that dies before the first frame is retried exactly once in
+    /// software, so hardware encoding never turns a working recording into a
+    /// failed one; the reason is recorded in the session.
+    fn start_segment(
+        &mut self,
+        session: &mut Session,
+        path: &Path,
+    ) -> Result<SegmentStart, String> {
+        let mut retried = false;
+        loop {
+            let _ = fs::remove_file(&self.progress);
+            let plan = build_plan(
+                self.options,
+                &self.capture,
+                path,
+                &self.progress,
+                &self.encoder,
+            )?;
+            let mut child = match spawn_ffmpeg(&self.ffmpeg, &plan.argv) {
+                Ok(child) => child,
+                Err(reason) => {
+                    return Ok(SegmentStart::Failed {
+                        reason,
+                        valid: false,
+                        no_frames: false,
+                    })
+                }
+            };
+            session.state = "starting".into();
+            session.child_pid = child.id();
+            session.child_start = proc_start(child.id()).unwrap_or(0);
+            session.encoder = Some(self.encoder.as_str().into());
+            write_state(session)?;
+            match wait_first_frame(&mut child, &self.progress) {
+                Startup::Frames(performance) => {
+                    session.performance = Some(performance);
+                    return Ok(SegmentStart::Running(child));
+                }
+                Startup::Signalled => return Ok(SegmentStart::Running(child)),
+                Startup::Exited(status) => {
+                    let valid = validate_media(path);
+                    if let (Encoder::Vaapi(device), false, false) = (&self.encoder, valid, retried)
+                    {
+                        let detail = log_tail().unwrap_or_else(|| "no ffmpeg output".into());
+                        let reason: String = format!(
+                            "h264_vaapi on {device} failed before the first frame ({status}): {detail}"
+                        )
+                        .chars()
+                        .take(600)
+                        .collect();
+                        eprintln!("niruclip: {reason}; retrying with software encoding");
+                        if self.options.encoder == EncoderChoice::Auto {
+                            store_probe_result(&self.ffmpeg, device, false);
+                        }
+                        let _ = fs::remove_file(path);
+                        self.encoder = Encoder::Software;
+                        session.encoder = Some(self.encoder.as_str().into());
+                        session.fallback = Some(reason);
+                        retried = true;
+                        continue;
+                    }
+                    return Ok(SegmentStart::Failed {
+                        reason: format!("ffmpeg exited during startup: {status}"),
+                        valid,
+                        no_frames: false,
+                    });
+                }
+                Startup::NoFrames => {
+                    session.state = "finalizing".into();
+                    let _ = write_state(session);
+                    stop_child(&mut child, Duration::from_secs(3));
+                    session.performance = read_progress(&self.progress);
+                    return Ok(SegmentStart::Failed {
+                        reason: "capture produced no frames; check the camera and screen source"
+                            .into(),
+                        valid: validate_media(path),
+                        no_frames: true,
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Ask ffmpeg to finish its file (SIGINT), then escalate if it hangs.
+fn stop_child(child: &mut std::process::Child, grace: Duration) -> Option<ExitStatus> {
+    if let Ok(Some(status)) = child.try_wait() {
+        return Some(status);
+    }
+    signal_group(child.id(), libc::SIGINT);
+    let deadline = Instant::now() + grace;
+    while Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(_) => break,
+        }
+    }
+    signal_group(child.id(), libc::SIGTERM);
+    std::thread::sleep(Duration::from_secs(1));
+    if child.try_wait().ok().flatten().is_none() {
+        signal_group(child.id(), libc::SIGKILL);
+    }
+    child.wait().ok()
+}
+
+/// Sleep until --resume (true) or a stop signal (false). Blocks in
+/// sigsuspend, so a paused recording costs no CPU and no polling.
+fn wait_for_resume() -> bool {
+    unsafe {
+        let mut block: libc::sigset_t = std::mem::zeroed();
+        let mut previous: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut block);
+        for signal in [
+            libc::SIGINT,
+            libc::SIGTERM,
+            libc::SIGHUP,
+            libc::SIGUSR1,
+            libc::SIGUSR2,
+        ] {
+            libc::sigaddset(&mut block, signal);
+        }
+        libc::pthread_sigmask(libc::SIG_BLOCK, &block, &mut previous);
+        PAUSE.store(false, Ordering::SeqCst);
+        while SIGNAL.load(Ordering::SeqCst) == 0 && !RESUME.load(Ordering::SeqCst) {
+            libc::sigsuspend(&previous);
+            PAUSE.store(false, Ordering::SeqCst);
+        }
+        libc::pthread_sigmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut());
+    }
+    RESUME.store(false, Ordering::SeqCst);
+    SIGNAL.load(Ordering::SeqCst) == 0
 }
 
 fn started_message(session: &Session) -> String {
@@ -2379,7 +2705,9 @@ fn stop_recording() -> Result<(), String> {
         signal_group(session.child_pid, libc::SIGTERM);
     }
     restore_stale_camera(&mut session);
-    session.recoverable = validate_media(Path::new(&session.partial));
+    session.recoverable = session_media(&session)
+        .iter()
+        .any(|path| validate_media(path));
     session.state = if session.recoverable {
         "interrupted".into()
     } else {
@@ -2398,6 +2726,61 @@ fn stop_recording() -> Result<(), String> {
     })
 }
 
+/// Every file a session may have recorded into, in order.
+fn session_media(session: &Session) -> Vec<PathBuf> {
+    match &session.segments {
+        Some(segments) if !segments.is_empty() => segments
+            .iter()
+            .map(|segment| PathBuf::from(&segment.path))
+            .collect(),
+        _ => vec![PathBuf::from(&session.partial)],
+    }
+}
+
+/// --pause (SIGUSR1) and --resume (SIGUSR2): ask the recorder to close the
+/// current segment or start the next one, and wait for it to confirm.
+fn control_recording(pause: bool) -> Result<(), String> {
+    let session = read_state().ok_or_else(|| "no active recording".to_string())?;
+    if !session.active() || !pid_alive(session.pid, session.pid_start) {
+        return Err(format!("no active recording (state: {})", session.state));
+    }
+    if session.recorder.is_none() {
+        return Err(
+            "the running recorder predates pause support; stop it with niruclip --stop".into(),
+        );
+    }
+    let (from, target, signal, verb) = if pause {
+        ("recording", "paused", libc::SIGUSR1, "pause")
+    } else {
+        ("paused", "recording", libc::SIGUSR2, "resume")
+    };
+    if session.state == target {
+        println!("NIRUCLIP already {target}");
+        return Ok(());
+    }
+    if session.state != from {
+        return Err(format!("cannot {verb} while {}", session.state));
+    }
+    signal_pid(session.pid, signal);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+        let Some(current) = read_state() else {
+            continue;
+        };
+        if current.state == target {
+            println!("NIRUCLIP {}", if pause { "paused" } else { "resumed" });
+            return Ok(());
+        }
+        if current.terminal() {
+            return Err(current
+                .reason
+                .unwrap_or_else(|| format!("recording ended ({})", current.state)));
+        }
+    }
+    Err(format!("the recorder did not {verb} in time"))
+}
+
 fn recover() -> Result<(), String> {
     let Some(mut session) = read_state() else {
         return Err("no recording state to recover".into());
@@ -2410,6 +2793,38 @@ fn recover() -> Result<(), String> {
     }
     if session.state == "finished" {
         println!("NIRUCLIP recording already saved: {}", session.output);
+        return Ok(());
+    }
+    if let Some(segments) = session.segments.clone().filter(|list| list.len() > 1) {
+        let valid: Vec<PathBuf> = segments
+            .iter()
+            .map(|segment| PathBuf::from(&segment.path))
+            .filter(|path| validate_media(path))
+            .collect();
+        if valid.is_empty() {
+            session.recoverable = false;
+            session.reason = Some("no segment is a usable video".into());
+            let _ = write_state(&session);
+            return Err("no segment of the previous session is a usable video".into());
+        }
+        let same_encoder = segments
+            .windows(2)
+            .all(|pair| pair[0].encoder == pair[1].encoder);
+        let saved = finalize_segments(&valid, same_encoder, Path::new(&session.output))?;
+        session.state = "finished".into();
+        session.output = saved.output.display().to_string();
+        session.recoverable = false;
+        session.segments = None;
+        session.pid = 0;
+        session.pid_start = 0;
+        session.child_pid = 0;
+        session.child_start = 0;
+        session.reason = Some(match saved.note {
+            Some(note) => format!("recovered from {} segments; {note}", valid.len()),
+            None => format!("recovered from {} segments", valid.len()),
+        });
+        write_state(&session)?;
+        println!("NIRUCLIP recovered: {}", saved.output.display());
         return Ok(());
     }
     let partial = PathBuf::from(&session.partial);
@@ -2498,6 +2913,12 @@ fn main() {
         if options.stop {
             return stop_recording();
         }
+        if options.pause {
+            return control_recording(true);
+        }
+        if options.resume {
+            return control_recording(false);
+        }
         if options.recover {
             return recover();
         }
@@ -2583,6 +3004,23 @@ mod tests {
         assert!(progress.summary().contains("4 dropped"));
         assert!(progress.summary().contains("55 duplicated"));
         assert!(parse_progress("frame=0\nfps=0\nprogress=continue\n").is_none());
+    }
+
+    #[test]
+    fn segments_are_named_after_the_partial() {
+        let partial = Path::new("/nonexistent/NIRUCLIP-x.part.mkv");
+        assert_eq!(
+            segment_path(partial, 2),
+            PathBuf::from("/nonexistent/NIRUCLIP-x.seg2.part.mkv")
+        );
+    }
+
+    #[test]
+    fn paused_sessions_are_active() {
+        let mut session = Session::empty();
+        session.state = "paused".into();
+        assert!(session.active());
+        assert!(!session.terminal());
     }
 
     #[test]

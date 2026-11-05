@@ -15,6 +15,18 @@ for arg in "$@"; do
   prev=$arg
   last=$arg
 done
+# Lossless concat of pause/resume segments: copy every listed file.
+if printf '%s\n' "$@" | grep -qx concat; then
+  [ "${FAKE_CONCAT:-ok}" = ok ] || exit 1
+  list=; prev=
+  for arg in "$@"; do [ "$prev" = "-i" ] && list=$arg; prev=$arg; done
+  [ ! -e "$last" ] || exit 1
+  : > "$last"
+  sed -n "s/^file '\(.*\)'$/\1/p" "$list" | while IFS= read -r part; do cat "$part" >> "$last"; done
+  exit 0
+fi
+# A resume that cannot start a new segment.
+if [ -n "${FAKE_FAIL_FLAG:-}" ] && [ -e "$FAKE_FAIL_FLAG" ]; then exit 1; fi
 # The one-frame VAAPI probe writes to the null muxer ("-").
 if [ "$last" = "-" ]; then
   [ -z "${FAKE_PROBE_COUNT:-}" ] || printf 'probe\n' >> "$FAKE_PROBE_COUNT"
@@ -69,8 +81,10 @@ cat > "$TMP/ffprobe" <<'EOF'
 #!/bin/sh
 last=
 for arg in "$@"; do last=$arg; done
-grep -q partial "$last" 2>/dev/null || exit 1
-printf '%s\n' '{"streams":[{"codec_name":"h264"}],"format":{"duration":"1.5"}}'
+n=$(grep -o partial "$last" 2>/dev/null | wc -l)
+[ "$n" -gt 0 ] || exit 1
+# Every recorded segment contributes 1.5 s, so joins are checked for length.
+printf '{"streams":[{"codec_name":"h264"}],"format":{"duration":"%s"}}\n' "$(awk -v n="$n" 'BEGIN{print n*1.5}')"
 EOF
 cat > "$TMP/xrandr" <<'EOF'
 #!/bin/sh
@@ -381,6 +395,77 @@ grep -qx 'Saving…' "$FAKE_NOTIFY_LOG"
 saving_line=$(grep -nx 'Saving…' "$FAKE_NOTIFY_LOG" | cut -d: -f1)
 saved_line=$(grep -n '^Saved ' "$FAKE_NOTIFY_LOG" | cut -d: -f1)
 [ "$saving_line" -lt "$saved_line" ]
+
+# U1: pause and resume record segments that are joined losslessly on stop.
+NIRUCLIP_FFMPEG="$TMP/ffmpeg-ok" common "$BIN" --full --audio none --countdown 0 --output "$TMP/out/pause.mkv" >/dev/null 2>&1 &
+pid=$!
+wait_state recording pause.mkv
+common "$BIN" --resume | grep -qx 'NIRUCLIP already recording'
+common "$BIN" --pause | grep -qx 'NIRUCLIP paused'
+common "$BIN" --status --json | grep -q '"state": "paused"'
+common "$BIN" --status --json | grep -q '"elapsed_before": 1.5'
+common "$BIN" --pause | grep -qx 'NIRUCLIP already paused'
+[ -s "$TMP/out/pause.part.mkv" ]
+common "$BIN" --resume | grep -qx 'NIRUCLIP resumed'
+common "$BIN" --status --json | grep -q '"state": "recording"'
+common "$BIN" --status --json | grep -q 'pause.seg2.part.mkv'
+common "$BIN" --pause >/dev/null
+common "$BIN" --resume >/dev/null
+[ -s "$TMP/out/pause.seg3.part.mkv" ]
+common "$BIN" --stop >/dev/null
+wait "$pid"
+common "$BIN" --status --json | grep -q '"state": "finished"'
+[ "$(grep -o partial "$TMP/out/pause.mkv" | wc -l)" -eq 3 ] || { echo 'segments were not joined' >&2; exit 1; }
+if ls "$TMP/out" | grep -q '^pause\..*part'; then echo 'segment files left behind' >&2; exit 1; fi
+if common "$BIN" --status --json | grep -q '"segments"'; then echo 'segments left in a finished session' >&2; exit 1; fi
+
+# U1: a stop while paused saves what was recorded.
+NIRUCLIP_FFMPEG="$TMP/ffmpeg-ok" common "$BIN" --full --audio none --countdown 0 --output "$TMP/out/pause-stop.mkv" >/dev/null 2>&1 &
+pid=$!
+wait_state recording pause-stop
+common "$BIN" --pause >/dev/null
+common "$BIN" --stop >/dev/null
+wait "$pid"
+common "$BIN" --status --json | grep -q '"state": "finished"'
+[ -s "$TMP/out/pause-stop.mkv" ]
+
+# U1: SIGKILL with several segments, then --recover joins them.
+NIRUCLIP_FFMPEG="$TMP/ffmpeg-ok" common "$BIN" --full --audio none --countdown 0 --output "$TMP/out/pause-kill.mkv" >/dev/null 2>&1 &
+pid=$!
+wait_state recording pause-kill
+common "$BIN" --pause >/dev/null
+common "$BIN" --resume >/dev/null
+kill_recorder "$pid"
+NIRUCLIP_FFMPEG="$TMP/ffmpeg-ok" common "$BIN" --recover >/dev/null
+common "$BIN" --status --json | grep -q '"reason": "recovered from 2 segments"'
+[ "$(grep -o partial "$TMP/out/pause-kill.mkv" | wc -l)" -eq 2 ]
+
+# U1: if the join fails every segment is saved on its own; nothing is lost.
+FAKE_CONCAT=fail NIRUCLIP_FFMPEG="$TMP/ffmpeg-ok" common "$BIN" --full --audio none --countdown 0 --output "$TMP/out/nojoin.mkv" >/dev/null 2>&1 &
+pid=$!
+wait_state recording nojoin
+FAKE_CONCAT=fail common "$BIN" --pause >/dev/null
+FAKE_CONCAT=fail common "$BIN" --resume >/dev/null
+common "$BIN" --stop >/dev/null
+wait "$pid"
+common "$BIN" --status --json | grep -q 'separate parts'
+[ -s "$TMP/out/nojoin.mkv" ] && [ -s "$TMP/out/nojoin-2.mkv" ]
+
+# U1: a resume that cannot start ffmpeg keeps the recorded part.
+export FAKE_FAIL_FLAG="$TMP/fail-next"
+NIRUCLIP_FFMPEG="$TMP/ffmpeg-ok" common "$BIN" --full --audio none --countdown 0 --output "$TMP/out/badresume.mkv" >/dev/null 2>&1 &
+pid=$!
+wait_state recording badresume
+common "$BIN" --pause >/dev/null
+touch "$FAKE_FAIL_FLAG"
+if common "$BIN" --resume >/dev/null 2>&1; then echo 'failed resume reported success' >&2; exit 1; fi
+wait "$pid" || true
+rm -f "$FAKE_FAIL_FLAG"
+unset FAKE_FAIL_FLAG
+common "$BIN" --status --json | grep -q '"state": "finished"'
+common "$BIN" --status --json | grep -q 'could not resume'
+[ -s "$TMP/out/badresume.mkv" ]
+if ls "$TMP/out" | grep -q '^badresume\..*part'; then echo 'failed resume left a partial' >&2; exit 1; fi
 
 # Profiles are listable, saveable and apply the camera-only mode.
 common "$BIN" --list-profiles | grep -q '^camera-mic'
