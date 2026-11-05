@@ -90,6 +90,14 @@ detail. A recording is only announced as started after FFmpeg has produced its
 first frame, and a source that never delivers frames fails clearly instead of
 leaving a false "recording" state.
 
+## Audio
+
+`--audio both` mixes the microphone and desktop audio at unity gain
+(`amix normalize=0`, so neither source is attenuated) and then applies a peak
+limiter (`alimiter=limit=0.95:level=0`). The limiter only engages when the
+sum of both sources would clip; it adds no automatic gain, so normal levels
+are unchanged.
+
 ## Profiles and notifications
 
 Profiles live in `${XDG_CONFIG_HOME:-$HOME/.config}/niruclip/config.toml`.

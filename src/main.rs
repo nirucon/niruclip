@@ -1515,8 +1515,11 @@ fn build_plan(
     }
     let has_audio = resolved.audio != Audio::None;
     if resolved.audio == Audio::Both {
+        // The mix keeps both sources at unity gain (normalize=0). A peak
+        // limiter at 0.95 (level=0: no automatic make-up gain) only acts when
+        // the sum would clip, so levels are otherwise unchanged.
         filters.push(format!(
-            "[{audio_index}:a][{}:a]amix=inputs=2:normalize=0[a]",
+            "[{audio_index}:a][{}:a]amix=inputs=2:normalize=0,alimiter=limit=0.95:level=0[a]",
             audio_index + 1
         ));
     }
