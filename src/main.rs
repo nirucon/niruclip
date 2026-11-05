@@ -1825,10 +1825,70 @@ Options:\n\
     );
 }
 
+/// `--status --json`: the session as stored plus fields derived when asked.
+#[derive(Serialize)]
+struct StatusView<'a> {
+    #[serde(flatten)]
+    session: &'a Session,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    elapsed_seconds: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    drop_warning: Option<bool>,
+}
+
+/// Recorded time: finished segments plus the current segment's progress.
+fn session_elapsed(session: &Session) -> Option<f64> {
+    if !session.active() {
+        return None;
+    }
+    let current = match session.state.as_str() {
+        "recording" | "pausing" | "finalizing" => session
+            .performance
+            .as_ref()
+            .and_then(|performance| performance.out_time_us)
+            .map(|us| us as f64 / 1e6)
+            .unwrap_or(0.0),
+        _ => 0.0,
+    };
+    Some(session.elapsed_before.unwrap_or(0.0) + current)
+}
+
+fn session_size(session: &Session) -> Option<u64> {
+    let files = if session.state == "finished" {
+        vec![PathBuf::from(&session.output)]
+    } else {
+        session_media(session)
+    };
+    let sizes: Vec<u64> = files
+        .iter()
+        .filter_map(|path| fs::metadata(path).ok().map(|meta| meta.len()))
+        .collect();
+    (!sizes.is_empty()).then(|| sizes.iter().sum())
+}
+
+fn clock(seconds: f64) -> String {
+    let total = seconds.max(0.0) as u64;
+    format!("{}:{:02}:{:02}", total / 3600, total / 60 % 60, total % 60)
+}
+
 fn status(options: &Options) {
     let session = read_state().unwrap_or_else(Session::empty);
+    let elapsed = session_elapsed(&session);
+    let size = session_size(&session);
+    let drop_warning = session
+        .performance
+        .as_ref()
+        .map(Performance::needs_attention);
     if options.json {
-        match serde_json::to_string_pretty(&session) {
+        let view = StatusView {
+            session: &session,
+            elapsed_seconds: elapsed.map(|value| (value * 10.0).round() / 10.0),
+            size_bytes: size,
+            drop_warning,
+        };
+        match serde_json::to_string_pretty(&view) {
             Ok(text) => println!("{text}"),
             Err(error) => {
                 eprintln!("niruclip: could not serialize state: {error}");
@@ -1839,14 +1899,22 @@ fn status(options: &Options) {
     }
     println!("NIRUCLIP {VERSION}");
     println!("state: {}", session.state);
-    if !session.output.is_empty() {
-        println!("output: {}", session.output);
+    if session.state != "idle" {
+        let mut mode = session.mode.clone();
+        if session.webcam == "corner" {
+            mode.push_str(&format!(", camera {}", session.corner));
+        }
+        mode.push_str(&format!(
+            ", audio {}, preset {}",
+            session.audio, session.preset
+        ));
+        println!("mode: {mode}");
     }
-    if !session.partial.is_empty() {
-        println!("partial: {}", session.partial);
+    if let Some(elapsed) = elapsed {
+        println!("elapsed: {}", clock(elapsed));
     }
-    if let Some(reason) = &session.reason {
-        println!("reason: {reason}");
+    if let Some(size) = size {
+        println!("size: {}", human_bytes(size));
     }
     if let Some(encoder) = &session.encoder {
         println!("encoder: {encoder}");
@@ -1854,16 +1922,29 @@ fn status(options: &Options) {
     if let Some(fallback) = &session.fallback {
         println!("fallback: {fallback}");
     }
+    if let Some(fps) = session.performance.as_ref().and_then(|p| p.fps) {
+        println!("fps: {fps:.1}");
+    }
     if let Some(performance) = &session.performance {
         let summary = performance.summary();
         if !summary.is_empty() {
             println!("performance: {summary}");
         }
-        if performance.needs_attention() {
-            println!(
-                "warning: capture cannot keep up; try preset small or disable the camera overlay"
-            );
-        }
+    }
+    if drop_warning == Some(true) {
+        println!("warning: capture cannot keep up; try preset small or disable the camera overlay");
+    }
+    if !session.output.is_empty() {
+        println!("output: {}", session.output);
+    }
+    if !session.partial.is_empty() && session.state != "finished" {
+        println!("partial: {}", session.partial);
+    }
+    if let Some(segments) = &session.segments {
+        println!("segments: {}", segments.len());
+    }
+    if let Some(reason) = &session.reason {
+        println!("reason: {reason}");
     }
     if session.recoverable {
         println!("recovery: available (niruclip --recover)");

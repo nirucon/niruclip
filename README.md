@@ -98,6 +98,13 @@ it to 0, and it is put back when the recording ends. After a SIGKILL, a crash
 or a power loss, `--stop`, `--recover` and the next recording start restore it
 from the stored session once the recorder process is gone.
 
+`niruclip --status` shows the state, mode (with camera corner, audio and
+preset), recorded time (excluding pauses), size so far, encoder and fallback,
+fps and the performance counters, a drop warning, the output path, the number
+of segments and the reason. `--status --json` prints the stored session plus
+the derived `elapsed_seconds`, `size_bytes` and `drop_warning` fields (all
+optional).
+
 State is stored at `${XDG_STATE_HOME:-$HOME/.local/state}/niruclip/session.json`
 and published atomically with schema version 1. NIRUBAR reads the same file and
 shows the active recording, an interrupted recovery, or a failure. While

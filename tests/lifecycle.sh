@@ -503,6 +503,26 @@ sleep 0.3
 [ "$(grep -c '^Low disk space: 1.9 GB free' "$FAKE_NOTIFY_LOG")" -eq 1 ]
 unset NIRUCLIP_TEST_FREE_BYTES_FILE NIRUCLIP_TEST_DISK_INTERVAL_MS
 
+# U3: --status shows mode, elapsed time, size, encoder, fps, a drop warning
+# and the output path; --status --json carries the same derived fields.
+NIRUCLIP_FFMPEG="$TMP/ffmpeg-ok" common "$BIN" --full --webcam corner --audio mic --countdown 0 --output "$TMP/out/status.mkv" >/dev/null 2>&1 &
+pid=$!
+wait_state recording status.mkv
+human=$(common "$BIN" --status)
+for line in '^state: recording$' '^mode: full, camera bottom-right, audio mic, preset share$' '^elapsed: 0:00:00$' '^size: ' '^encoder: software$' '^fps: 30.0$' "^output: $TMP/out/status.mkv\$"; do
+  printf '%s\n' "$human" | grep -q "$line" || { echo "status lacks $line" >&2; printf '%s\n' "$human" >&2; exit 1; }
+done
+if printf '%s\n' "$human" | grep -q '^warning:'; then echo 'healthy capture shows a drop warning' >&2; exit 1; fi
+json=$(common "$BIN" --status --json)
+for key in '"elapsed_seconds": 0.0' '"size_bytes": 7' '"drop_warning": false' '"encoder": "software"'; do
+  printf '%s\n' "$json" | grep -qF "$key" || { echo "status --json lacks $key" >&2; exit 1; }
+done
+common "$BIN" --pause >/dev/null
+common "$BIN" --status | grep -q '^elapsed: 0:00:01$'
+common "$BIN" --status --json | grep -qF '"elapsed_seconds": 1.5'
+common "$BIN" --stop >/dev/null
+wait "$pid"
+
 # Profiles are listable, saveable and apply the camera-only mode.
 common "$BIN" --list-profiles | grep -q '^camera-mic'
 common "$BIN" --save-profile test-profile --webcam-only --audio none --webcam-size small
