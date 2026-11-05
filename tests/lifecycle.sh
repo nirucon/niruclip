@@ -83,6 +83,21 @@ cat > "$TMP/slop" <<'EOF'
 #!/bin/sh
 printf '%s\n' '10 20 800 600'
 EOF
+cat > "$TMP/v4l2-ctl" <<'EOF'
+#!/bin/sh
+# Fake camera control: the value lives in $FAKE_V4L2_STATE, sets are logged.
+[ -n "${FAKE_V4L2_STATE:-}" ] || exit 1
+case "$3" in
+  --get-ctrl)
+    [ -f "$FAKE_V4L2_STATE" ] || exit 1
+    printf '%s: %s\n' "$4" "$(cat "$FAKE_V4L2_STATE")" ;;
+  --set-ctrl)
+    printf '%s' "${4#*=}" > "$FAKE_V4L2_STATE"
+    printf '%s\n' "$4" >> "$FAKE_V4L2_STATE.log" ;;
+  *) exit 1 ;;
+esac
+EOF
+chmod +x "$TMP/v4l2-ctl"
 chmod +x "$TMP"/ffmpeg-ok "$TMP"/ffmpeg-fail "$TMP"/ffmpeg-interrupt "$TMP"/ffmpeg-silent "$TMP"/ffprobe "$TMP"/xrandr "$TMP"/slop
 
 common() {
@@ -92,6 +107,7 @@ common() {
   NIRUCLIP_XRANDR="$TMP/xrandr" \
   NIRUCLIP_SLOP="$TMP/slop" \
   NIRUCLIP_FFPROBE="$TMP/ffprobe" \
+  NIRUCLIP_V4L2CTL="$TMP/v4l2-ctl" \
   NIRUCLIP_NOTIFY=0 \
   NIRUCLIP_VAAPI_DEVICE="${FAKE_RENDER_NODE:-$TMP/no-render-node}" \
   DISPLAY=:0 \
@@ -100,9 +116,13 @@ common() {
 
 wait_state() {
   state=$1
+  # An optional second argument must also appear (for example the output
+  # name), so a stale state from a killed recorder is not mistaken for it.
+  also=${2:-\"state\"}
   i=0
   while [ "$i" -lt 100 ]; do
-    if common "$BIN" --status --json | grep -q "\"state\": \"$state\""; then return 0; fi
+    json=$(common "$BIN" --status --json)
+    if printf '%s\n' "$json" | grep -q "\"state\": \"$state\"" && printf '%s\n' "$json" | grep -qF "$also"; then return 0; fi
     sleep 0.1
     i=$((i + 1))
   done
@@ -270,6 +290,72 @@ wait "$pid"
 grep -q '^libx264$' "$TMP/vaapi.log"
 grep -q "\"$TMP/renderD130\":false" "$TMP/state/vaapi-probe.json"
 unset FAKE_PROBE_COUNT FAKE_LOG
+
+# C4: the camera control is persisted before it is changed and restored by a
+# normal stop, by --stop and --recover after SIGKILL, and by the next start.
+export FAKE_V4L2_STATE="$TMP/camera.ctrl"
+ctrl() { cat "$FAKE_V4L2_STATE"; }
+kill_recorder() {
+  json=$(common "$BIN" --status --json)
+  recorder=$(printf '%s\n' "$json" | sed -n 's/^  "pid": \([0-9]*\).*/\1/p')
+  child=$(printf '%s\n' "$json" | sed -n 's/.*"child_pid": \([0-9]*\).*/\1/p')
+  kill -9 "$recorder"
+  wait "$1" 2>/dev/null || true
+  [ -z "$child" ] || kill -9 -- "-$child" 2>/dev/null || true
+}
+printf 1 > "$FAKE_V4L2_STATE"
+NIRUCLIP_FFMPEG="$TMP/ffmpeg-ok" common "$BIN" --webcam-only --audio none --countdown 0 --output "$TMP/out/cam-normal.mkv" >/dev/null 2>&1 &
+pid=$!
+wait_state recording
+[ "$(ctrl)" = 0 ]
+common "$BIN" --status --json | grep -q '"previous": "1"'
+common "$BIN" --stop >/dev/null
+wait "$pid"
+[ "$(ctrl)" = 1 ]
+if common "$BIN" --status --json | grep -q camera_restore; then echo 'camera_restore left in a finished session' >&2; exit 1; fi
+
+NIRUCLIP_FFMPEG="$TMP/ffmpeg-ok" common "$BIN" --webcam-only --audio none --countdown 0 --output "$TMP/out/cam-kill.mkv" >/dev/null 2>&1 &
+pid=$!
+wait_state recording
+[ "$(ctrl)" = 0 ]
+kill_recorder "$pid"
+[ "$(ctrl)" = 0 ]
+common "$BIN" --status --json | grep -q '"camera_restore"'
+common "$BIN" --recover >/dev/null
+[ "$(ctrl)" = 1 ] || { echo '--recover did not restore the camera control' >&2; exit 1; }
+[ -s "$TMP/out/cam-kill.mkv" ]
+if common "$BIN" --status --json | grep -q camera_restore; then echo 'camera_restore survived --recover' >&2; exit 1; fi
+
+NIRUCLIP_FFMPEG="$TMP/ffmpeg-ok" common "$BIN" --webcam-only --audio none --countdown 0 --output "$TMP/out/cam-stop.mkv" >/dev/null 2>&1 &
+pid=$!
+wait_state recording
+kill_recorder "$pid"
+common "$BIN" --stop >/dev/null 2>&1 || true
+[ "$(ctrl)" = 1 ] || { echo '--stop did not restore the camera control' >&2; exit 1; }
+common "$BIN" --recover >/dev/null
+
+NIRUCLIP_FFMPEG="$TMP/ffmpeg-ok" common "$BIN" --webcam-only --audio none --countdown 0 --output "$TMP/out/cam-stale.mkv" >/dev/null 2>&1 &
+pid=$!
+wait_state recording
+kill_recorder "$pid"
+: > "$FAKE_V4L2_STATE.log"
+NIRUCLIP_FFMPEG="$TMP/ffmpeg-ok" common "$BIN" --full --audio none --countdown 0 --output "$TMP/out/after-stale.mkv" >/dev/null 2>&1 &
+pid=$!
+wait_state recording after-stale
+common "$BIN" --stop >/dev/null
+wait "$pid"
+[ "$(ctrl)" = 1 ]
+[ "$(cat "$FAKE_V4L2_STATE.log")" = "exposure_dynamic_framerate=1" ] || { echo 'next start did not restore the stale camera control' >&2; exit 1; }
+
+# A camera already at 0 (or without the control) is left alone.
+printf 0 > "$FAKE_V4L2_STATE"; : > "$FAKE_V4L2_STATE.log"
+NIRUCLIP_FFMPEG="$TMP/ffmpeg-ok" common "$BIN" --webcam-only --audio none --countdown 0 --output "$TMP/out/cam-zero.mkv" >/dev/null 2>&1 &
+pid=$!
+wait_state recording
+common "$BIN" --stop >/dev/null
+wait "$pid"
+[ ! -s "$FAKE_V4L2_STATE.log" ]
+unset FAKE_V4L2_STATE
 
 # Profiles are listable, saveable and apply the camera-only mode.
 common "$BIN" --list-profiles | grep -q '^camera-mic'

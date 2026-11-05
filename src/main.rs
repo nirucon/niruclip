@@ -638,6 +638,8 @@ struct Session {
     /// Why a requested or detected hardware encoder was not used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     fallback: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    camera_restore: Option<CameraRestore>,
 }
 
 impl Session {
@@ -666,6 +668,7 @@ impl Session {
             reason: None,
             encoder: None,
             fallback: None,
+            camera_restore: None,
         }
     }
 
@@ -1059,68 +1062,73 @@ struct Plan {
     height: u32,
 }
 
-struct CameraControl {
+const CAMERA_CONTROL: &str = "exposure_dynamic_framerate";
+
+/// A camera control NIRUCLIP changed and must put back. It is stored in
+/// session.json *before* the change, so --stop, --recover and the next start
+/// can restore it after a SIGKILL, a crash or a power loss.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct CameraRestore {
     device: String,
-    previous: Option<String>,
+    control: String,
+    previous: String,
 }
 
-impl CameraControl {
-    fn apply(device: &str) -> Self {
-        let command = command_path("v4l2-ctl", "NIRUCLIP_V4L2CTL");
-        let previous = Command::new(&command)
-            .args([
-                "--device",
-                device,
-                "--get-ctrl",
-                "exposure_dynamic_framerate",
-            ])
-            .stdin(Stdio::null())
-            .output()
-            .ok()
-            .filter(|output| output.status.success())
-            .and_then(|output| {
-                String::from_utf8_lossy(&output.stdout)
-                    .split_once(':')
-                    .map(|(_, value)| value.trim().to_string())
-            })
-            .filter(|value| value == "0" || value == "1");
-        if previous.as_deref() != Some("0") {
-            let _ = Command::new(&command)
-                .args([
-                    "--device",
-                    device,
-                    "--set-ctrl",
-                    "exposure_dynamic_framerate=0",
-                ])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-        }
-        Self {
-            device: device.to_string(),
-            previous,
-        }
+fn v4l2_ctl() -> String {
+    command_path("v4l2-ctl", "NIRUCLIP_V4L2CTL")
+}
+
+fn read_camera_control(device: &str) -> Option<String> {
+    Command::new(v4l2_ctl())
+        .args(["--device", device, "--get-ctrl", CAMERA_CONTROL])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .split_once(':')
+                .map(|(_, value)| value.trim().to_string())
+        })
+        .filter(|value| value == "0" || value == "1")
+}
+
+fn set_camera_control(device: &str, control: &str, value: &str) -> bool {
+    Command::new(v4l2_ctl())
+        .args([
+            "--device",
+            device,
+            "--set-ctrl",
+            &format!("{control}={value}"),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn restore_camera(restore: &CameraRestore) {
+    if !set_camera_control(&restore.device, &restore.control, &restore.previous) {
+        eprintln!(
+            "niruclip: could not restore {}={} on {}",
+            restore.control, restore.previous, restore.device
+        );
     }
 }
 
-impl Drop for CameraControl {
-    fn drop(&mut self) {
-        if let Some(previous) = &self.previous {
-            let command = command_path("v4l2-ctl", "NIRUCLIP_V4L2CTL");
-            let _ = Command::new(&command)
-                .args([
-                    "--device",
-                    &self.device,
-                    "--set-ctrl",
-                    &format!("exposure_dynamic_framerate={previous}"),
-                ])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-        }
+/// Restore a camera control left behind by a recorder that is gone, and
+/// clear it from the session. Returns true when the session changed.
+fn restore_stale_camera(session: &mut Session) -> bool {
+    if session.camera_restore.is_none() || pid_alive(session.pid, session.pid_start) {
+        return false;
     }
+    if let Some(restore) = session.camera_restore.take() {
+        restore_camera(&restore);
+    }
+    true
 }
 
 struct CaptureInputs {
@@ -1883,7 +1891,25 @@ fn run_recording(options: Options) -> Result<(), String> {
     install_signal_handlers();
     SIGNAL.store(0, Ordering::SeqCst);
     let _lock = acquire_lock()?;
-    if let Some(previous) = read_state() {
+    let mut camera = None;
+    let result = record(options, &mut camera);
+    if let Some(restore) = camera {
+        restore_camera(&restore);
+        if let Some(mut session) = read_state() {
+            if session.camera_restore.as_ref() == Some(&restore) {
+                session.camera_restore = None;
+                let _ = write_state(&session);
+            }
+        }
+    }
+    result
+}
+
+fn record(options: Options, camera: &mut Option<CameraRestore>) -> Result<(), String> {
+    if let Some(mut previous) = read_state() {
+        if restore_stale_camera(&mut previous) {
+            let _ = write_state(&previous);
+        }
         if previous.state == "interrupted" || previous.state == "failed" {
             eprintln!(
                 "niruclip: previous session is {}; run niruclip --recover if a partial exists",
@@ -1898,12 +1924,6 @@ fn run_recording(options: Options) -> Result<(), String> {
         None
     } else {
         Some(current_display()?)
-    };
-    let camera_device = std::env::var("NIRUCLIP_CAMERA").unwrap_or_else(|_| "/dev/video0".into());
-    let _camera_control = if options.mode == Mode::WebcamOnly || options.webcam != Webcam::Off {
-        Some(CameraControl::apply(&camera_device))
-    } else {
-        None
     };
     let requested = output_path(options.output.as_deref())?;
     let (output, partial) = unique_pair(&requested);
@@ -1949,8 +1969,25 @@ fn run_recording(options: Options) -> Result<(), String> {
         reason: None,
         encoder: Some(selection.encoder.as_str().into()),
         fallback: selection.fallback.clone(),
+        camera_restore: None,
     };
     write_state(&session)?;
+    if options.mode == Mode::WebcamOnly || options.webcam != Webcam::Off {
+        // Ask for a steady 30 fps: dynamic exposure framerate halves the
+        // camera rate in low light. The previous value is persisted first.
+        let device = std::env::var("NIRUCLIP_CAMERA").unwrap_or_else(|_| "/dev/video0".into());
+        if let Some(previous) = read_camera_control(&device).filter(|value| value != "0") {
+            let restore = CameraRestore {
+                device: device.clone(),
+                control: CAMERA_CONTROL.into(),
+                previous,
+            };
+            session.camera_restore = Some(restore.clone());
+            write_state(&session)?;
+            *camera = Some(restore);
+            set_camera_control(&device, CAMERA_CONTROL, "0");
+        }
+    }
     if options.countdown > 0 {
         let mut remaining = options.countdown;
         while remaining > 0 {
@@ -2327,6 +2364,7 @@ fn stop_recording() -> Result<(), String> {
         std::thread::sleep(Duration::from_millis(500));
         signal_group(session.child_pid, libc::SIGTERM);
     }
+    restore_stale_camera(&mut session);
     session.recoverable = validate_media(Path::new(&session.partial));
     session.state = if session.recoverable {
         "interrupted".into()
@@ -2350,6 +2388,12 @@ fn recover() -> Result<(), String> {
     let Some(mut session) = read_state() else {
         return Err("no recording state to recover".into());
     };
+    if session.active() && pid_alive(session.pid, session.pid_start) {
+        return Err("the recording is still running; use niruclip --stop".into());
+    }
+    if restore_stale_camera(&mut session) {
+        write_state(&session)?;
+    }
     if session.state == "finished" {
         println!("NIRUCLIP recording already saved: {}", session.output);
         return Ok(());

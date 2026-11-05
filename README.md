@@ -73,6 +73,12 @@ kept and `niruclip --recover` validates and restores it. A failed startup with
 no usable media is `failed`, not recoverable. A crash leaves stale state; the
 next status/stop check does not signal a reused PID.
 
+The camera's `exposure_dynamic_framerate` control is stored in `session.json`
+(`camera_restore`, with the device and the previous value) before NIRUCLIP sets
+it to 0, and it is put back when the recording ends. After a SIGKILL, a crash
+or a power loss, `--stop`, `--recover` and the next recording start restore it
+from the stored session once the recorder process is gone.
+
 State is stored at `${XDG_STATE_HOME:-$HOME/.local/state}/niruclip/session.json`
 and published atomically with schema version 1. NIRUBAR reads the same file and
 shows the active recording, an interrupted recovery, or a failure. While
