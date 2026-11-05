@@ -108,7 +108,7 @@ common() {
   NIRUCLIP_SLOP="$TMP/slop" \
   NIRUCLIP_FFPROBE="$TMP/ffprobe" \
   NIRUCLIP_V4L2CTL="$TMP/v4l2-ctl" \
-  NIRUCLIP_NOTIFY=0 \
+  NIRUCLIP_NOTIFY="${FAKE_NOTIFY:-0}" \
   NIRUCLIP_VAAPI_DEVICE="${FAKE_RENDER_NODE:-$TMP/no-render-node}" \
   DISPLAY=:0 \
   "$@"
@@ -361,6 +361,26 @@ common "$BIN" --stop >/dev/null
 wait "$pid"
 [ ! -s "$FAKE_V4L2_STATE.log" ]
 unset FAKE_V4L2_STATE
+
+# C7: a stop announces "Saving…" before the file is finalized.
+cat > "$TMP/notify-send" <<'EOF'
+#!/bin/sh
+for last in "$@"; do :; done
+printf '%s\n' "$last" >> "$FAKE_NOTIFY_LOG"
+EOF
+chmod +x "$TMP/notify-send"
+export FAKE_NOTIFY_LOG="$TMP/notify.log"
+: > "$FAKE_NOTIFY_LOG"
+FAKE_NOTIFY=1 NIRUCLIP_NOTIFY_SEND="$TMP/notify-send" NIRUCLIP_FFMPEG="$TMP/ffmpeg-ok" common "$BIN" --full --audio none --countdown 0 --output "$TMP/out/saving.mkv" >/dev/null 2>&1 &
+pid=$!
+wait_state recording saving
+common "$BIN" --stop >/dev/null
+wait "$pid"
+sleep 0.3
+grep -qx 'Saving…' "$FAKE_NOTIFY_LOG"
+saving_line=$(grep -nx 'Saving…' "$FAKE_NOTIFY_LOG" | cut -d: -f1)
+saved_line=$(grep -n '^Saved ' "$FAKE_NOTIFY_LOG" | cut -d: -f1)
+[ "$saving_line" -lt "$saved_line" ]
 
 # Profiles are listable, saveable and apply the camera-only mode.
 common "$BIN" --list-profiles | grep -q '^camera-mic'

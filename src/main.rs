@@ -881,7 +881,7 @@ fn notify(options: &Options, summary: &str, body: &str) {
     {
         return;
     }
-    let _ = Command::new("notify-send")
+    let _ = Command::new(command_path("notify-send", "NIRUCLIP_NOTIFY_SEND"))
         .args(["-a", "NIRUCLIP", "-t", "3000", summary, body])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -2157,6 +2157,8 @@ fn record(options: Options, camera: &mut Option<CameraRestore>) -> Result<(), St
     loop {
         if SIGNAL.load(Ordering::SeqCst) != 0 && !requested_stop {
             requested_stop = true;
+            // Validation and the rename follow; say so at once.
+            notify(&options, "NIRUCLIP", "Saving…");
             session.state = "finalizing".into();
             let _ = write_state(&session);
             signal_group(child.id(), libc::SIGINT);
