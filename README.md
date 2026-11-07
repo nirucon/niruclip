@@ -4,6 +4,10 @@ Screen, region and camera recorder for the NIRUX X11 desktop.
 
 **Status: alpha** · Part of the [NIRUX](https://github.com/nirucon/nirux) suite · [MIT License](LICENSE)
 
+![NIRUCLIP capture profiles in NIRU Launcher](docs/screenshots/main.png)
+
+*Capture profiles as they appear in NIRU Launcher (`nirulauncher --clip`).*
+
 ## About
 
 NIRUCLIP is a small native X11 recorder. It owns the recording process and a
