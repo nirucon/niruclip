@@ -1,10 +1,65 @@
 # NIRUCLIP
 
-**Part of [NIRUX - A minimal X11 desktop by Nicklas Rudolfsson](https://github.com/nirucon/nirux).**
+Screen, region and camera recorder for the NIRUX X11 desktop.
 
-**Early beta.** A small native X11 screen, region and camera recorder. NIRUCLIP
-owns the recording process and a versioned state file; ffmpeg performs encoding
-and `slop` selects a rectangle. It does not upload or run a background daemon.
+**Status: alpha** · Part of the [NIRUX](https://github.com/nirucon/nirux) suite · [MIT License](LICENSE)
+
+## About
+
+NIRUCLIP is a small native X11 recorder. It owns the recording process and a
+versioned state file; ffmpeg does the encoding and `slop` selects a rectangle.
+It does not upload anything and runs no background daemon: a recording is one
+process that lives exactly as long as the recording.
+
+In NIRUX you normally start it from the recording view of NIRU Launcher, and
+NIRUBAR shows the running, paused, interrupted or failed recording.
+
+## Features
+
+- Full screen, region, window rectangle or camera-only recording.
+- Microphone, desktop audio or both (mixed at unity gain with a peak limiter).
+- Camera overlay in any corner at three sizes, or camera only.
+- `share`, `small` and `quality` presets that never upscale a smaller screen.
+- VAAPI hardware encoding when a probe succeeds, with automatic software
+  (`libx264`) fallback.
+- Pause and resume with a lossless join of the segments on stop.
+- Crash-safe output: `.part.mkv` files, validation before rename, and
+  `--recover` for interrupted recordings, including a lossless remux after a
+  power loss.
+- Saved profiles plus four built-ins, and a configurable default profile.
+- Free-space checks: a warning below 2 GB, a clean stop below 500 MB.
+- Frame drop/duplication monitoring in `--status` and NIRUBAR.
+- Countdown, start and result notifications.
+
+## Requirements
+
+- X11 (Debian, Arch and Void glibc, x86_64). The released binary is a static
+  x86_64 musl build.
+- `ffmpeg` (with `ffprobe`), `slop` for region capture, `xrandr`.
+- For camera and microphone: a V4L2 camera, `v4l2-ctl` (`v4l-utils`) and
+  PipeWire's PulseAudio interface.
+- Optional: `notify-send`, a VAAPI driver for hardware encoding.
+
+NIRUX installs the matching packages.
+
+## Installation
+
+### With NIRUX
+
+NIRUCLIP is a core component: `nirux install` and `nirux update` install and
+update it as part of the pinned suite generation.
+
+### Standalone
+
+```sh
+./install.sh            # download the released static binary, verify SHA256SUMS, install to ~/.local/bin
+./install.sh --build    # build from this checkout with cargo and install it
+```
+
+`NIRUCLIP_PREFIX` changes the prefix (default `~/.local`); `NIRUCLIP_VERSION`
+installs another release.
+
+## Usage
 
 ```sh
 niruclip --full --audio mic
@@ -15,11 +70,12 @@ niruclip --profile screen-camera
 niruclip --pause
 niruclip --resume
 niruclip --stop
+niruclip --status
 niruclip --status --json
 niruclip --recover
+niruclip --list-profiles
+niruclip --full --audio desktop --save-profile demo
 ```
-
-## Capture choices
 
 | Option | Values |
 |---|---|
@@ -27,154 +83,139 @@ niruclip --recover
 | Audio | `--audio none`, `mic`, `desktop`, `both` |
 | Camera | `--webcam off`, `corner`, `only` |
 | Corner | `--corner top-left`, `top-right`, `bottom-left`, `bottom-right` |
-| Camera size | `--webcam-size small` (20%), `medium` (30%), `large` (40%) |
+| Camera size | `--webcam-size small` (20 %), `medium` (30 %, default), `large` (40 %) of the final video width |
 | Preset | `--preset share` (up to 1080p), `small` (up to 720p), `quality` |
-| Countdown | `--countdown 0..10` |
 | Encoder | `--encoder auto` (default), `software`, `vaapi` |
+| Countdown | `--countdown 0..10` |
+| Output | `--output PATH` (file or directory) |
+| Screen | `--screen OUTPUT` (connected RandR output for full/overlay) |
+| Profile | `--profile NAME` |
+| Notifications | `--no-notify` |
 
-Camera size is a target share of the **final video width**. The camera is never
-upscaled beyond its native width. The camera is requested at 30 fps and dynamic exposure framerate is disabled during capture so a 30 fps screen overlay does not show a 15 fps camera. When a camera overlay is used, the camera input is opened before the screen input; the reverse order made FFmpeg drop or duplicate most frames on the tested laptops even though either source worked alone. The default is `medium`. An overlay is placed 16 pixels from the selected corner.
+`--full` records the primary RandR output. `--window` currently records a
+selected static rectangle; it does not follow a window that moves or resizes.
 
-`--full` and an overlay use the primary connected RandR output at its real X11
-origin. `--screen OUTPUT` chooses another connected output. `--region` asks for
-a rectangle. `--window` currently records a selected static rectangle; it does
-not follow a window that moves or resizes. `--webcam-only` does not require a
-usable X11 screen geometry.
+Recordings go to `~/Videos/NIRUCLIP-YYYY-MM-DD_HH-MM-SS.mkv` unless
+`NIRUCLIP_OUTPUT` or `--output` says otherwise. Existing files are never
+overwritten.
 
-The `share` and `small` presets avoid upscaling a smaller screen. `quality`
-keeps the screen dimensions, rounded down to even values. Camera-only capture
-is capped at 1920 pixels wide (1280 with `small`) and keeps the camera aspect.
+The details of encoding, pause/resume, recovery, the state file, audio mixing,
+disk-space checks and exit codes are in [docs/REFERENCE.md](docs/REFERENCE.md).
 
-## Pause and resume
-
-`niruclip --pause` closes the current ffmpeg segment cleanly and the state
-becomes `paused`; no ffmpeg runs and the recorder sleeps without polling.
-`niruclip --resume` starts a new segment with the same capture settings and
-encoder. On stop the segments are joined losslessly with the concat demuxer
-(stream copy, no re-encode); the join is validated for length before the
-segment files are removed. If a join fails, or segments ended up with
-different encoders after a VAAPI fallback, every segment is saved as its own
-file instead (`NAME.mkv`, `NAME-2.mkv`, ...), so nothing is lost. A resume that
-cannot start keeps and saves what was already recorded. The segment list is
-stored in `session.json` (`segments`), so `--recover` joins them after a
-crash. `--stop` works while paused.
-
-NIRUBAR 0.18.84 does not know the `paused` state yet and hides its recording
-module while a recording is paused.
-
-## Encoding
-
-`--encoder auto` (config key `encoder = "auto"` in `config.toml`) uses VAAPI
-(`h264_vaapi`) when a render node `/dev/dri/renderD*` exists **and** a one-frame
-synthetic probe encode succeeds within 3 seconds. The probe result is cached per
-boot, ffmpeg binary and render node in `${XDG_STATE_HOME}/niruclip/vaapi-probe.json`.
-VAAPI uses constant QP mapped from the preset (`share` 25, `small` 30,
-`quality` 22). `software` always uses `libx264 -preset veryfast` with the
-preset CRF (23/28/20). `vaapi` skips the probe but still needs a render node;
-`NIRUCLIP_VAAPI_DEVICE` selects a node explicitly.
-
-Software encoding is the guaranteed fallback: when the hardware encoder stops
-before the first frame, NIRUCLIP retries once in software, marks that node as
-failed for the rest of the boot, and records `encoder` and `fallback` in the
-state and the start notification. `--status` shows the encoder in use.
-
-## Output and recovery
-
-The default destination is `~/Videos/NIRUCLIP-YYYY-MM-DD_HH-MM-SS.mkv`.
-`NIRUCLIP_OUTPUT` changes the directory and `--output` selects a file or an
-existing/created directory. Existing output and partial files are never
-overwritten; a numeric suffix is chosen instead. MKV is written as
-`.part.mkv` and renamed only after it contains a usable video stream.
-
-A controlled stop finalizes a valid partial as a normal saved recording. An
-unexpected encoder failure with a valid partial is `interrupted`: the partial is
-kept and `niruclip --recover` validates and restores it. A failed startup with
-no usable media is `failed`, not recoverable. If ffmpeg itself was killed (a power
-loss), the partial has no duration or index; `--recover` remuxes it
-losslessly (stream copy) and replaces the unfinished partial only after the
-copy validates. A crash leaves stale state; the
-next status/stop check does not signal a reused PID.
-
-The camera's `exposure_dynamic_framerate` control is stored in `session.json`
-(`camera_restore`, with the device and the previous value) before NIRUCLIP sets
-it to 0, and it is put back when the recording ends. After a SIGKILL, a crash
-or a power loss, `--stop`, `--recover` and the next recording start restore it
-from the stored session once the recorder process is gone.
-
-`niruclip --status` shows the state, mode (with camera corner, audio and
-preset), recorded time (excluding pauses), size so far, encoder and fallback,
-fps and the performance counters, a drop warning, the output path, the number
-of segments and the reason. `--status --json` prints the stored session plus
-the derived `elapsed_seconds`, `size_bytes` and `drop_warning` fields (all
-optional).
-
-State is stored at `${XDG_STATE_HOME:-$HOME/.local/state}/niruclip/session.json`
-and published atomically with schema version 1. NIRUBAR reads the same file and
-shows the active recording, an interrupted recovery, or a failure. While
-recording, the state also carries an optional `performance` object with encoded
-frames, fps, dropped/duplicated frames and encoder speed. `niruclip --status`
-prints a warning when the captured stream is losing more than 2% frames or
-duplicating more than 5%; NIRUBAR shows the same warning in its recording
-detail. A recording is only announced as started after FFmpeg has produced its
-first frame, and a source that never delivers frames fails clearly instead of
-leaving a false "recording" state.
-
-## Audio
-
-`--audio both` mixes the microphone and desktop audio at unity gain
-(`amix normalize=0`, so neither source is attenuated) and then applies a peak
-limiter (`alimiter=limit=0.95:level=0`). The limiter only engages when the
-sum of both sources would clip; it adds no automatic gain, so normal levels
-are unchanged.
-
-## Disk space
-
-Before a recording starts, and every 30 seconds while recording (one `statvfs`
-call in the existing recorder loop, no extra process), NIRUCLIP checks the free
-space in the output directory. Below 2 GB it warns once with a notification.
-Below 500 MB it does not start, or stops a running recording cleanly with a
-"disk almost full" notification; the file is finalized and validated like a
-normal stop, and the reason is kept in the state. (`NIRUCLIP_TEST_FREE_BYTES_FILE`
-and `NIRUCLIP_TEST_DISK_INTERVAL_MS` are test hooks for `tests/lifecycle.sh`.)
-
-## Profiles and notifications
+## Configuration
 
 Profiles live in `${XDG_CONFIG_HOME:-$HOME/.config}/niruclip/config.toml`.
-Built-ins are `screen-mic`, `screen-camera`, `camera-mic` and `screen-desktop`.
-Use `--profile NAME`, list with `--list-profiles`, and save the current explicit
-choices with `--save-profile NAME`. A configured `default_profile` applies when
-no `--profile` is given; command-line options still override it.
+Built-in profiles:
 
-Desktop notifications show the countdown, start and result when
-`notify-send` is available. `--no-notify` or `NIRUCLIP_NOTIFY=0` disables them;
-the installed launcher uses a visible countdown notification in its GUI flow.
+| Profile | Capture |
+|---|---|
+| `screen-mic` | Full screen and microphone |
+| `screen-camera` | Full screen with camera overlay and microphone |
+| `camera-mic` | Camera only with microphone |
+| `screen-desktop` | Full screen with desktop audio |
 
-## Dependencies and distribution
+`--save-profile NAME` saves the current choices (letters, digits, dot, dash and
+underscore). A `default_profile` applies when no `--profile` is given;
+command-line options still override it.
 
-Requires `ffmpeg`, X11 and `slop` for screen/region capture, plus a camera and
-PipeWire's PulseAudio interface for camera/microphone capture. The released
-binary is static x86_64 (musl) for Debian, Arch and Void glibc. NIRUX installs
-the matching packages and pins the release.
+```toml
+schema = 1
+default_profile = "screen-mic"
+encoder = "auto"            # auto, software or vaapi
 
-## Build and test
+[profiles.demo]
+description = "Custom capture profile"
+mode = "full"               # full, region, window, webcam-only
+audio = "desktop"           # none, mic, desktop, both
+webcam = "off"              # off, corner, only
+corner = "bottom-right"
+webcam_size = "medium"      # small, medium, large
+preset = "share"            # share, small, quality
+countdown = 3
+screen = "DisplayPort-0"    # optional
+```
+
+Notifications are shown when `notify-send` is available; `--no-notify` or
+`NIRUCLIP_NOTIFY=0` disables them. Other environment overrides are listed in
+the [reference](docs/REFERENCE.md#environment-overrides).
+
+## Files and paths
+
+| Path | Purpose |
+|---|---|
+| `~/.local/bin/niruclip` | The program |
+| `~/.config/niruclip/config.toml` | Profiles, default profile, encoder |
+| `~/.local/state/niruclip/session.json` | Recording state (schema 1), read by NIRUBAR and NIRU Launcher |
+| `~/.local/state/niruclip/vaapi-probe.json` | Cached VAAPI probe result per boot |
+| `~/Videos/NIRUCLIP-*.mkv` | Recordings (`*.part.mkv` while recording) |
+
+Recordings, partials and profiles are user data. NIRUCLIP never deletes a
+personal recording as cleanup.
+
+## Troubleshooting
+
+- **A recording ended unexpectedly:** run `niruclip --status`, then
+  `niruclip --recover`. Segments of a paused recording are joined too.
+- **Choppy camera overlay:** check `--status` for the drop warning. NIRUCLIP
+  already requests 30 fps and disables dynamic exposure framerate during
+  capture.
+- **Hardware encoding not used:** `--status` shows the encoder and any
+  fallback. Delete `vaapi-probe.json` after a driver change, or force
+  `--encoder software`.
+- **Recording refused to start:** less than 500 MB was free in the output
+  directory.
+
+## Uninstall
+
+With NIRUX, NIRUCLIP is removed by `nirux uninstall`. A standalone copy is one
+file: `rm ~/.local/bin/niruclip`. Configuration and state are in
+`~/.config/niruclip` and `~/.local/state/niruclip`; recordings are never
+removed.
+
+## Building from source
 
 ```sh
 cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
 cargo build --release --locked
 sh tests/lifecycle.sh target/release/niruclip
+sh tests/smoke.sh target/release/niruclip
 ```
 
-`tests/lifecycle.sh` uses fake ffmpeg/ffprobe and synthetic geometry. Run the
-real camera, audio and display matrix on an authorized graphical host.
+The tests use fake ffmpeg/ffprobe and synthetic geometry. The real camera, audio
+and display matrix is run on a graphical test machine.
 
-## Exit behavior
+## Status, disclaimer and how it's made
 
-- `0`: recording saved, countdown cancelled by an explicit stop, or profile/status operation succeeded.
-- `1`: capture failed, a controlled stop left only an interrupted partial, or no active session was available to stop.
-- `2` is reserved by the wrapper for usage errors; NIRUCLIP reports usage problems on stderr with a non-zero status.
+**Status: alpha.** Recording, pause/resume and recovery work on my machines,
+but `--window` is still a static rectangle and the camera/audio matrix depends a
+lot on hardware.
 
-Recordings, partials and profiles are user data. NIRUCLIP never deletes a
-personal recording as cleanup.
+NIRUX and every niru* project are made by me, Nicklas Rudolfsson
+([@nirucon](https://github.com/nirucon)), for me. They are tailored to my own
+needs, preferences and workflows, on my own machines. If they fit yours too,
+that's a nice bonus.
 
-See [LICENSE](LICENSE).
+- **Free and open source.** Anyone is free to use, study, change and share
+  it under the [MIT License](LICENSE).
+- **No guarantees.** There is no warranty of any kind. Use it at your own
+  risk, read what you install and keep backups of anything that matters.
+- **How it's made.** Some of these projects I built from scratch by hand. In
+  more recent releases I have used Claude, Anthropic's AI, to do much of the
+  heavy lifting under my direction: I decide what to build and how it should
+  behave, and I test it on my own machines. It saves me a lot of time, and
+  the result is quite OK.
+- **Alpha, beta, dev, and maybe forever.** Most things here are alpha, beta
+  or dev, and may stay that way. Maybe one day there will be a real stable
+  release, but given how fast development moves, and how I am as a person,
+  maybe never :)
+
+| Label | Meaning |
+|---|---|
+| dev | Under active construction; may not build, install or work yet. |
+| alpha | Works on my machines, but incomplete or rough; expect breaking changes. |
+| beta | In daily use on my machines and mostly complete; rough edges remain. |
+
+## License
+
+MIT License, see [LICENSE](LICENSE). Copyright (c) 2026 Nicklas Rudolfsson.
