@@ -13,7 +13,9 @@ for arg in "$@"; do
   [ "$prev" = "-progress" ] && progress=$arg
   [ "$arg" = "h264_vaapi" ] && vaapi=1
   prev=$arg
-  last=$arg
+  # The live camera check is a second output after the recording.
+  if [ "$arg" = "[probe]" ]; then probeout=1; last=$mainout; fi
+  [ -n "${probeout:-}" ] || { mainout=$last; last=$arg; }
 done
 # Lossless remux of an unfinished file: "damaged" packets become "partial".
 if printf '%s\n' "$@" | grep -qx copy && ! printf '%s\n' "$@" | grep -qx concat; then
@@ -51,14 +53,24 @@ fi
 : > "$last"
 printf 'partial' >> "$last"
 [ -z "$progress" ] || printf 'frame=1\nfps=30.0\ndrop_frames=0\ndup_frames=0\nspeed=1.0x\nout_time_us=33333\nprogress=continue\n' > "$progress"
-trap 'exit 0' INT TERM
+# The live camera check: rewrite the probe frame twice a second.
+probe=; prev=
+for arg in "$@"; do [ "$prev" = pgm ] && probe=$arg; prev=$arg; done
+if [ -n "$probe" ] && [ -n "${FAKE_PROBE_FRAME:-}" ]; then
+  (while :; do cp "$FAKE_PROBE_FRAME" "$probe.tmp" && mv "$probe.tmp" "$probe"; sleep 0.3; done) &
+  writer=$!
+fi
+trap '[ -z "${writer:-}" ] || kill "$writer" 2>/dev/null; exit 0' INT TERM
 sleep 30 &
 wait $!
 EOF
 cat > "$TMP/ffmpeg-fail" <<'EOF'
 #!/bin/sh
 last=
-for arg in "$@"; do last=$arg; done
+for arg in "$@"; do
+  if [ "$arg" = "[probe]" ]; then probeout=1; last=$mainout; fi
+  [ -n "${probeout:-}" ] || { mainout=$last; last=$arg; }
+done
 : > "$last"
 printf 'bad' >> "$last"
 exit 1
@@ -69,7 +81,9 @@ last=; progress=; prev=
 for arg in "$@"; do
   [ "$prev" = "-progress" ] && progress=$arg
   prev=$arg
-  last=$arg
+  # The live camera check is a second output after the recording.
+  if [ "$arg" = "[probe]" ]; then probeout=1; last=$mainout; fi
+  [ -n "${probeout:-}" ] || { mainout=$last; last=$arg; }
 done
 : > "$last"
 printf 'partial' >> "$last"
@@ -80,7 +94,10 @@ EOF
 cat > "$TMP/ffmpeg-silent" <<'EOF'
 #!/bin/sh
 last=
-for arg in "$@"; do last=$arg; done
+for arg in "$@"; do
+  if [ "$arg" = "[probe]" ]; then probeout=1; last=$mainout; fi
+  [ -n "${probeout:-}" ] || { mainout=$last; last=$arg; }
+done
 : > "$last"
 trap 'exit 1' INT TERM
 sleep 30 &
@@ -89,7 +106,10 @@ EOF
 cat > "$TMP/ffprobe" <<'EOF'
 #!/bin/sh
 last=
-for arg in "$@"; do last=$arg; done
+for arg in "$@"; do
+  if [ "$arg" = "[probe]" ]; then probeout=1; last=$mainout; fi
+  [ -n "${probeout:-}" ] || { mainout=$last; last=$arg; }
+done
 # The first-packet probe of an unfinished file.
 if printf '%s\n' "$@" | grep -qx 'packet=pts_time'; then
   grep -q -e damaged -e partial "$last" 2>/dev/null && echo 0.000000
@@ -132,6 +152,7 @@ common() {
   NIRUCLIP_STATE_DIR="$TMP/state" \
   NIRUCLIP_CONFIG="$TMP/config/config.toml" \
   NIRUCLIP_CAMERA=/dev/zero \
+  NIRUCLIP_PROBE_DIR="$TMP/state" \
   NIRUCLIP_XRANDR="$TMP/xrandr" \
   NIRUCLIP_SLOP="$TMP/slop" \
   NIRUCLIP_FFPROBE="$TMP/ffprobe" \
@@ -224,7 +245,15 @@ wait "$pid"
 grep -q '1920x1200' "$TMP/args.log"
 grep -q ':0+0,0' "$TMP/args.log"
 grep -q 'scale=1728:1080' "$TMP/args.log"
-grep -q 'min(iw,690)' "$TMP/args.log"
+# Camera overlay: 34 % of the output height at 16:9, filled and cropped,
+# rounded with a border, 28 px from the top-left corner.
+grep -q 'scale=654:368:force_original_aspect_ratio=increase:flags=bicubic,crop=654:368' "$TMP/args.log"
+grep -q 'alphamerge' "$TMP/args.log"
+grep -q 'overlay=28:28:format=auto' "$TMP/args.log"
+# One capture clock: absolute camera timestamps, -copyts, a global zero shift.
+grep -A1 -x -- '-ts' "$TMP/args.log" | grep -qx abs
+grep -qx -- '-copyts' "$TMP/args.log"
+grep -A1 -x -- '-avoid_negative_ts' "$TMP/args.log" | grep -qx make_zero
 grep -q '@DEFAULT_SOURCE@' "$TMP/args.log"
 grep -q '@DEFAULT_MONITOR@' "$TMP/args.log"
 grep -q 'amix=inputs=2:normalize=0,alimiter=limit=0.95:level=0\[a\]' "$TMP/args.log"
@@ -551,10 +580,88 @@ common "$BIN" --status --json | grep -q '"state": "finished"'
 grep -q partial "$TMP/out/powerloss.mkv"
 [ ! -e "$TMP/out/powerloss.part.mkv" ] && [ ! -e "$TMP/out/powerloss.part.mkv.repair.mkv" ]
 
+# Camera mode selection: MJPEG 1080p for camera-only, 720p for an overlay,
+# instead of whatever the driver last used (YUYV 640x480 on most webcams).
+export NIRUCLIP_CAMERA_MODES='YUYV 640x480@30,MJPG 640x480@30,MJPG 1280x720@30,MJPG 1920x1080@30,MJPG 2880x1800@30'
+export FAKE_LOG="$TMP/mode.log"
+NIRUCLIP_FFMPEG="$TMP/ffmpeg-ok" common "$BIN" --webcam-only --audio none --countdown 0 --output "$TMP/out/mode1.mkv" >/dev/null 2>&1 &
+pid=$!
+wait_state recording mode1
+grep -A1 -x -- '-input_format' "$TMP/mode.log" | grep -qx mjpeg
+grep -A1 -x -- '-video_size' "$TMP/mode.log" | grep -qx 1920x1080
+common "$BIN" --status --json | grep -q '"mode": "MJPG 1920x1080@30"'
+common "$BIN" --status --json | grep -q '"height": 1080'
+common "$BIN" --stop >/dev/null
+wait "$pid"
+NIRUCLIP_FFMPEG="$TMP/ffmpeg-ok" common "$BIN" --full --webcam corner --audio none --countdown 0 --camera-shape circle --camera-border none --mirror --output "$TMP/out/mode2.mkv" >/dev/null 2>&1 &
+pid=$!
+wait_state recording mode2
+grep -A1 -x -- '-video_size' "$TMP/mode.log" | grep -x 1280x720 >/dev/null
+grep -q 'hflip,scale=280:280:force_original_aspect_ratio=increase' "$TMP/mode.log"
+common "$BIN" --stop >/dev/null
+wait "$pid"
+unset NIRUCLIP_CAMERA_MODES
+
+# A camera that another program is streaming from: camera-only fails with a
+# clear message; a screen recording continues without the camera and says so.
+if NIRUCLIP_TEST_CAMERA_BUSY=1 NIRUCLIP_FFMPEG="$TMP/ffmpeg-ok" common "$BIN" --webcam-only --audio none --countdown 0 --output "$TMP/out/busy.mkv" 2>"$TMP/busy.err"; then
+  echo 'busy camera did not fail' >&2; exit 1
+fi
+grep -q 'in use' "$TMP/busy.err"
+export FAKE_LOG="$TMP/busy.log"
+NIRUCLIP_TEST_CAMERA_BUSY=1 NIRUCLIP_FFMPEG="$TMP/ffmpeg-ok" common "$BIN" --full --webcam corner --audio none --countdown 0 --output "$TMP/out/busy2.mkv" >/dev/null 2>&1 &
+pid=$!
+wait_state recording busy2
+common "$BIN" --status --json | grep -q '"status": "busy"'
+common "$BIN" --status | grep -q 'recording without the camera'
+if grep -q v4l2 "$TMP/busy.log"; then echo 'busy camera was still opened' >&2; exit 1; fi
+common "$BIN" --stop >/dev/null
+wait "$pid"
+[ -s "$TMP/out/busy2.mkv" ]
+if NIRUCLIP_TEST_CAMERA_BUSY=1 common "$BIN" --check-camera >/dev/null 2>&1; then
+  echo '--check-camera accepted a busy camera' >&2; exit 1
+fi
+
+# Live picture check: the firmware privacy image (a still symbol on black)
+# is reported in the state and --status; a live picture is "ok".
+mkpgm() { # file fill bright
+  { printf 'P5\n128 96\n255\n'; head -c 11500 /dev/zero | tr '\0' "$2"; head -c 300 /dev/zero | tr '\0' "$3"; head -c 488 /dev/zero | tr '\0' "$2"; } > "$1"
+}
+mkpgm "$TMP/placeholder.pgm" '\002' '\372'
+NIRUCLIP_TEST_PRIVACY=0 FAKE_PROBE_FRAME="$TMP/placeholder.pgm" NIRUCLIP_FFMPEG="$TMP/ffmpeg-ok" common "$BIN" --webcam-only --audio none --countdown 0 --output "$TMP/out/privacy.mkv" >/dev/null 2>&1 &
+pid=$!
+wait_state recording privacy
+i=0
+until common "$BIN" --status --json | grep -q '"status": "privacy"'; do
+  i=$((i + 1)); [ "$i" -lt 60 ] || { echo 'privacy image was not detected' >&2; exit 1; }
+  sleep 0.1
+done
+common "$BIN" --status | grep -q 'privacy image'
+common "$BIN" --stop >/dev/null
+wait "$pid"
+# The UVC privacy control is reported too.
+NIRUCLIP_TEST_PRIVACY=1 NIRUCLIP_FFMPEG="$TMP/ffmpeg-ok" common "$BIN" --webcam-only --audio none --countdown 0 --output "$TMP/out/privacy2.mkv" >/dev/null 2>&1 &
+pid=$!
+wait_state recording privacy2
+i=0
+until common "$BIN" --status --json | grep -q 'privacy switch is on'; do
+  i=$((i + 1)); [ "$i" -lt 30 ] || { echo 'privacy control was not reported' >&2; exit 1; }
+  sleep 0.1
+done
+common "$BIN" --stop >/dev/null
+wait "$pid"
+
 # Profiles are listable, saveable and apply the camera-only mode.
 common "$BIN" --list-profiles | grep -q '^camera-mic'
 common "$BIN" --save-profile test-profile --webcam-only --audio none --webcam-size small
 common "$BIN" --list-profiles | grep -q '^test-profile'
 common "$BIN" --profile test-profile --countdown 0 --status
+# Camera device, shape, mirroring and border are remembered in a profile.
+common "$BIN" --save-profile cam-profile --full --webcam corner --camera /dev/zero --camera-shape circle --mirror --camera-border 8aa87e
+grep -q 'camera = "/dev/zero"' "$TMP/config/config.toml"
+grep -q 'camera_shape = "circle"' "$TMP/config/config.toml"
+grep -q 'camera_mirror = true' "$TMP/config/config.toml"
+grep -q 'camera_border = "8aa87e"' "$TMP/config/config.toml"
+if common "$BIN" --full --camera-shape hexagon --status >/dev/null 2>&1; then echo 'bad shape accepted' >&2; exit 1; fi
 
 echo 'NIRUCLIP lifecycle tests: PASS'

@@ -6,22 +6,84 @@ codes.
 
 ## Capture geometry and camera
 
-Camera size is a target share of the **final video width**: `small` 20 %,
-`medium` 30 % (default), `large` 40 %. The camera is never upscaled beyond its
-native width. An overlay is placed 16 pixels from the selected corner.
+### Which camera and which mode
 
-The camera (`/dev/video0`, or `NIRUCLIP_CAMERA`) is requested at 30 fps and its
-`exposure_dynamic_framerate` control is set to 0 during capture, so a 30 fps
-screen overlay does not show a 15 fps camera. When a camera overlay is used, the
-camera input is opened before the screen input; the reverse order made FFmpeg
-drop or duplicate most frames on the tested laptops even though either source
-worked alone.
+Without `--camera` (or `camera` in the configuration, or `NIRUCLIP_CAMERA`)
+NIRUCLIP queries every `/dev/video*` node with V4L2 ioctls and takes the first
+video-capture node that is not an infrared sensor. Metadata nodes are not
+capture nodes, and IR sensors (greyscale only, or named "IR") are skipped, so
+a laptop with `/dev/video0`-`3` gets its RGB camera.
 
-The previous `exposure_dynamic_framerate` value is stored in `session.json`
-(`camera_restore`, with the device) before NIRUCLIP changes it, and is put back
-when the recording ends. After a SIGKILL, a crash or a power loss, `--stop`,
-`--recover` and the next recording start restore it from the stored session
-once the recorder process is gone.
+The capture mode is chosen from what the camera offers, never left to the
+driver's last setting (which on most webcams is YUYV 640x480):
+
+- full frame rate first (25 fps or more, or the best the camera has);
+- then the smallest size that covers the target: 1280x720 for an overlay,
+  1920x1080 for camera-only (1280x720 with `--preset small`), preferring the
+  target's aspect ratio; a smaller camera uses its largest mode;
+- then uncompressed YUYV when it can do that size at full rate, else MJPEG.
+
+The chosen mode is shown by `--check-camera`, `--status` and in the
+session (`camera.mode`).
+
+### Timing and sync
+
+The camera input uses `-ts abs`, and ffmpeg runs with `-copyts`: the camera,
+the screen (x11grab) and pulse audio all keep their capture timestamps on the
+wall clock, so they line up by when they were captured. The output is shifted
+to start at zero as a whole (`-avoid_negative_ts make_zero`). Before 0.4.0
+each input was shifted to zero on its own, and because the inputs are opened
+one after another the camera overlay ended up about 0.3 s out of sync with
+the microphone.
+
+The camera is requested at 30 fps and its `exposure_dynamic_framerate`
+control is set to 0 during capture, so a 30 fps screen overlay does not show
+a 15 fps camera. When a camera overlay is used, the camera input is opened
+before the screen input.
+
+### Overlay
+
+The overlay height is a share of the output height: `small` 20 %, `medium`
+26 % (default), `large` 34 %, at the camera's aspect ratio (a circle is a
+centre crop), never wider than 45 % of the video, with a margin of 2.5 % of
+the height. Shapes are `rounded` (default), `circle` and `rect`; the border
+is a thin ring (about 1 % of the overlay height) in the NIRUX theme accent
+(`camera_border = "theme"`), a fixed colour, or `none`. The shape mask and
+the ring are generated once per recording, so a shaped overlay costs no more
+than a plain one. `--mirror` flips the camera horizontally.
+
+### Camera health
+
+- **Before recording:** a camera that another program is streaming from is
+  detected without opening a stream (re-applying the current format is
+  refused with EBUSY), and the programs holding it are named. Camera-only
+  recording then fails clearly; a screen recording continues without the
+  camera and says so.
+- **During the countdown** (2 s or more): a separate short ffmpeg reads tiny
+  greyscale frames (128x96, 5 per second, in memory only) and judges the
+  frames after the first second.
+- **While recording:** ffmpeg also writes a 128x96 greyscale copy of every
+  camera frame to one tmpfs file (atomically replaced); NIRUCLIP looks at it
+  twice a second, and also reads the UVC privacy control when the camera has
+  one.
+
+A picture is reported as a **privacy image** when it is still (mean change
+between frames half a second apart below 0.2 grey levels) and looks like a
+symbol on black (90 % of the pixels at most 24, some above 140). It is
+**frozen** when every frame is bit-identical. A dark room is never reported:
+a real sensor, however dark, has noise, so its frames are never identical
+and their mean change stays far above 0.2. **No frames** means the camera
+stopped delivering for 6 seconds (unplugged, or taken over). Problems and
+recovery are notified once each, stored as `camera.status`/`camera.message`
+in the session (`ok`, `checking`, `privacy`, `frozen`, `no-frames`, `busy`,
+`missing`) and shown by `--status`, NIRUBAR (`● rec 00:12 · cam off`) and
+NIRU Launcher.
+
+`--check-camera` lists the cameras, the chosen modes and the privacy
+control, checks for another user and looks at the picture for 2.5 s; it exits
+1 when the camera is not usable. `--preview` opens a live window (ffplay)
+showing the camera exactly as the overlay will look; it closes with q or Esc
+and after two minutes.
 
 `--full` and an overlay use the primary connected RandR output at its real X11
 origin; `--screen OUTPUT` chooses another connected output. `--region` asks for
@@ -122,6 +184,17 @@ full" notification; the file is finalized and validated like a normal stop, and
 the reason is kept in the state. `NIRUCLIP_TEST_FREE_BYTES_FILE` and
 `NIRUCLIP_TEST_DISK_INTERVAL_MS` are test hooks for `tests/lifecycle.sh`.
 
+## Export and share
+
+`--export mp4` writes `NAME.mp4` next to the last saved recording (or
+`--input FILE`): a lossless remux with `+faststart` when there is no trim,
+so it is instant and plays in browsers and chat apps. `--from` and `--to`
+(seconds) trim, which re-encodes so the cut is frame-accurate. `--export gif`
+makes a 12 fps GIF up to 720 pixels wide with an optimised palette, at most
+the first 30 seconds unless `--to` says otherwise. The MKV is never changed
+and existing files are never overwritten. `--share` exports the MP4 and opens
+NIRU Share (`nirulauncher --share`) with it.
+
 ## Exit codes
 
 - `0`: recording saved, countdown cancelled by an explicit stop, or a
@@ -137,7 +210,8 @@ the reason is kept in the state. `NIRUCLIP_TEST_FREE_BYTES_FILE` and
 | `NIRUCLIP_OUTPUT` | Output directory |
 | `NIRUCLIP_CONFIG` | Configuration file instead of `~/.config/niruclip/config.toml` |
 | `NIRUCLIP_STATE_DIR` | State directory |
-| `NIRUCLIP_CAMERA` | Camera device (default `/dev/video0`) |
+| `NIRUCLIP_CAMERA` | Camera device (default: the first non-infrared capture camera) |
 | `NIRUCLIP_VAAPI_DEVICE` | VAAPI render node |
 | `NIRUCLIP_NOTIFY=0` | Disable notifications |
-| `NIRUCLIP_FFMPEG`, `NIRUCLIP_FFPROBE`, `NIRUCLIP_SLOP`, `NIRUCLIP_XRANDR`, `NIRUCLIP_V4L2CTL`, `NIRUCLIP_NOTIFY_SEND` | Alternative helper programs (used by the tests) |
+| `NIRUCLIP_FFMPEG`, `NIRUCLIP_FFPROBE`, `NIRUCLIP_FFPLAY`, `NIRUCLIP_SLOP`, `NIRUCLIP_XRANDR`, `NIRUCLIP_V4L2CTL`, `NIRUCLIP_NOTIFY_SEND`, `NIRUCLIP_LAUNCHER` | Alternative helper programs (used by the tests) |
+| `NIRUCLIP_CAMERA_MODES`, `NIRUCLIP_TEST_CAMERA_BUSY`, `NIRUCLIP_TEST_PRIVACY`, `NIRUCLIP_PROBE_DIR`, `NIRUCLIP_DEV_DIR` | Test hooks for camera modes, a busy camera, the privacy control, the live-check directory and the device directory |

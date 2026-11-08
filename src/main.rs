@@ -1,3 +1,5 @@
+mod camera;
+
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
@@ -9,7 +11,7 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const VERSION: &str = "0.3.0";
+const VERSION: &str = "0.4.0";
 const SCHEMA: u32 = 1;
 const ACTIVE_STATES: &[&str] = &[
     "countdown",
@@ -149,12 +151,13 @@ impl Corner {
         }
     }
 
-    fn overlay(self) -> (&'static str, &'static str) {
+    /// (right, bottom)
+    fn placement(self) -> (bool, bool) {
         match self {
-            Self::TopLeft => ("16", "16"),
-            Self::TopRight => ("main_w-overlay_w-16", "16"),
-            Self::BottomLeft => ("16", "main_h-overlay_h-16"),
-            Self::BottomRight => ("main_w-overlay_w-16", "main_h-overlay_h-16"),
+            Self::TopLeft => (false, false),
+            Self::TopRight => (true, false),
+            Self::BottomLeft => (false, true),
+            Self::BottomRight => (true, true),
         }
     }
 }
@@ -186,11 +189,12 @@ impl Size {
         }
     }
 
-    fn factor(self) -> f64 {
+    /// Camera overlay height as a share of the output height.
+    fn height_share(self) -> f64 {
         match self {
             Self::Small => 0.20,
-            Self::Medium => 0.30,
-            Self::Large => 0.40,
+            Self::Medium => 0.26,
+            Self::Large => 0.34,
         }
     }
 }
@@ -291,6 +295,21 @@ struct Options {
     countdown: u64,
     output: Option<PathBuf>,
     screen: Option<String>,
+    /// Camera device; None picks the first regular capture camera.
+    camera: Option<String>,
+    camera_shape: camera::Shape,
+    camera_mirror: bool,
+    /// `theme` (NIRUX accent), `none` or a hex colour.
+    camera_border: String,
+    check_camera: bool,
+    preview: bool,
+    /// `mp4` or `gif`.
+    export: Option<String>,
+    share: bool,
+    /// A recording for --export/--share; default is the last saved one.
+    input: Option<PathBuf>,
+    trim_from: Option<f64>,
+    trim_to: Option<f64>,
     profile: Option<String>,
     save_profile: Option<String>,
     json: bool,
@@ -318,6 +337,17 @@ impl Default for Options {
             countdown: 3,
             output: None,
             screen: None,
+            camera: None,
+            camera_shape: camera::Shape::Rounded,
+            camera_mirror: false,
+            camera_border: "theme".into(),
+            check_camera: false,
+            preview: false,
+            export: None,
+            share: false,
+            input: None,
+            trim_from: None,
+            trim_to: None,
             profile: None,
             save_profile: None,
             json: false,
@@ -354,6 +384,14 @@ struct Profile {
     countdown: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     screen: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    camera: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    camera_shape: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    camera_mirror: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    camera_border: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -365,6 +403,15 @@ struct Config {
     /// `auto` (default), `software` or `vaapi`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     encoder: Option<String>,
+    /// Camera defaults for every recording; a profile can override them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    camera: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    camera_shape: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    camera_mirror: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    camera_border: Option<String>,
     #[serde(default)]
     profiles: BTreeMap<String, Profile>,
 }
@@ -375,6 +422,10 @@ impl Config {
             schema: 1,
             default_profile: None,
             encoder: None,
+            camera: None,
+            camera_shape: None,
+            camera_mirror: None,
+            camera_border: None,
             profiles: BTreeMap::new(),
         };
         for (name, profile) in builtin_profiles() {
@@ -395,6 +446,10 @@ impl Config {
             }
             config.default_profile = loaded.default_profile;
             config.encoder = loaded.encoder;
+            config.camera = loaded.camera;
+            config.camera_shape = loaded.camera_shape;
+            config.camera_mirror = loaded.camera_mirror;
+            config.camera_border = loaded.camera_border;
             config.profiles.extend(loaded.profiles);
         }
         Ok(config)
@@ -414,6 +469,10 @@ impl Config {
             preset: Some(options.preset.as_str().into()),
             countdown: Some(options.countdown),
             screen: options.screen.clone(),
+            camera: options.camera.clone(),
+            camera_shape: Some(options.camera_shape.as_str().into()),
+            camera_mirror: Some(options.camera_mirror),
+            camera_border: Some(options.camera_border.clone()),
         };
         self.profiles.insert(name.to_string(), profile);
         self.schema = 1;
@@ -484,7 +543,7 @@ fn builtin_profiles() -> Vec<(String, Profile)> {
                     webcam_size: Some(size.as_str().into()),
                     preset: Some(preset.as_str().into()),
                     countdown: Some(3),
-                    screen: None,
+                    ..Profile::default()
                 },
             )
         },
@@ -498,6 +557,38 @@ fn valid_profile_name(name: &str) -> bool {
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+fn valid_border(value: &str) -> Result<String, String> {
+    if value == "theme" || value == "none" || camera::parse_hex(value).is_some() {
+        Ok(value.to_string())
+    } else {
+        Err(format!(
+            "camera border must be theme, none or a hex colour: {value}"
+        ))
+    }
+}
+
+fn apply_camera_settings(
+    options: &mut Options,
+    device: Option<&str>,
+    shape: Option<&str>,
+    mirror: Option<bool>,
+    border: Option<&str>,
+) -> Result<(), String> {
+    if let Some(value) = device.filter(|value| !value.is_empty() && *value != "auto") {
+        options.camera = Some(value.to_string());
+    }
+    if let Some(value) = shape {
+        options.camera_shape = camera::Shape::parse(value)?;
+    }
+    if let Some(value) = mirror {
+        options.camera_mirror = value;
+    }
+    if let Some(value) = border {
+        options.camera_border = valid_border(value)?;
+    }
+    Ok(())
 }
 
 fn apply_profile(options: &mut Options, profile: &Profile) -> Result<(), String> {
@@ -525,6 +616,13 @@ fn apply_profile(options: &mut Options, profile: &Profile) -> Result<(), String>
     if let Some(value) = &profile.screen {
         options.screen = Some(value.clone());
     }
+    apply_camera_settings(
+        options,
+        profile.camera.as_deref(),
+        profile.camera_shape.as_deref(),
+        profile.camera_mirror,
+        profile.camera_border.as_deref(),
+    )?;
     if options.mode == Mode::WebcamOnly {
         options.webcam = Webcam::Only;
     }
@@ -672,6 +770,29 @@ struct Session {
     /// Seconds recorded in the segments before the current one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     elapsed_before: Option<f64>,
+    /// The camera in use and whether its picture is usable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    camera: Option<CameraStatus>,
+}
+
+/// Camera health as shown by --status, NIRUBAR and NIRU Launcher.
+/// `status`: ok, checking, privacy, frozen, no-frames, busy or missing.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+struct CameraStatus {
+    device: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mode: Option<String>,
+    status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+}
+
+impl CameraStatus {
+    fn problem(&self) -> bool {
+        !matches!(self.status.as_str(), "ok" | "checking")
+    }
 }
 
 impl Session {
@@ -704,6 +825,7 @@ impl Session {
             recorder: None,
             segments: None,
             elapsed_before: None,
+            camera: None,
         }
     }
 
@@ -1174,6 +1296,10 @@ struct CaptureInputs {
     screen_index: Option<usize>,
     camera_index: Option<usize>,
     audio_index: usize,
+    /// The camera and the mode requested from it (None: ffmpeg's default).
+    camera: Option<camera::Camera>,
+    camera_mode: Option<camera::Mode>,
+    camera_status: Option<CameraStatus>,
 }
 
 /// Packets each live input may queue while the filter graph is busy. 8 (screen)
@@ -1181,20 +1307,38 @@ struct CaptureInputs {
 /// which shows up as dropped or duplicated frames.
 const INPUT_QUEUE: &str = "512";
 
-fn camera_input(camera: &str) -> Vec<String> {
-    [
-        "-thread_queue_size",
-        INPUT_QUEUE,
-        "-f",
-        "v4l2",
-        "-framerate",
-        "30",
-        "-i",
-        camera,
-    ]
-    .iter()
-    .map(|value| (*value).to_string())
-    .collect()
+/// The v4l2 input. An explicit pixel format and size matter: without them
+/// ffmpeg takes whatever the driver last used, which on most webcams is
+/// YUYV 640x480. `-ts abs` turns the kernel's monotonic frame timestamps into
+/// wall-clock time like x11grab and pulse use, so with `-copyts` every input
+/// shares one clock (see build_plan).
+fn camera_input(device: &str, mode: Option<&camera::Mode>) -> Vec<String> {
+    let mut argv: Vec<String> = ["-thread_queue_size", INPUT_QUEUE, "-f", "v4l2"]
+        .iter()
+        .map(|value| (*value).to_string())
+        .collect();
+    let mut framerate = "30".to_string();
+    if let Some(mode) = mode {
+        if let Some(format) = mode.ffmpeg_format() {
+            argv.extend(["-input_format".into(), format.into()]);
+        }
+        argv.extend([
+            "-video_size".into(),
+            format!("{}x{}", mode.width, mode.height),
+        ]);
+        if mode.fps > 0.0 && mode.fps < 29.5 {
+            framerate = format!("{}", mode.fps.round() as u32);
+        }
+    }
+    argv.extend([
+        "-framerate".into(),
+        framerate,
+        "-ts".into(),
+        "abs".into(),
+        "-i".into(),
+        device.into(),
+    ]);
+    argv
 }
 
 fn screen_input(display: &str, geometry: &Geometry) -> Vec<String> {
@@ -1213,15 +1357,81 @@ fn screen_input(display: &str, geometry: &Geometry) -> Vec<String> {
     .to_vec()
 }
 
-fn capture_input(resolved: &Options, display: &str) -> Result<CaptureInputs, String> {
-    let camera = std::env::var("NIRUCLIP_CAMERA").unwrap_or_else(|_| "/dev/video0".into());
-    if resolved.mode == Mode::WebcamOnly || resolved.webcam != Webcam::Off {
-        let metadata =
-            fs::metadata(&camera).map_err(|_| format!("camera {camera} is unavailable"))?;
-        if !metadata.file_type().is_char_device() {
-            return Err(format!("camera {camera} is not a character device"));
-        }
+fn config_home() -> PathBuf {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(|| home().join(".config"))
+}
+
+/// The explicit camera: option/profile/config, then NIRUCLIP_CAMERA.
+fn explicit_camera(options: &Options) -> Option<String> {
+    options
+        .camera
+        .clone()
+        .or_else(|| std::env::var("NIRUCLIP_CAMERA").ok())
+        .filter(|value| !value.is_empty())
+}
+
+fn busy_message(device: &str) -> String {
+    let holders = camera::holders(device);
+    if holders.is_empty() {
+        format!("camera {device} is in use by another program")
+    } else {
+        format!("camera {device} is in use by {}", holders.join(", "))
     }
+}
+
+/// Find the camera, check that nobody else is streaming from it and pick
+/// its capture mode. A camera-only recording fails clearly; a screen
+/// recording with a camera overlay continues without the camera and says so.
+fn prepare_camera(
+    resolved: &Options,
+) -> Result<(Option<camera::Camera>, Option<camera::Mode>, CameraStatus), String> {
+    let camera_only = resolved.mode == Mode::WebcamOnly;
+    let explicit = explicit_camera(resolved);
+    let missing = |message: String, status: &str| -> Result<_, String> {
+        if camera_only {
+            return Err(message);
+        }
+        Ok((
+            None,
+            None,
+            CameraStatus {
+                device: explicit.clone().unwrap_or_default(),
+                status: status.into(),
+                message: Some(format!("{message}; recording without the camera")),
+                ..CameraStatus::default()
+            },
+        ))
+    };
+    let found = match camera::resolve(explicit.as_deref()) {
+        Ok(found) => found,
+        Err(message) => return missing(message, "missing"),
+    };
+    if camera::busy(&found.device) {
+        return missing(busy_message(&found.device), "busy");
+    }
+    let want = camera::wanted_size(camera_only, resolved.preset.camera_max_width());
+    let mode = camera::choose_mode(&found.modes, want);
+    let status = CameraStatus {
+        device: found.device.clone(),
+        name: (!found.name.is_empty()).then(|| found.name.clone()),
+        mode: mode.as_ref().map(camera::Mode::label),
+        status: "checking".into(),
+        message: None,
+    };
+    Ok((Some(found), mode, status))
+}
+
+fn capture_input(resolved: &Options, display: &str) -> Result<CaptureInputs, String> {
+    let (found, camera_mode, camera_status) =
+        if resolved.mode == Mode::WebcamOnly || resolved.webcam != Webcam::Off {
+            let (found, mode, status) = prepare_camera(resolved)?;
+            (found, mode, Some(status))
+        } else {
+            (None, None, None)
+        };
     let geometry = if resolved.mode == Mode::WebcamOnly {
         None
     } else if resolved.mode == Mode::Region || resolved.mode == Mode::Window {
@@ -1238,23 +1448,26 @@ fn capture_input(resolved: &Options, display: &str) -> Result<CaptureInputs, Str
             let geometry = geometry
                 .as_ref()
                 .ok_or_else(|| "screen geometry is missing".to_string())?;
-            if resolved.webcam == Webcam::Corner {
+            if let (Webcam::Corner, Some(found)) = (resolved.webcam, &found) {
                 // The camera is opened first on purpose. With x11grab first,
                 // FFmpeg's two live inputs drift apart and the overlay path
                 // duplicates or drops most of the frame stream even though
                 // either source is fine on its own.
                 camera_index = Some(video_inputs);
                 video_inputs += 1;
-                argv.extend(camera_input(&camera));
+                argv.extend(camera_input(&found.device, camera_mode.as_ref()));
             }
             screen_index = Some(video_inputs);
             video_inputs += 1;
             argv.extend(screen_input(display, geometry));
         }
         Mode::WebcamOnly => {
+            let found = found
+                .as_ref()
+                .ok_or_else(|| "camera input is missing".to_string())?;
             camera_index = Some(video_inputs);
             video_inputs += 1;
-            argv.extend(camera_input(&camera));
+            argv.extend(camera_input(&found.device, camera_mode.as_ref()));
         }
     }
     Ok(CaptureInputs {
@@ -1263,6 +1476,9 @@ fn capture_input(resolved: &Options, display: &str) -> Result<CaptureInputs, Str
         screen_index,
         camera_index,
         audio_index: video_inputs,
+        camera: found,
+        camera_mode,
+        camera_status,
     })
 }
 
@@ -1448,17 +1664,39 @@ impl Preset {
     }
 }
 
+fn border_rgb(value: &str) -> Option<(u8, u8, u8)> {
+    match value {
+        "none" => None,
+        "theme" => Some(camera::theme_accent(&config_home()).unwrap_or((232, 232, 232))),
+        other => camera::parse_hex(other),
+    }
+}
+
 fn build_plan(
     resolved: &Options,
     capture: &CaptureInputs,
     partial: &Path,
     progress: &Path,
     encoder: &Encoder,
+    probe: Option<&Path>,
 ) -> Result<Plan, String> {
-    let mut argv: Vec<String> = ["-hide_banner", "-loglevel", "warning", "-nostdin", "-n"]
-        .iter()
-        .map(|value| (*value).to_string())
-        .collect();
+    // -copyts keeps every input on its own capture clock (x11grab and pulse
+    // use wall-clock time, the camera does with -ts abs), so the camera, the
+    // screen and the microphone line up by when they were captured instead
+    // of each input being shifted to start at zero on its own; the latter put
+    // the camera overlay about 0.3 s out of sync with the voice. The output
+    // is shifted to start at zero as a whole (-avoid_negative_ts make_zero).
+    let mut argv: Vec<String> = [
+        "-hide_banner",
+        "-loglevel",
+        "warning",
+        "-nostdin",
+        "-n",
+        "-copyts",
+    ]
+    .iter()
+    .map(|value| (*value).to_string())
+    .collect();
     if let Encoder::Vaapi(device) = encoder {
         argv.extend(["-vaapi_device".into(), device.clone()]);
     }
@@ -1510,16 +1748,40 @@ fn build_plan(
     let mut filters = Vec::new();
     let width;
     let height;
+    let mirror = if resolved.camera_mirror { "hflip," } else { "" };
+    // The camera stream, split once when the live picture check is on.
+    let camera_source = |filters: &mut Vec<String>, camera_index: usize| -> String {
+        if probe.is_some() {
+            filters.push(format!(
+                "[{camera_index}:v]split=2[camsrc][probesrc];[probesrc]{}[probe]",
+                camera::probe_chain(None)
+            ));
+            "camsrc".to_string()
+        } else {
+            format!("{camera_index}:v")
+        }
+    };
     if resolved.mode == Mode::WebcamOnly {
         let camera_index = capture
             .camera_index
             .ok_or_else(|| "camera input is missing".to_string())?;
         let max_width = resolved.preset.camera_max_width();
+        let source = camera_source(&mut filters, camera_index);
         filters.push(format!(
-            "[{camera_index}:v]scale=w='trunc(min(iw,{max_width})/2)*2':h=-2:flags=bicubic,setsar=1[{vout}]"
+            "[{source}]{mirror}scale=w='trunc(min(iw,{max_width})/2)*2':h=-2:flags=bicubic,setsar=1[{vout}]"
         ));
-        width = max_width;
-        height = 0;
+        match &capture.camera_mode {
+            Some(mode) => {
+                width = even(mode.width.min(max_width));
+                height = even(
+                    ((mode.height as f64) * (width as f64) / (mode.width as f64)).round() as u32,
+                );
+            }
+            None => {
+                width = max_width;
+                height = 0;
+            }
+        }
     } else {
         let screen_index = capture
             .screen_index
@@ -1528,19 +1790,41 @@ fn build_plan(
             screen.ok_or_else(|| "screen geometry is missing".to_string())?;
         width = out_width;
         height = out_height;
-        if resolved.webcam == Webcam::Corner {
-            let camera_index = capture
-                .camera_index
-                .ok_or_else(|| "camera input is missing".to_string())?;
-            let target = even(((out_width as f64) * resolved.webcam_size.factor()).round() as u32);
-            let (x, y) = resolved.corner.overlay();
+        if let (Webcam::Corner, Some(camera_index)) = (resolved.webcam, capture.camera_index) {
+            let camera_size = capture
+                .camera_mode
+                .as_ref()
+                .map(|mode| (mode.width, mode.height))
+                .unwrap_or((0, 0));
+            let border = border_rgb(&resolved.camera_border);
+            let overlay = camera::overlay_box(
+                (out_width, out_height),
+                camera_size,
+                resolved.webcam_size.height_share(),
+                resolved.camera_shape,
+                resolved.corner.placement(),
+                border.is_some(),
+            );
+            let (ow, oh) = (overlay.width, overlay.height);
             filters.push(format!(
                 "[{screen_index}:v]scale={out_width}:{out_height}:flags=bicubic,setsar=1[base]"
             ));
+            let source = camera_source(&mut filters, camera_index);
+            // Fill the box and crop the rest: correct for any camera aspect,
+            // and a centre crop for the circle.
             filters.push(format!(
-                "[{camera_index}:v]scale=w='trunc(min(iw,{target})/2)*2':h=-2:flags=bicubic,setsar=1[wc]"
+                "[{source}]{mirror}scale={ow}:{oh}:force_original_aspect_ratio=increase:flags=bicubic,crop={ow}:{oh},setsar=1[wc]"
             ));
-            filters.push(format!("[base][wc]overlay={x}:{y}:format=auto[{vout}]"));
+            filters.extend(camera::shape_filters(
+                "wc",
+                "wco",
+                &overlay,
+                border.unwrap_or((0, 0, 0)),
+            ));
+            filters.push(format!(
+                "[base][wco]overlay={}:{}:format=auto[{vout}]",
+                overlay.x, overlay.y
+            ));
         } else {
             filters.push(format!(
                 "[{screen_index}:v]scale={out_width}:{out_height}:flags=bicubic,setsar=1[{vout}]"
@@ -1599,7 +1883,25 @@ fn build_plan(
     if has_audio {
         argv.extend(["-c:a".into(), "aac".into(), "-b:a".into(), "160k".into()]);
     }
+    argv.extend(["-avoid_negative_ts".into(), "make_zero".into()]);
     argv.push(partial.display().to_string());
+    if let (Some(path), Some(_)) = (probe, capture.camera_index) {
+        // A tiny greyscale copy of every camera frame for the live picture
+        // check, replaced atomically in one tmpfs file (about 12 KB).
+        argv.extend([
+            "-map".into(),
+            "[probe]".into(),
+            "-f".into(),
+            "image2".into(),
+            "-update".into(),
+            "1".into(),
+            "-atomic_writing".into(),
+            "1".into(),
+            "-c:v".into(),
+            "pgm".into(),
+            path.display().to_string(),
+        ]);
+    }
     Ok(Plan {
         argv,
         width,
@@ -1693,6 +1995,13 @@ fn parse_args(argv: &[String], config: &Config) -> Result<Options, String> {
     if let Some(value) = &config.encoder {
         options.encoder = EncoderChoice::parse(value)?;
     }
+    apply_camera_settings(
+        &mut options,
+        config.camera.as_deref(),
+        config.camera_shape.as_deref(),
+        config.camera_mirror,
+        config.camera_border.as_deref(),
+    )?;
     let profile_name = argv
         .windows(2)
         .find(|pair| pair[0] == "--profile")
@@ -1768,6 +2077,49 @@ fn parse_args(argv: &[String], config: &Config) -> Result<Options, String> {
                 options.screen = Some(next()?);
                 index += 1;
             }
+            "--camera" => {
+                let value = next()?;
+                options.camera = (value != "auto").then_some(value);
+                index += 1;
+            }
+            "--camera-shape" => {
+                options.camera_shape = camera::Shape::parse(&next()?)?;
+                index += 1;
+            }
+            "--mirror" => options.camera_mirror = true,
+            "--no-mirror" => options.camera_mirror = false,
+            "--camera-border" => {
+                options.camera_border = valid_border(&next()?)?;
+                index += 1;
+            }
+            "--check-camera" => options.check_camera = true,
+            "--preview" => options.preview = true,
+            "--export" => {
+                let value = next()?;
+                if value != "mp4" && value != "gif" {
+                    return Err("--export needs mp4 or gif".into());
+                }
+                options.export = Some(value);
+                index += 1;
+            }
+            "--share" => options.share = true,
+            "--input" => {
+                options.input = Some(PathBuf::from(next()?));
+                index += 1;
+            }
+            "--from" | "--to" => {
+                let value: f64 = next()?
+                    .parse()
+                    .ok()
+                    .filter(|value: &f64| value.is_finite() && *value >= 0.0)
+                    .ok_or_else(|| format!("{arg} needs seconds"))?;
+                if arg == "--from" {
+                    options.trim_from = Some(value);
+                } else {
+                    options.trim_to = Some(value);
+                }
+                index += 1;
+            }
             "--profile" => {
                 index += 1;
             }
@@ -1801,6 +2153,11 @@ fn parse_args(argv: &[String], config: &Config) -> Result<Options, String> {
     if options.countdown > 10 {
         return Err("countdown must be 0..10".into());
     }
+    if let (Some(from), Some(to)) = (options.trim_from, options.trim_to) {
+        if to <= from {
+            return Err("--to must be after --from".into());
+        }
+    }
     Ok(options)
 }
 
@@ -1809,12 +2166,18 @@ fn help() {
         "NIRUCLIP {VERSION}\n\
 Usage: niruclip --full|--region|--window|--webcam-only [options]\n\
        niruclip --stop | --pause | --resume | --status [--json] | --recover\n\
-       niruclip --list-profiles | --save-profile NAME\n\n\
+       niruclip --list-profiles | --save-profile NAME\n\
+       niruclip --check-camera | --preview\n\
+       niruclip --export mp4|gif [--input FILE] [--from S] [--to S] | --share [--input FILE]\n\n\
 Options:\n\
   --audio none|mic|desktop|both\n\
   --webcam off|corner|only          camera placement\n\
   --corner top-left|top-right|bottom-left|bottom-right\n\
-  --webcam-size small|medium|large  target share of final video width\n\
+  --webcam-size small|medium|large  camera height: 20, 26 or 34 % of the video\n\
+  --camera DEVICE|auto              camera device (auto skips IR sensors)\n\
+  --camera-shape rounded|circle|rect\n\
+  --camera-border theme|none|RRGGBB thin border around the camera\n\
+  --mirror | --no-mirror            mirror the camera picture\n\
   --preset share|small|quality\n\
   --encoder auto|software|vaapi     auto uses VAAPI when a probe succeeds\n\
   --countdown 0..10\n\
@@ -1933,6 +2296,19 @@ fn status(options: &Options) {
     }
     if drop_warning == Some(true) {
         println!("warning: capture cannot keep up; try preset small or disable the camera overlay");
+    }
+    if let Some(camera) = &session.camera {
+        let mut line = camera.device.clone();
+        if let Some(name) = &camera.name {
+            line.push_str(&format!(" ({name})"));
+        }
+        if let Some(mode) = &camera.mode {
+            line.push_str(&format!(", {mode}"));
+        }
+        println!("camera: {line}: {}", camera.status);
+        if let Some(message) = camera.message.as_ref().filter(|_| camera.problem()) {
+            println!("warning: {message}");
+        }
     }
     if !session.output.is_empty() {
         println!("output: {}", session.output);
@@ -2091,12 +2467,14 @@ fn record(options: Options, camera: &mut Option<CameraRestore>) -> Result<(), St
     let capture = capture_input(&options, display.as_deref().unwrap_or_default())?;
     let ffmpeg = command_path("ffmpeg", "NIRUCLIP_FFMPEG");
     let selection = select_encoder(options.encoder, &ffmpeg);
+    let probe = capture.camera_index.and_then(|_| probe_path());
     let plan = build_plan(
         &options,
         &capture,
         &partial,
         &progress_path,
         &selection.encoder,
+        probe.as_deref(),
     )?;
     let pid = std::process::id();
     let mut session = Session {
@@ -2127,12 +2505,22 @@ fn record(options: Options, camera: &mut Option<CameraRestore>) -> Result<(), St
         recorder: Some(VERSION.into()),
         segments: None,
         elapsed_before: None,
+        camera: capture.camera_status.clone(),
     };
     write_state(&session)?;
-    if options.mode == Mode::WebcamOnly || options.webcam != Webcam::Off {
+    if let Some(status) = session.camera.as_ref().filter(|status| status.problem()) {
+        let message = status.message.clone().unwrap_or_default();
+        eprintln!("niruclip: {message}");
+        notify(&options, "NIRUCLIP camera", &capitalize(&message));
+    }
+    if capture.camera.is_some() {
         // Ask for a steady 30 fps: dynamic exposure framerate halves the
         // camera rate in low light. The previous value is persisted first.
-        let device = std::env::var("NIRUCLIP_CAMERA").unwrap_or_else(|_| "/dev/video0".into());
+        let device = capture
+            .camera
+            .as_ref()
+            .map(|found| found.device.clone())
+            .unwrap_or_default();
         if let Some(previous) = read_camera_control(&device).filter(|value| value != "0") {
             let restore = CameraRestore {
                 device: device.clone(),
@@ -2145,10 +2533,25 @@ fn record(options: Options, camera: &mut Option<CameraRestore>) -> Result<(), St
             set_camera_control(&device, CAMERA_CONTROL, "0");
         }
     }
+    // A countdown of 2 s or more doubles as a camera check: a short probe
+    // reads the camera while the user waits, so a privacy image, a frozen or
+    // a silent camera is reported before anything is recorded.
+    let ffmpeg_for_preroll = command_path("ffmpeg", "NIRUCLIP_FFMPEG");
+    let mut preroll = match (&capture.camera, options.countdown >= 2) {
+        (Some(found), true) => PreRoll::start(
+            &ffmpeg_for_preroll,
+            &found.device,
+            capture.camera_mode.as_ref(),
+        ),
+        _ => None,
+    };
     if options.countdown > 0 {
         let mut remaining = options.countdown;
         while remaining > 0 {
             if SIGNAL.load(Ordering::SeqCst) != 0 {
+                if let Some(preroll) = preroll.take() {
+                    preroll.finish();
+                }
                 finish_session(
                     &mut session,
                     "cancelled",
@@ -2173,6 +2576,17 @@ fn record(options: Options, camera: &mut Option<CameraRestore>) -> Result<(), St
             remaining -= 1;
         }
     }
+    if let Some(preroll) = preroll.take() {
+        let verdict = preroll.finish();
+        let device = session
+            .camera
+            .as_ref()
+            .map(|status| status.device.clone())
+            .unwrap_or_default();
+        if let Some((state, message)) = verdict.status(&device) {
+            update_camera_status(&mut session, &options, state, message);
+        }
+    }
     if SIGNAL.load(Ordering::SeqCst) != 0 {
         finish_session(
             &mut session,
@@ -2191,6 +2605,11 @@ fn record(options: Options, camera: &mut Option<CameraRestore>) -> Result<(), St
         ffmpeg,
         encoder: selection.encoder,
         progress: progress_path.clone(),
+        probe: probe.clone(),
+    };
+    let mut monitor = match (&capture_device(&recorder), &recorder.probe) {
+        (Some(device), Some(path)) => Some(CameraMonitor::new(device, path)),
+        _ => None,
     };
     let mut segments = vec![Segment {
         path: partial.display().to_string(),
@@ -2246,6 +2665,14 @@ fn record(options: Options, camera: &mut Option<CameraRestore>) -> Result<(), St
                 if session.performance.as_ref() != Some(&performance) {
                     session.performance = Some(performance);
                     let _ = write_state(&session);
+                }
+            }
+            if let Some(monitor) = monitor.as_mut() {
+                if recorder.probe.is_none() {
+                    monitor.probe = None;
+                }
+                if let Some((state, message)) = monitor.poll() {
+                    update_camera_status(&mut session, &options, state, message);
                 }
             }
             match child.try_wait() {
@@ -2344,6 +2771,9 @@ fn record(options: Options, camera: &mut Option<CameraRestore>) -> Result<(), St
                 session.segments = Some(segments.clone());
                 session.state = "recording".into();
                 write_state(&session)?;
+                if let Some(monitor) = monitor.as_mut() {
+                    monitor.reset();
+                }
                 notify(&options, "NIRUCLIP", "Recording resumed");
                 eprintln!("NIRUCLIP resumed");
             }
@@ -2671,6 +3101,299 @@ struct Recorder<'a> {
     ffmpeg: String,
     encoder: Encoder,
     progress: PathBuf,
+    /// Live picture-check output; dropped if ffmpeg cannot write it.
+    probe: Option<PathBuf>,
+}
+
+fn capture_device(recorder: &Recorder) -> Option<String> {
+    recorder
+        .capture
+        .camera
+        .as_ref()
+        .filter(|_| recorder.capture.camera_index.is_some())
+        .map(|found| found.device.clone())
+}
+
+/// Store a camera status change and tell the user about problems (and about
+/// the picture coming back after one).
+fn update_camera_status(
+    session: &mut Session,
+    options: &Options,
+    state: &str,
+    message: Option<String>,
+) {
+    let Some(status) = session.camera.as_mut() else {
+        return;
+    };
+    if status.status == state && status.message == message {
+        return;
+    }
+    let was_problem = status.problem();
+    status.status = state.into();
+    status.message = message.clone();
+    let problem = status.problem();
+    let _ = write_state(session);
+    if let (true, Some(message)) = (problem, message) {
+        eprintln!("niruclip: {message}");
+        notify(options, "NIRUCLIP camera", &capitalize(&message));
+    } else if was_problem && !problem {
+        notify(options, "NIRUCLIP camera", "Camera picture is back");
+    }
+}
+
+fn capitalize(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
+/// Where ffmpeg writes the live picture-check frame. It is rewritten for
+/// every camera frame, so only a tmpfs is used; without one the live check
+/// is off (the countdown check and the privacy control still work).
+fn probe_path() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("NIRUCLIP_PROBE_DIR") {
+        return Some(PathBuf::from(dir).join(format!("niruclip-{}.pgm", std::process::id())));
+    }
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .into_iter()
+        .chain(std::iter::once(PathBuf::from("/dev/shm")))
+        .find(|dir| dir.is_dir() && on_tmpfs(dir))
+        .map(|dir| dir.join(format!("niruclip-{}.pgm", std::process::id())))
+}
+
+fn on_tmpfs(dir: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(path) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
+        return false;
+    };
+    let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: valid C string and a zeroed statfs buffer.
+    if unsafe { libc::statfs(path.as_ptr(), &mut stat) } != 0 {
+        return false;
+    }
+    // TMPFS_MAGIC / RAMFS_MAGIC
+    matches!(stat.f_type as i64, 0x0102_1994 | 0x8584_58f6)
+}
+
+/// The countdown camera check: a separate short ffmpeg that reads tiny
+/// greyscale frames from the camera into memory. Nothing is stored.
+struct PreRoll {
+    child: std::process::Child,
+    reader: std::thread::JoinHandle<Vec<(Instant, Vec<u8>)>>,
+    errors: std::thread::JoinHandle<String>,
+}
+
+struct PreRollVerdict {
+    picture: camera::Picture,
+    frames: usize,
+    errors: String,
+}
+
+impl PreRollVerdict {
+    /// (status, message) for the session, None when nothing can be said.
+    fn status(&self, device: &str) -> Option<(&'static str, Option<String>)> {
+        if self.frames == 0 {
+            if self.errors.contains("busy") {
+                return Some(("busy", Some(busy_message(device))));
+            }
+            return Some((
+                "no-frames",
+                Some(format!(
+                    "camera {device} delivered no frames during the countdown"
+                )),
+            ));
+        }
+        picture_status(self.picture)
+    }
+}
+
+fn picture_status(picture: camera::Picture) -> Option<(&'static str, Option<String>)> {
+    match picture {
+        camera::Picture::Unknown => None,
+        camera::Picture::Live => Some(("ok", None)),
+        camera::Picture::Placeholder => Some((
+            "privacy",
+            Some(
+                "the camera shows its privacy image (crossed-out camera): check the camera key, \
+                 the shutter or the BIOS camera setting"
+                    .into(),
+            ),
+        )),
+        camera::Picture::Frozen => Some((
+            "frozen",
+            Some(
+                "the camera picture is frozen (every frame is identical): check the camera key \
+                 or shutter, a covered lens, or unplug and replug the camera"
+                    .into(),
+            ),
+        )),
+    }
+}
+
+impl PreRoll {
+    fn start(ffmpeg: &str, device: &str, mode: Option<&camera::Mode>) -> Option<Self> {
+        use std::io::Read;
+        let mut argv: Vec<String> = ["-nostdin", "-hide_banner", "-loglevel", "error"]
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect();
+        argv.extend(camera_input(device, mode));
+        argv.extend([
+            "-vf".into(),
+            camera::probe_chain(Some(5)),
+            "-f".into(),
+            "rawvideo".into(),
+            "-".into(),
+        ]);
+        let mut child = Command::new(ffmpeg)
+            .args(&argv)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .ok()?;
+        let mut stdout = child.stdout.take()?;
+        let mut stderr = child.stderr.take()?;
+        let reader = std::thread::spawn(move || {
+            let mut frames = Vec::new();
+            let mut frame = vec![0u8; camera::PROBE_BYTES];
+            while stdout.read_exact(&mut frame).is_ok() {
+                frames.push((Instant::now(), frame.clone()));
+                if frames.len() > 64 {
+                    frames.remove(0);
+                }
+            }
+            frames
+        });
+        let errors = std::thread::spawn(move || {
+            let mut text = String::new();
+            let _ = stderr.read_to_string(&mut text);
+            text.chars().take(2000).collect()
+        });
+        Some(Self {
+            child,
+            reader,
+            errors,
+        })
+    }
+
+    /// Stop the probe (the camera is released before the recording opens
+    /// it) and judge the frames that came after the first second, when
+    /// exposure has settled and a firmware privacy image has replaced the
+    /// first real frames.
+    fn finish(mut self) -> PreRollVerdict {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let frames = self.reader.join().unwrap_or_default();
+        let errors = self.errors.join().unwrap_or_default();
+        let count = frames.len();
+        let first = frames.first().map(|(at, _)| *at);
+        let settled: Vec<&[u8]> = frames
+            .iter()
+            .filter(|(at, _)| {
+                first
+                    .map(|first| at.duration_since(first) >= Duration::from_millis(900))
+                    .unwrap_or(false)
+            })
+            .map(|(_, frame)| frame.as_slice())
+            .collect();
+        PreRollVerdict {
+            picture: camera::assess(&settled),
+            frames: count,
+            errors: errors.to_ascii_lowercase(),
+        }
+    }
+}
+
+/// Watches the camera during a recording: the probe frame ffmpeg rewrites
+/// twice a second, and the UVC privacy control when the camera has one.
+struct CameraMonitor {
+    device: String,
+    probe: Option<PathBuf>,
+    frames: std::collections::VecDeque<Vec<u8>>,
+    last_mtime: Option<SystemTime>,
+    last_frame: Instant,
+    next_check: Instant,
+    reported: Option<&'static str>,
+}
+
+impl CameraMonitor {
+    fn new(device: &str, probe: &Path) -> Self {
+        Self {
+            device: device.to_string(),
+            probe: Some(probe.to_path_buf()),
+            frames: std::collections::VecDeque::new(),
+            last_mtime: None,
+            last_frame: Instant::now(),
+            next_check: Instant::now(),
+            reported: None,
+        }
+    }
+
+    /// A new segment (resume) opens the camera again.
+    fn reset(&mut self) {
+        self.frames.clear();
+        self.last_mtime = None;
+        self.last_frame = Instant::now();
+    }
+
+    /// The new (status, message) when it changed.
+    fn poll(&mut self) -> Option<(&'static str, Option<String>)> {
+        let now = Instant::now();
+        if now < self.next_check {
+            return None;
+        }
+        self.next_check = now + Duration::from_millis(500);
+        let mut verdict: Option<(&'static str, Option<String>)> = None;
+        if let Some(path) = &self.probe {
+            let mtime = fs::metadata(path).and_then(|meta| meta.modified()).ok();
+            if mtime.is_some() && mtime != self.last_mtime {
+                if let Some(frame) = camera::read_pgm(path) {
+                    self.last_mtime = mtime;
+                    self.last_frame = now;
+                    self.frames.push_back(frame);
+                    while self.frames.len() > 6 {
+                        self.frames.pop_front();
+                    }
+                }
+            }
+            if now.duration_since(self.last_frame) > Duration::from_secs(6) {
+                verdict = Some((
+                    "no-frames",
+                    Some(format!(
+                        "camera {} stopped delivering frames (unplugged or taken by another program?)",
+                        self.device
+                    )),
+                ));
+            } else {
+                let frames: Vec<&[u8]> = self.frames.iter().map(Vec::as_slice).collect();
+                verdict = picture_status(camera::assess(&frames));
+            }
+        }
+        if camera::privacy(&self.device) == Some(true) {
+            verdict = Some((
+                "privacy",
+                Some("the camera privacy switch is on (camera key or shutter)".into()),
+            ));
+        }
+        let (state, message) = verdict?;
+        if self.reported == Some(state) {
+            return None;
+        }
+        self.reported = Some(state);
+        Some((state, message))
+    }
+}
+
+impl Drop for CameraMonitor {
+    fn drop(&mut self) {
+        if let Some(path) = &self.probe {
+            let _ = fs::remove_file(path);
+        }
+    }
 }
 
 enum SegmentStart {
@@ -2695,12 +3418,16 @@ impl Recorder<'_> {
         let mut retried = false;
         loop {
             let _ = fs::remove_file(&self.progress);
+            if let Some(probe) = &self.probe {
+                let _ = fs::remove_file(probe);
+            }
             let plan = build_plan(
                 self.options,
                 &self.capture,
                 path,
                 &self.progress,
                 &self.encoder,
+                self.probe.as_deref(),
             )?;
             let mut child = match spawn_ffmpeg(&self.ffmpeg, &plan.argv) {
                 Ok(child) => child,
@@ -2744,6 +3471,22 @@ impl Recorder<'_> {
                         session.fallback = Some(reason);
                         retried = true;
                         continue;
+                    }
+                    // The live picture check must never cost a recording:
+                    // if ffmpeg could not write it, record without it.
+                    if let (Some(probe), false) = (&self.probe, valid) {
+                        let name = probe
+                            .file_name()
+                            .map(|name| name.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                        if log_tail().map(|log| log.contains(&name)).unwrap_or(false) {
+                            eprintln!(
+                                "niruclip: camera picture check unavailable; recording without it"
+                            );
+                            let _ = fs::remove_file(path);
+                            self.probe = None;
+                            continue;
+                        }
                     }
                     return Ok(SegmentStart::Failed {
                         reason: format!("ffmpeg exited during startup: {status}"),
@@ -3154,6 +3897,396 @@ fn recover() -> Result<(), String> {
     Ok(())
 }
 
+/// A recording that uses the camera right now, if any.
+fn camera_in_recording() -> Option<CameraStatus> {
+    read_state()
+        .filter(|session| session.active() && pid_alive(session.pid, session.pid_start))
+        .and_then(|session| session.camera)
+        .filter(|camera| camera.status != "busy" && camera.status != "missing")
+}
+
+fn mode_summary(found: &camera::Camera) -> String {
+    let mut best: Vec<(String, u32, u32, f64)> = Vec::new();
+    for mode in &found.modes {
+        match best.iter_mut().find(|entry| entry.0 == mode.format) {
+            Some(entry) => {
+                if (mode.width as u64 * mode.height as u64) > (entry.1 as u64 * entry.2 as u64) {
+                    entry.1 = mode.width;
+                    entry.2 = mode.height;
+                    entry.3 = mode.fps;
+                }
+            }
+            None => best.push((mode.format.clone(), mode.width, mode.height, mode.fps)),
+        }
+    }
+    best.iter()
+        .map(|(format, w, h, fps)| format!("{format} up to {w}x{h}@{}", fps.round()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// `--check-camera`: which camera, which mode, privacy control, busy, and a
+/// 2.5 s look at the picture. Prints a report, notifies a one-line summary
+/// and exits 1 when the camera is not usable.
+fn check_camera(options: &Options) -> Result<(), String> {
+    if let Some(camera) = camera_in_recording() {
+        println!(
+            "camera {} is being recorded: {}",
+            camera.device, camera.status
+        );
+        if let Some(message) = camera.message.filter(|_| camera.status != "ok") {
+            println!("warning: {message}");
+        }
+        return Ok(());
+    }
+    let explicit = explicit_camera(options);
+    if explicit.is_none() {
+        for other in camera::discover() {
+            let kind = if other.infrared() {
+                ", infrared: skipped"
+            } else {
+                ""
+            };
+            println!("found: {} ({}{kind})", other.device, other.name);
+        }
+    }
+    let result = (|| -> Result<String, String> {
+        let found = camera::resolve(explicit.as_deref())?;
+        println!("camera: {} ({})", found.device, found.name);
+        if !found.bus.is_empty() {
+            println!("bus: {}", found.bus);
+        }
+        if !found.modes.is_empty() {
+            println!("modes: {}", mode_summary(&found));
+        }
+        let overlay = camera::choose_mode(&found.modes, camera::wanted_size(false, 1920));
+        let alone = camera::choose_mode(
+            &found.modes,
+            camera::wanted_size(true, options.preset.camera_max_width()),
+        );
+        println!(
+            "recording uses: overlay {}, camera-only {}",
+            overlay
+                .as_ref()
+                .map(camera::Mode::label)
+                .unwrap_or_else(|| "ffmpeg default".into()),
+            alone
+                .as_ref()
+                .map(camera::Mode::label)
+                .unwrap_or_else(|| "ffmpeg default".into())
+        );
+        match camera::privacy(&found.device) {
+            Some(true) => {
+                return Err("the camera privacy switch is on (camera key or shutter)".into())
+            }
+            Some(false) => println!("privacy control: off"),
+            None => {}
+        }
+        if camera::busy(&found.device) {
+            return Err(busy_message(&found.device));
+        }
+        let ffmpeg = command_path("ffmpeg", "NIRUCLIP_FFMPEG");
+        let probe = PreRoll::start(&ffmpeg, &found.device, overlay.as_ref())
+            .ok_or_else(|| "could not start ffmpeg".to_string())?;
+        std::thread::sleep(Duration::from_millis(2500));
+        let verdict = probe.finish();
+        println!("frames: {} in 2.5 s", verdict.frames);
+        match verdict.status(&found.device) {
+            Some(("ok", _)) => Ok(format!(
+                "{} works: {}",
+                if found.name.is_empty() {
+                    &found.device
+                } else {
+                    &found.name
+                },
+                overlay
+                    .as_ref()
+                    .map(camera::Mode::label)
+                    .unwrap_or_default()
+            )),
+            Some((_, Some(message))) => Err(message),
+            _ => Err("could not judge the camera picture (too few frames)".into()),
+        }
+    })();
+    match result {
+        Ok(summary) => {
+            println!("picture: ok");
+            notify(options, "NIRUCLIP camera", &summary);
+            Ok(())
+        }
+        Err(message) => {
+            println!("problem: {message}");
+            notify(options, "NIRUCLIP camera", &capitalize(&message));
+            Err("camera check failed".into())
+        }
+    }
+}
+
+/// `--preview`: a live window with the camera exactly as the overlay will
+/// look (shape, border, mirroring). Closes with q/Esc or after two minutes.
+fn preview(options: &Options) -> Result<(), String> {
+    if camera_in_recording().is_some() {
+        return Err("the camera is being recorded; no preview while recording".into());
+    }
+    let found = camera::resolve(explicit_camera(options).as_deref())?;
+    if camera::busy(&found.device) {
+        let message = busy_message(&found.device);
+        notify(options, "NIRUCLIP camera", &capitalize(&message));
+        return Err(message);
+    }
+    let mode = camera::choose_mode(&found.modes, (1280, 720));
+    let size = mode.as_ref().map(|m| (m.width, m.height)).unwrap_or((0, 0));
+    let border = border_rgb(&options.camera_border);
+    let shape = camera::overlay_box(
+        (1600, 720),
+        size,
+        0.5,
+        options.camera_shape,
+        (false, false),
+        border.is_some(),
+    );
+    let (w, h) = (shape.width, shape.height);
+    let (canvas_w, canvas_h) = (w + 2 * shape.x, h + 2 * shape.y);
+    let mirror = if options.camera_mirror { "hflip," } else { "" };
+    let mut graph = vec![format!(
+        "[in]setpts=PTS-STARTPTS,{mirror}scale={w}:{h}:force_original_aspect_ratio=increase:flags=bicubic,crop={w}:{h},setsar=1[wc]"
+    )];
+    graph.extend(camera::shape_filters(
+        "wc",
+        "wco",
+        &shape,
+        border.unwrap_or((0, 0, 0)),
+    ));
+    graph.push(format!("color=c=0x101010:s={canvas_w}x{canvas_h}:r=30[bg]"));
+    graph.push(format!(
+        "[bg][wco]overlay={}:{}:shortest=1:format=auto[out]",
+        shape.x, shape.y
+    ));
+    let mut argv: Vec<String> = ["-hide_banner", "-loglevel", "error", "-f", "v4l2"]
+        .iter()
+        .map(|value| (*value).to_string())
+        .collect();
+    if let Some(mode) = &mode {
+        if let Some(format) = mode.ffmpeg_format() {
+            argv.extend(["-input_format".into(), format.into()]);
+        }
+        argv.extend([
+            "-video_size".into(),
+            format!("{}x{}", mode.width, mode.height),
+        ]);
+    }
+    argv.extend([
+        "-framerate".into(),
+        "30".into(),
+        "-fflags".into(),
+        "nobuffer".into(),
+        "-flags".into(),
+        "low_delay".into(),
+        "-framedrop".into(),
+        "-an".into(),
+        "-t".into(),
+        "120".into(),
+        "-autoexit".into(),
+        "-window_title".into(),
+        "NIRUCLIP camera preview (q to close)".into(),
+        "-vf".into(),
+        graph.join(";"),
+        found.device.clone(),
+    ]);
+    // exec: the preview window *is* this process, so closing or killing
+    // it never leaves an ffplay holding the camera.
+    let error = Command::new(command_path("ffplay", "NIRUCLIP_FFPLAY"))
+        .args(&argv)
+        .stdin(Stdio::null())
+        .exec();
+    Err(format!("could not start ffplay: {error}"))
+}
+
+/// The recording --export and --share work on: --input, else the last saved
+/// recording, else the newest NIRUCLIP recording in the output directory.
+fn last_recording(options: &Options) -> Result<PathBuf, String> {
+    if let Some(input) = &options.input {
+        return input
+            .is_file()
+            .then(|| input.clone())
+            .ok_or_else(|| format!("{} does not exist", input.display()));
+    }
+    if let Some(session) = read_state().filter(|session| session.state == "finished") {
+        let path = PathBuf::from(&session.output);
+        if path.is_file() {
+            return Ok(path);
+        }
+    }
+    let dir = output_path(None)?
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    fs::read_dir(&dir)
+        .map_err(|error| format!("could not read {}: {error}", dir.display()))?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            name.starts_with("NIRUCLIP-") && name.ends_with(".mkv") && !name.ends_with(".part.mkv")
+        })
+        .max_by_key(|path| fs::metadata(path).and_then(|meta| meta.modified()).ok())
+        .ok_or_else(|| format!("no recording found in {}", dir.display()))
+}
+
+/// A path next to `input` with `extension` that does not exist yet.
+fn export_target(input: &Path, extension: &str) -> PathBuf {
+    let stem = input
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().to_string())
+        .unwrap_or_else(|| "NIRUCLIP".into());
+    let dir = input.parent().map(Path::to_path_buf).unwrap_or_default();
+    let mut candidate = dir.join(format!("{stem}.{extension}"));
+    let mut n = 2;
+    while candidate.exists() {
+        candidate = dir.join(format!("{stem}-{n}.{extension}"));
+        n += 1;
+    }
+    candidate
+}
+
+/// The longest GIF made without an explicit --to.
+const GIF_MAX_SECONDS: f64 = 30.0;
+
+/// `--export mp4|gif`: a share-friendly copy of a recording next to it. MP4
+/// without trimming is a lossless remux (instant); trimming re-encodes so
+/// the cut is frame-accurate. The MKV is never changed.
+fn export(options: &Options, format: &str) -> Result<PathBuf, String> {
+    let input = last_recording(options)?;
+    let target = export_target(&input, format);
+    let ffmpeg = command_path("ffmpeg", "NIRUCLIP_FFMPEG");
+    let mut trim: Vec<String> = Vec::new();
+    if let Some(from) = options.trim_from {
+        trim.extend(["-ss".into(), format!("{from:.3}")]);
+    }
+    let mut to = options.trim_to;
+    let mut capped = false;
+    if format == "gif" && to.is_none() {
+        let duration = media_duration(&input).unwrap_or(0.0);
+        if duration - options.trim_from.unwrap_or(0.0) > GIF_MAX_SECONDS {
+            to = Some(options.trim_from.unwrap_or(0.0) + GIF_MAX_SECONDS);
+            capped = true;
+        }
+    }
+    if let Some(to) = to {
+        trim.extend(["-to".into(), format!("{to:.3}")]);
+    }
+    let base = |args: &[String]| -> Vec<String> {
+        let mut argv: Vec<String> = ["-nostdin", "-hide_banner", "-loglevel", "error", "-n"]
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect();
+        argv.extend(trim.iter().cloned());
+        argv.extend(["-i".into(), input.display().to_string()]);
+        argv.extend(args.iter().cloned());
+        argv.push(target.display().to_string());
+        argv
+    };
+    let strings =
+        |items: &[&str]| -> Vec<String> { items.iter().map(|v| (*v).to_string()).collect() };
+    let attempts: Vec<Vec<String>> = if format == "gif" {
+        vec![base(&strings(&[
+            "-an",
+            "-vf",
+            "fps=12,scale='min(720,iw)':-2:flags=lanczos,split[a][b];[a]palettegen=stats_mode=diff[p];[b][p]paletteuse=dither=bayer:bayer_scale=4",
+            "-loop",
+            "0",
+        ]))]
+    } else {
+        let encode = base(&strings(&[
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a?",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "20",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "160k",
+            "-movflags",
+            "+faststart",
+        ]));
+        if trim.is_empty() {
+            vec![
+                base(&strings(&[
+                    "-map",
+                    "0",
+                    "-c",
+                    "copy",
+                    "-movflags",
+                    "+faststart",
+                ])),
+                encode,
+            ]
+        } else {
+            vec![encode]
+        }
+    };
+    let mut last_error = String::new();
+    for argv in attempts {
+        let _ = fs::remove_file(&target);
+        let output = Command::new(&ffmpeg)
+            .args(&argv)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|error| format!("could not start ffmpeg: {error}"))?;
+        if output.status.success() && fs::metadata(&target).map(|m| m.len() > 0).unwrap_or(false) {
+            let note = if capped {
+                " (first 30 s; use --to for more)"
+            } else {
+                ""
+            };
+            println!("NIRUCLIP exported: {}{note}", target.display());
+            notify(
+                options,
+                "NIRUCLIP",
+                &format!("Exported {}{note}", target.display()),
+            );
+            return Ok(target);
+        }
+        last_error = String::from_utf8_lossy(&output.stderr)
+            .trim()
+            .chars()
+            .take(400)
+            .collect();
+    }
+    let _ = fs::remove_file(&target);
+    notify(
+        options,
+        "NIRUCLIP",
+        "Export failed; see the terminal output",
+    );
+    Err(format!("export failed: {last_error}"))
+}
+
+/// `--share`: export the recording as MP4 and open NIRU Share with it.
+fn share(options: &Options) -> Result<(), String> {
+    let mp4 = export(options, "mp4")?;
+    Command::new(command_path("nirulauncher", "NIRUCLIP_LAUNCHER"))
+        .arg("--share")
+        .env("NIRUSHARE_SEND_FILE", &mp4)
+        .stdin(Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("could not open NIRU Share: {error}"))
+}
+
 fn list_profiles(config: &Config) {
     for (name, profile) in &config.profiles {
         println!(
@@ -3212,6 +4345,18 @@ fn main() {
         if options.status {
             status(&options);
             return Ok(());
+        }
+        if options.check_camera {
+            return check_camera(&options);
+        }
+        if options.preview {
+            return preview(&options);
+        }
+        if options.share {
+            return share(&options);
+        }
+        if let Some(format) = &options.export {
+            return export(&options, format).map(|_| ());
         }
         run_recording(options)
     })();

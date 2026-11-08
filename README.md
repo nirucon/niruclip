@@ -22,7 +22,19 @@ NIRUBAR shows the running, paused, interrupted or failed recording.
 
 - Full screen, region, window rectangle or camera-only recording.
 - Microphone, desktop audio or both (mixed at unity gain with a peak limiter).
-- Camera overlay in any corner at three sizes, or camera only.
+- Camera overlay in any corner at three sizes, rounded, circular or square,
+  with a thin border in the NIRUX theme colour and optional mirroring; or
+  camera only.
+- The camera is captured at a proper size (MJPEG 720p for the overlay,
+  1080p camera-only) on one shared clock with the screen and microphone, so
+  the face stays in sync with the voice.
+- Camera health checks: the countdown and the running recording detect a
+  privacy image (for example HP's crossed-out camera), a frozen picture, a
+  camera that delivers no frames or one that another program is using, and
+  say so in a notification, `--status`, NIRUBAR and NIRU Launcher.
+- `--check-camera` and a live `--preview` of the overlay.
+- `--export mp4|gif` (with `--from`/`--to` trimming) and `--share` through
+  NIRU Share.
 - `share`, `small` and `quality` presets that never upscale a smaller screen.
 - VAAPI hardware encoding when a probe succeeds, with automatic software
   (`libx264`) fallback.
@@ -79,6 +91,11 @@ niruclip --status --json
 niruclip --recover
 niruclip --list-profiles
 niruclip --full --audio desktop --save-profile demo
+niruclip --check-camera
+niruclip --preview --camera-shape circle --mirror
+niruclip --export mp4
+niruclip --export gif --from 3 --to 9
+niruclip --share
 ```
 
 | Option | Values |
@@ -87,7 +104,12 @@ niruclip --full --audio desktop --save-profile demo
 | Audio | `--audio none`, `mic`, `desktop`, `both` |
 | Camera | `--webcam off`, `corner`, `only` |
 | Corner | `--corner top-left`, `top-right`, `bottom-left`, `bottom-right` |
-| Camera size | `--webcam-size small` (20 %), `medium` (30 %, default), `large` (40 %) of the final video width |
+| Camera size | `--webcam-size small`, `medium` (default), `large`: 20, 26 or 34 % of the video height |
+| Camera device | `--camera DEVICE` or `auto` (default: the first camera, infrared sensors skipped) |
+| Camera shape | `--camera-shape rounded` (default), `circle`, `rect` |
+| Camera border | `--camera-border theme` (default), `none`, or a hex colour such as `8aa87e` |
+| Mirroring | `--mirror`, `--no-mirror` (default: not mirrored, so text reads correctly) |
+| Export | `--export mp4\|gif`, `--input FILE`, `--from SECONDS`, `--to SECONDS`; `--share` |
 | Preset | `--preset share` (up to 1080p), `small` (up to 720p), `quality` |
 | Encoder | `--encoder auto` (default), `software`, `vaapi` |
 | Countdown | `--countdown 0..10` |
@@ -137,7 +159,16 @@ webcam_size = "medium"      # small, medium, large
 preset = "share"            # share, small, quality
 countdown = 3
 screen = "DisplayPort-0"    # optional
+camera = "/dev/v4l/by-path/pci-0000:c4:00.4-usb-0:1:1.0-video-index0"  # optional
+camera_shape = "circle"     # rounded, circle, rect
+camera_mirror = false
+camera_border = "theme"     # theme, none or RRGGBB
 ```
+
+`camera`, `camera_shape`, `camera_mirror` and `camera_border` can also be set
+at the top level as defaults for every recording. A `/dev/v4l/by-path/` link
+keeps pointing at the same USB port; on some laptops the `by-id` link
+`...-video-index0` is the infrared sensor, not the camera.
 
 Notifications are shown when `notify-send` is available; `--no-notify` or
 `NIRUCLIP_NOTIFY=0` disables them. Other environment overrides are listed in
@@ -151,7 +182,8 @@ the [reference](docs/REFERENCE.md#environment-overrides).
 | `~/.config/niruclip/config.toml` | Profiles, default profile, encoder |
 | `~/.local/state/niruclip/session.json` | Recording state (schema 1), read by NIRUBAR and NIRU Launcher |
 | `~/.local/state/niruclip/vaapi-probe.json` | Cached VAAPI probe result per boot |
-| `~/Videos/NIRUCLIP-*.mkv` | Recordings (`*.part.mkv` while recording) |
+| `~/Videos/NIRUCLIP-*.mkv` | Recordings (`*.part.mkv` while recording); `--export` writes `.mp4`/`.gif` next to them |
+| `$XDG_RUNTIME_DIR/niruclip-PID.pgm` | A 128x96 grey copy of the current camera frame while recording (tmpfs, removed at the end) |
 
 Recordings, partials and profiles are user data. NIRUCLIP never deletes a
 personal recording as cleanup.
@@ -160,6 +192,13 @@ personal recording as cleanup.
 
 - **A recording ended unexpectedly:** run `niruclip --status`, then
   `niruclip --recover`. Segments of a paused recording are joined too.
+- **The camera shows a crossed-out camera or a black picture:** that is the
+  camera's own privacy image. Press the camera/privacy key (on HP laptops
+  often F10 or a key with a camera symbol), open the shutter, or check the
+  BIOS camera setting. `niruclip --check-camera` tells you when the picture
+  is usable again.
+- **"Camera is in use by ...":** another program (a browser or a video call)
+  is streaming from the camera. Close it, or record without the camera.
 - **Choppy camera overlay:** check `--status` for the drop warning. NIRUCLIP
   already requests 30 fps and disables dynamic exposure framerate during
   capture.
