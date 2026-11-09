@@ -3,6 +3,32 @@
 All notable changes to NIRUCLIP. Earlier releases are described in their
 GitHub release notes and commit messages.
 
+## 0.6.0 (2026-11-09)
+
+Choose the microphone per recording.
+
+### Added
+
+- `--mic SOURCE|default` and a `mic = "..."` key at the top of the config
+  and in profiles, next to `audio`. The value is a PipeWire/Pulse source
+  name, a case-insensitive part of its description (`webcam`, `UMC1820`) or
+  `default`. Precedence: `--mic`, profile, top-level `mic`; absent means the
+  system default source, exactly as before. Used by `--audio mic` and the mic
+  half of `--audio both`; the system default is never changed.
+- `--list-mics [--json]` lists the input sources (name, description, `*` for
+  the system default), without sink monitors.
+- The source is resolved at start. A missing microphone falls back to the
+  system default with a notification instead of failing the recording.
+- `session.json` has an optional `mic` object (requested, source, name,
+  description, fallback); `--status` shows the microphone and any fallback.
+
+### Changed
+
+- A user profile named like a built-in one (`screen-camera`, ...) now changes
+  only the keys it sets and keeps the others from the built-in profile;
+  before, missing keys fell back to the plain defaults. Profiles saved with
+  `--save-profile` set every key and behave as before.
+
 ## 0.5.1 (2026-11-09)
 
 ### Fixed

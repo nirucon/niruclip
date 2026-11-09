@@ -1,4 +1,5 @@
 mod camera;
+mod mic;
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -11,7 +12,7 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const VERSION: &str = "0.5.1";
+const VERSION: &str = "0.6.0";
 const SCHEMA: u32 = 1;
 const ACTIVE_STATES: &[&str] = &[
     "countdown",
@@ -301,6 +302,12 @@ struct Options {
     camera_mirror: bool,
     /// `theme` (NIRUX accent), `none` or a hex colour.
     camera_border: String,
+    /// Microphone setting (--mic / `mic =`); None is the system default.
+    mic: Option<String>,
+    /// The source the recording opens, resolved at start; None is
+    /// `@DEFAULT_SOURCE@`.
+    mic_source: Option<String>,
+    list_mics: bool,
     recovery: Recovery,
     check_camera: bool,
     preview: bool,
@@ -342,6 +349,9 @@ impl Default for Options {
             camera_shape: camera::Shape::Rounded,
             camera_mirror: false,
             camera_border: "theme".into(),
+            mic: None,
+            mic_source: None,
+            list_mics: false,
             recovery: Recovery::default(),
             check_camera: false,
             preview: false,
@@ -435,6 +445,9 @@ struct Profile {
     mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     audio: Option<String>,
+    /// Microphone: a source name, a description substring or `default`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mic: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     webcam: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -457,6 +470,30 @@ struct Profile {
     camera_border: Option<String>,
 }
 
+impl Profile {
+    /// This profile with every key it leaves out taken from `base`: a user
+    /// profile named like a built-in one (say `screen-camera` with only
+    /// `mic = "webcam"`) changes just the keys it sets.
+    fn over(self, base: Profile) -> Profile {
+        Profile {
+            description: self.description.or(base.description),
+            mode: self.mode.or(base.mode),
+            audio: self.audio.or(base.audio),
+            mic: self.mic.or(base.mic),
+            webcam: self.webcam.or(base.webcam),
+            corner: self.corner.or(base.corner),
+            webcam_size: self.webcam_size.or(base.webcam_size),
+            preset: self.preset.or(base.preset),
+            countdown: self.countdown.or(base.countdown),
+            screen: self.screen.or(base.screen),
+            camera: self.camera.or(base.camera),
+            camera_shape: self.camera_shape.or(base.camera_shape),
+            camera_mirror: self.camera_mirror.or(base.camera_mirror),
+            camera_border: self.camera_border.or(base.camera_border),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct Config {
     #[serde(default)]
@@ -466,6 +503,10 @@ struct Config {
     /// `auto` (default), `software` or `vaapi`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     encoder: Option<String>,
+    /// Microphone for every recording; a profile or --mic can override it.
+    /// Absent or `default`: the system default source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mic: Option<String>,
     /// Camera defaults for every recording; a profile can override them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     camera: Option<String>,
@@ -490,10 +531,33 @@ struct Config {
 
 impl Config {
     fn load() -> Result<Self, String> {
+        let path = config_path();
+        let loaded = if path.exists() {
+            let text = fs::read_to_string(&path)
+                .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+            let loaded: Config = toml::from_str(&text)
+                .map_err(|error| format!("invalid {}: {error}", path.display()))?;
+            if loaded.schema > 1 {
+                return Err(format!(
+                    "{} uses config schema {}, newer than supported schema 1",
+                    path.display(),
+                    loaded.schema
+                ));
+            }
+            Some(loaded)
+        } else {
+            None
+        };
+        Ok(Self::with_builtins(loaded))
+    }
+
+    /// The built-in profiles with the user's config on top.
+    fn with_builtins(loaded: Option<Config>) -> Self {
         let mut config = Self {
             schema: 1,
             default_profile: None,
             encoder: None,
+            mic: None,
             camera: None,
             camera_shape: None,
             camera_mirror: None,
@@ -507,21 +571,10 @@ impl Config {
         for (name, profile) in builtin_profiles() {
             config.profiles.insert(name, profile);
         }
-        let path = config_path();
-        if path.exists() {
-            let text = fs::read_to_string(&path)
-                .map_err(|error| format!("could not read {}: {error}", path.display()))?;
-            let loaded: Config = toml::from_str(&text)
-                .map_err(|error| format!("invalid {}: {error}", path.display()))?;
-            if loaded.schema > 1 {
-                return Err(format!(
-                    "{} uses config schema {}, newer than supported schema 1",
-                    path.display(),
-                    loaded.schema
-                ));
-            }
+        if let Some(loaded) = loaded {
             config.default_profile = loaded.default_profile;
             config.encoder = loaded.encoder;
+            config.mic = loaded.mic;
             config.camera = loaded.camera;
             config.camera_shape = loaded.camera_shape;
             config.camera_mirror = loaded.camera_mirror;
@@ -530,9 +583,15 @@ impl Config {
             config.camera_stall_seconds = loaded.camera_stall_seconds;
             config.camera_reopen_attempts = loaded.camera_reopen_attempts;
             config.camera_reopen_autosuspend = loaded.camera_reopen_autosuspend;
-            config.profiles.extend(loaded.profiles);
+            for (name, profile) in loaded.profiles {
+                let merged = match config.profiles.remove(&name) {
+                    Some(builtin) => profile.over(builtin),
+                    None => profile,
+                };
+                config.profiles.insert(name, merged);
+            }
         }
-        Ok(config)
+        config
     }
 
     fn save_profile(&mut self, name: &str, options: &Options) -> Result<(), String> {
@@ -543,6 +602,7 @@ impl Config {
             description: Some("Custom capture profile".into()),
             mode: Some(options.mode.as_str().into()),
             audio: Some(options.audio.as_str().into()),
+            mic: options.mic.clone(),
             webcam: Some(options.webcam.as_str().into()),
             corner: Some(options.corner.as_str().into()),
             webcam_size: Some(options.webcam_size.as_str().into()),
@@ -677,6 +737,9 @@ fn apply_profile(options: &mut Options, profile: &Profile) -> Result<(), String>
     }
     if let Some(value) = &profile.audio {
         options.audio = Audio::parse(value)?;
+    }
+    if let Some(value) = &profile.mic {
+        options.mic = mic_setting(value);
     }
     if let Some(value) = &profile.webcam {
         options.webcam = Webcam::parse(value)?;
@@ -856,6 +919,9 @@ struct Session {
     /// What the camera recovery did (lost, back, reopened), oldest first.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     camera_events: Option<Vec<CameraEvent>>,
+    /// The microphone in use (audio mic or both) and any fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mic: Option<mic::MicStatus>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -933,6 +999,7 @@ impl Session {
             elapsed_before: None,
             camera: None,
             camera_events: None,
+            mic: None,
         }
     }
 
@@ -1888,7 +1955,10 @@ fn build_plan(
                 "-f".into(),
                 "pulse".into(),
                 "-i".into(),
-                "@DEFAULT_SOURCE@".into(),
+                resolved
+                    .mic_source
+                    .clone()
+                    .unwrap_or_else(|| mic::DEFAULT_SOURCE.into()),
             ]);
         }
         if resolved.audio == Audio::Desktop || resolved.audio == Audio::Both {
@@ -2168,6 +2238,9 @@ fn parse_args(argv: &[String], config: &Config) -> Result<Options, String> {
         options.encoder = EncoderChoice::parse(value)?;
     }
     options.recovery = Recovery::from_config(config)?;
+    if let Some(value) = &config.mic {
+        options.mic = mic_setting(value);
+    }
     apply_camera_settings(
         &mut options,
         config.camera.as_deref(),
@@ -2209,6 +2282,11 @@ fn parse_args(argv: &[String], config: &Config) -> Result<Options, String> {
                 options.audio = Audio::parse(&next()?)?;
                 index += 1;
             }
+            "--mic" => {
+                options.mic = mic_setting(&next()?);
+                index += 1;
+            }
+            "--list-mics" => options.list_mics = true,
             "--webcam" => {
                 let value = next()?;
                 options.webcam = Webcam::parse(&value)?;
@@ -2339,11 +2417,13 @@ fn help() {
         "NIRUCLIP {VERSION}\n\
 Usage: niruclip --full|--region|--window|--webcam-only [options]\n\
        niruclip --stop | --pause | --resume | --status [--json] | --recover\n\
-       niruclip --list-profiles | --save-profile NAME\n\
+       niruclip --list-profiles | --save-profile NAME | --list-mics [--json]\n\
        niruclip --check-camera | --preview\n\
        niruclip --export mp4|gif [--input FILE] [--from S] [--to S] | --share [--input FILE]\n\n\
 Options:\n\
   --audio none|mic|desktop|both\n\
+  --mic SOURCE|default              microphone: source name or part of its description\n\
+  --list-mics [--json]              list microphones (* marks the system default)\n\
   --webcam off|corner|only          camera placement\n\
   --corner top-left|top-right|bottom-left|bottom-right\n\
   --webcam-size small|medium|large  camera height: 20, 26 or 34 % of the video\n\
@@ -2451,6 +2531,12 @@ fn status(options: &Options) {
     }
     if let Some(size) = size {
         println!("size: {}", human_bytes(size));
+    }
+    if let Some(mic) = &session.mic {
+        println!("mic: {}", mic.label());
+        if let Some(fallback) = &mic.fallback {
+            println!("warning: {fallback}; using the system default");
+        }
     }
     if let Some(encoder) = &session.encoder {
         println!("encoder: {encoder}");
@@ -2643,8 +2729,10 @@ fn record(options: Options, camera: &mut Option<CameraRestore>) -> Result<(), St
     }
     let progress_path = state_dir().join("ffmpeg.progress");
     let _ = fs::remove_file(&progress_path);
-    let capture = capture_input(&options, display.as_deref().unwrap_or_default())?;
     let ffmpeg = command_path("ffmpeg", "NIRUCLIP_FFMPEG");
+    let mut options = options;
+    let mic_status = resolve_microphone(&mut options, &ffmpeg);
+    let capture = capture_input(&options, display.as_deref().unwrap_or_default())?;
     let selection = select_encoder(options.encoder, &ffmpeg);
     let probe = capture.camera_index.and_then(|_| probe_path());
     let plan = build_plan(
@@ -2686,6 +2774,7 @@ fn record(options: Options, camera: &mut Option<CameraRestore>) -> Result<(), St
         elapsed_before: None,
         camera: capture.camera_status.clone(),
         camera_events: None,
+        mic: mic_status,
     };
     write_state(&session)?;
     if let Some(status) = session.camera.as_ref().filter(|status| status.problem()) {
@@ -5471,6 +5560,71 @@ fn share(options: &Options) -> Result<(), String> {
         .map_err(|error| format!("could not open NIRU Share: {error}"))
 }
 
+/// A `--mic` / `mic =` value; `default` (or empty) is the system default.
+fn mic_setting(value: &str) -> Option<String> {
+    (!mic::is_default(Some(value))).then(|| value.trim().to_string())
+}
+
+/// Pick the microphone for this recording (audio mic or both) and say so
+/// when the requested one is missing: the recording then uses the system
+/// default instead of failing. The system default itself is never changed.
+fn resolve_microphone(options: &mut Options, ffmpeg: &str) -> Option<mic::MicStatus> {
+    options.mic_source = None;
+    if options.audio != Audio::Mic && options.audio != Audio::Both {
+        return None;
+    }
+    let sources = mic::list_sources(ffmpeg);
+    let status = mic::resolve(options.mic.as_deref(), sources.as_deref());
+    if status.source != mic::DEFAULT_SOURCE {
+        options.mic_source = Some(status.source.clone());
+    }
+    if let Some(fallback) = &status.fallback {
+        let message = format!(
+            "{fallback}; recording from the system default ({})",
+            status.label().trim_end_matches(", system default")
+        );
+        eprintln!("niruclip: {message}");
+        notify(options, "NIRUCLIP microphone", &capitalize(&message));
+    } else if status.source == mic::DEFAULT_SOURCE
+        && status
+            .name
+            .as_deref()
+            .is_some_and(|name| name.ends_with(".monitor"))
+    {
+        eprintln!(
+            "niruclip: the system default source is a monitor (desktop audio): {}",
+            status.name.as_deref().unwrap_or_default()
+        );
+    }
+    eprintln!("niruclip: microphone: {}", status.label());
+    Some(status)
+}
+
+fn list_mics(options: &Options) -> Result<(), String> {
+    let ffmpeg = command_path("ffmpeg", "NIRUCLIP_FFMPEG");
+    let sources = mic::list_sources(&ffmpeg)
+        .ok_or("could not list audio sources (is PipeWire's Pulse interface running?)")?;
+    if options.json {
+        let mics: Vec<serde_json::Value> = sources
+            .iter()
+            .filter(|source| !source.monitor())
+            .map(|source| {
+                serde_json::json!({
+                    "name": source.name,
+                    "description": source.description,
+                    "default": source.default,
+                })
+            })
+            .collect();
+        let text = serde_json::to_string_pretty(&mics)
+            .map_err(|error| format!("could not serialize sources: {error}"))?;
+        println!("{text}");
+    } else {
+        print!("{}", mic::format_list(&sources));
+    }
+    Ok(())
+}
+
 fn list_profiles(config: &Config) {
     for (name, profile) in &config.profiles {
         println!(
@@ -5509,6 +5663,9 @@ fn main() {
         if options.list_profiles {
             list_profiles(&config);
             return Ok(());
+        }
+        if options.list_mics {
+            return list_mics(&options);
         }
         if let Some(name) = &options.save_profile {
             let mut config = config;
@@ -5807,6 +5964,106 @@ mod tests {
         session.state = "paused".into();
         assert!(session.active());
         assert!(!session.terminal());
+    }
+
+    #[test]
+    fn microphone_from_config_profile_and_flag() {
+        let args = |list: &[&str]| list.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+        // A 0.5 config without mic keys: the system default, as before.
+        let old: Config = toml::from_str(
+            "schema = 1\ndefault_profile = \"screen-mic\"\n[profiles.mine]\nmode = \"full\"\naudio = \"both\"\n",
+        )
+        .unwrap();
+        let config = Config::with_builtins(Some(old));
+        let options = parse_args(&args(&["--full"]), &config).unwrap();
+        assert_eq!(options.mic, None);
+        assert_eq!(options.audio, Audio::Mic);
+        let options = parse_args(&args(&["--profile", "mine"]), &config).unwrap();
+        assert_eq!((options.audio, options.mic.as_deref()), (Audio::Both, None));
+        assert!(!toml::to_string_pretty(&config).unwrap().contains("mic ="));
+        // Top-level mic, a profile mic over it, and --mic over both.
+        let set: Config =
+            toml::from_str("mic = \"UMC1820\"\n[profiles.screen-camera]\nmic = \"webcam\"\n")
+                .unwrap();
+        let config = Config::with_builtins(Some(set));
+        let options = parse_args(&args(&["--full"]), &config).unwrap();
+        assert_eq!(options.mic.as_deref(), Some("UMC1820"));
+        let options = parse_args(&args(&["--profile", "screen-camera"]), &config).unwrap();
+        assert_eq!(options.mic.as_deref(), Some("webcam"));
+        // The partial override keeps the built-in camera overlay.
+        assert_eq!(options.webcam, Webcam::Corner);
+        assert_eq!(
+            config.profiles["screen-camera"].description.as_deref(),
+            Some("Screen with camera overlay and microphone")
+        );
+        let options = parse_args(
+            &args(&["--profile", "screen-camera", "--mic", "Built-in"]),
+            &config,
+        )
+        .unwrap();
+        assert_eq!(options.mic.as_deref(), Some("Built-in"));
+        let options = parse_args(&args(&["--mic", "default"]), &config).unwrap();
+        assert_eq!(options.mic, None);
+        assert!(parse_args(&args(&["--mic"]), &config).is_err());
+        let options = parse_args(&args(&["--list-mics", "--json"]), &config).unwrap();
+        assert!(options.list_mics && options.json);
+    }
+
+    #[test]
+    fn chosen_microphone_is_the_pulse_input() {
+        let geometry = Some(Geometry {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        });
+        let pulse_inputs = |options: &Options| {
+            let capture = assemble_inputs(options, ":0", geometry, None, None, None).unwrap();
+            let plan = build_plan(
+                options,
+                &capture,
+                Path::new("/tmp/x.part.mkv"),
+                Path::new("/tmp/p"),
+                &Encoder::Software,
+                None,
+            )
+            .unwrap();
+            plan.argv
+                .windows(3)
+                .filter(|window| window[0] == "pulse" && window[1] == "-i")
+                .map(|window| window[2].clone())
+                .collect::<Vec<_>>()
+        };
+        let mut options = Options {
+            audio: Audio::Both,
+            ..Options::default()
+        };
+        assert_eq!(
+            pulse_inputs(&options),
+            ["@DEFAULT_SOURCE@", "@DEFAULT_MONITOR@"]
+        );
+        options.mic_source = Some("alsa_input.usb-webcam.analog-stereo".into());
+        assert_eq!(
+            pulse_inputs(&options),
+            ["alsa_input.usb-webcam.analog-stereo", "@DEFAULT_MONITOR@"]
+        );
+        options.audio = Audio::Desktop;
+        assert_eq!(pulse_inputs(&options), ["@DEFAULT_MONITOR@"]);
+        // Resolving never touches the source for desktop-only or no audio.
+        assert!(resolve_microphone(&mut options, "/nonexistent/ffmpeg").is_none());
+        assert_eq!(options.mic_source, None);
+        // An unlistable server: the default, with the reason recorded.
+        options.audio = Audio::Mic;
+        options.no_notify = true;
+        options.mic = Some("webcam".into());
+        let status = resolve_microphone(&mut options, "/nonexistent/ffmpeg").unwrap();
+        assert_eq!(status.source, "@DEFAULT_SOURCE@");
+        assert!(status.fallback.is_some());
+        assert_eq!(options.mic_source, None);
+        // Older session files without `mic` still load.
+        let session: Session =
+            serde_json::from_str(&serde_json::to_string(&Session::empty()).unwrap()).unwrap();
+        assert!(session.mic.is_none());
     }
 
     #[test]

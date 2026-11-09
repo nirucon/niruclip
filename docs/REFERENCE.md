@@ -210,13 +210,14 @@ State is stored at `${XDG_STATE_HOME:-$HOME/.local/state}/niruclip/session.json`
 (`NIRUCLIP_STATE_DIR` overrides the directory) and published atomically with
 schema version 1. NIRUBAR and NIRU Launcher read the same file and show the
 active or paused recording, an interrupted recovery, or a failure. Since 0.5.0
-the optional `camera_events` list records what the camera recovery did; no new
-states were added.
+the optional `camera_events` list records what the camera recovery did, and
+since 0.6.0 the optional `mic` object the microphone in use (see
+[Microphone selection](#microphone-selection)); no new states were added.
 
 While recording, the state carries an optional `performance` object with
 encoded frames, fps, dropped/duplicated frames and encoder speed.
 `niruclip --status` shows the state, mode (with camera corner, audio and
-preset), recorded time (excluding pauses), size so far, encoder and fallback,
+preset), the microphone, recorded time (excluding pauses), size so far, encoder and fallback,
 fps and the performance counters, a drop warning, the output path, the number of
 segments and the reason. It warns when the captured stream is losing more than
 2 % frames or duplicating more than 5 %; NIRUBAR shows the same warning.
@@ -225,6 +226,46 @@ segments and the reason. It warns when the captured stream is losing more than
 `elapsed_seconds`, `size_bytes` and `drop_warning` fields (all optional).
 
 ## Audio
+
+### Microphone selection
+
+The microphone is resolved once, when the recording starts (before the
+countdown), and only for `--audio mic` or `both`. NIRUCLIP lists the sources
+with `ffmpeg -sources pulse` (the same Pulse connection the recording uses,
+answered by PipeWire's pipewire-pulse; no `pactl` needed, two-second limit) and
+picks, in order:
+
+1. a source whose name is exactly the setting (a monitor's exact name too);
+2. a microphone whose name or description equals it, ignoring case;
+3. the first microphone whose description contains it, ignoring case;
+4. the first microphone whose name contains it.
+
+Sink monitors (`*.monitor`, "Monitor of …") are not microphones: they are
+hidden by `--list-mics` and only match by exact name. Desktop audio stays
+`@DEFAULT_MONITOR@`.
+
+With no setting or `default` the recording opens `@DEFAULT_SOURCE@` exactly as
+before 0.6.0; the name and description of the default are still recorded when
+the listing worked. A chosen source is passed to ffmpeg's pulse input by name
+for this recording only; the system default is not changed. Pause/resume
+segments and the software retry reuse the resolved source.
+
+**Missing microphone: fall back, do not stop.** If the setting matches no
+source (unplugged) or the sources cannot be listed, the recording uses the
+system default source, prints the reason, and notifies "Microphone "…" not
+found; recording from the system default (…)". A recording is never refused
+because of the microphone: losing the take is worse than recording the wrong
+mic, and the notification arrives during the countdown. `--list-mics` exits
+with status 1 when the sources cannot be listed.
+
+`session.json` gets an optional `mic` object: `requested` (`default` or the
+setting), `source` (what ffmpeg opened: a name or `@DEFAULT_SOURCE@`), `name`
+and `description` when known, and `fallback` (the reason) when the requested
+one was not used. `--status` prints `mic: <description> (<name>)`, with
+", system default" when the default was used, and a warning line after a
+fallback. A system default that is itself a monitor is noted on stderr.
+
+### Mixing
 
 `--audio both` mixes the microphone and desktop audio at unity gain
 (`amix normalize=0`, so neither source is attenuated) and then applies a peak

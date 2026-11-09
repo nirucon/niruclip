@@ -22,6 +22,8 @@ NIRUBAR shows the running, paused, interrupted or failed recording.
 
 - Full screen, region, window rectangle or camera-only recording.
 - Microphone, desktop audio or both (mixed at unity gain with a peak limiter).
+  The microphone can be chosen per recording or profile (the webcam mic, an
+  audio interface input) without changing the system default.
 - Camera overlay in any corner at three sizes, rounded, circular or square,
   with a thin border in the NIRUX theme colour and optional mirroring; or
   camera only.
@@ -88,6 +90,8 @@ installs another release.
 ```sh
 niruclip --full --audio mic
 niruclip --region --audio both
+niruclip --full --audio mic --mic webcam     # this recording only
+niruclip --list-mics
 niruclip --full --webcam corner --corner bottom-right --webcam-size large
 niruclip --webcam-only --audio mic
 niruclip --profile screen-camera
@@ -110,6 +114,7 @@ niruclip --share
 |---|---|
 | Mode | `--full`, `--region`, `--window`, `--webcam-only` |
 | Audio | `--audio none`, `mic`, `desktop`, `both` |
+| Microphone | `--mic SOURCE` or `default` (default: the system default source); `--list-mics [--json]` |
 | Camera | `--webcam off`, `corner`, `only` |
 | Corner | `--corner top-left`, `top-right`, `bottom-left`, `bottom-right` |
 | Camera size | `--webcam-size small`, `medium` (default), `large`: 20, 26 or 34 % of the video height |
@@ -156,11 +161,13 @@ command-line options still override it.
 schema = 1
 default_profile = "screen-mic"
 encoder = "auto"            # auto, software or vaapi
+mic = "default"             # optional: default, a source name or part of its description
 
 [profiles.demo]
 description = "Custom capture profile"
 mode = "full"               # full, region, window, webcam-only
 audio = "desktop"           # none, mic, desktop, both
+mic = "UMC1820"             # optional; absent means the system default source
 webcam = "off"              # off, corner, only
 corner = "bottom-right"
 webcam_size = "medium"      # small, medium, large
@@ -172,6 +179,29 @@ camera_shape = "circle"     # rounded, circle, rect
 camera_mirror = false
 camera_border = "theme"     # theme, none or RRGGBB
 ```
+
+### Choosing the microphone
+
+`niruclip --list-mics` lists the input sources (sink monitors are left out)
+with their PipeWire/Pulse name and description; `*` marks the system default.
+`--mic` (or `mic =` at the top of the config or in a profile) takes a source
+name, a case-insensitive part of the description such as `webcam` or
+`UMC1820`, or `default`. Precedence: `--mic`, then the profile, then the
+top-level `mic`; without any of them the system default source is used, as
+before. The choice applies to `--audio mic` and to the microphone half of
+`--audio both`; the system default is never changed.
+
+A profile with the name of a built-in one changes only the keys it sets, so
+this keeps the camera overlay of `screen-camera` and only picks the mic:
+
+```toml
+[profiles.screen-camera]
+mic = "webcam"
+```
+
+If the chosen microphone is not there (unplugged), NIRUCLIP warns with a
+notification and records from the system default instead of failing;
+`--status` and `session.json` (`mic`) show which source was used and why.
 
 `camera`, `camera_shape`, `camera_mirror` and `camera_border` can also be set
 at the top level as defaults for every recording.

@@ -8,6 +8,16 @@ mkdir -p "$TMP/state" "$TMP/config" "$TMP/out"
 
 cat > "$TMP/ffmpeg-ok" <<'EOF'
 #!/bin/sh
+# The source listing behind --mic and --list-mics (ffmpeg -sources pulse).
+if printf '%s\n' "$@" | grep -qx -- -sources; then
+  [ -z "${FAKE_SOURCES_LOG:-}" ] || printf '%s\n' "$*" >> "$FAKE_SOURCES_LOG"
+  [ "${FAKE_SOURCES:-ok}" = ok ] || exit 1
+  printf '%s\n' 'Auto-detected sources for pulse:' \
+    '* fake_output.analog-stereo.monitor [Monitor of Fake Speakers] (none)' \
+    '  alsa_input.fake-builtin.analog-stereo [Built-in Audio Analog Stereo] (none)' \
+    '  alsa_input.usb-Fake_Webcam-02.mono-fallback [Fake Webcam Mono] (none)'
+  exit 0
+fi
 last=; progress=; prev=; vaapi=
 for arg in "$@"; do
   [ "$prev" = "-progress" ] && progress=$arg
@@ -890,6 +900,50 @@ wait "$pid"
 sleep 0.3
 if grep -q 'privacy image' "$FAKE_NOTIFY_LOG"; then echo 'a cured placeholder was still reported' >&2; exit 1; fi
 [ "$(parts "$TMP/out/cured.mkv")" -eq 2 ]
+
+# Microphone choice. --list-mics hides monitors and notes a monitor default.
+NIRUCLIP_FFMPEG="$TMP/ffmpeg-ok" common "$BIN" --list-mics > "$TMP/mics.txt"
+grep -q '^  alsa_input.usb-Fake_Webcam-02.mono-fallback  *Fake Webcam Mono$' "$TMP/mics.txt"
+grep -q '^  alsa_input.fake-builtin.analog-stereo  *Built-in Audio Analog Stereo$' "$TMP/mics.txt"
+if grep -v '^note:' "$TMP/mics.txt" | grep -q monitor; then echo 'a monitor was listed as a microphone' >&2; exit 1; fi
+grep -q '^note: the system default source is fake_output.analog-stereo.monitor' "$TMP/mics.txt"
+NIRUCLIP_FFMPEG="$TMP/ffmpeg-ok" common "$BIN" --list-mics --json | grep -q '"description": "Fake Webcam Mono"'
+if FAKE_SOURCES=fail NIRUCLIP_FFMPEG="$TMP/ffmpeg-ok" common "$BIN" --list-mics >/dev/null 2>&1; then echo 'an unlistable server was not reported' >&2; exit 1; fi
+# --mic by description substring opens that source, and session.json says so.
+export FAKE_LOG="$TMP/mic.log"; NIRUCLIP_FFMPEG="$TMP/ffmpeg-ok" common "$BIN" --full --audio mic --mic WEBCAM --countdown 0 --output "$TMP/out/mic.mkv" >/dev/null 2>&1 &
+pid=$!
+wait_state recording mic.mkv
+common "$BIN" --status --json | grep -q '"source": "alsa_input.usb-Fake_Webcam-02.mono-fallback"'
+common "$BIN" --status | grep -qx 'mic: Fake Webcam Mono (alsa_input.usb-Fake_Webcam-02.mono-fallback)'
+common "$BIN" --stop >/dev/null
+wait "$pid"
+grep -A2 -x -- pulse "$TMP/mic.log" | grep -qx 'alsa_input.usb-Fake_Webcam-02.mono-fallback'
+if grep -q '@DEFAULT_SOURCE@' "$TMP/mic.log"; then echo '--mic still opened the default source' >&2; exit 1; fi
+# A missing microphone falls back to the system default with a notification.
+: > "$FAKE_NOTIFY_LOG"
+export FAKE_LOG="$TMP/mic-missing.log"; FAKE_NOTIFY=1 NIRUCLIP_NOTIFY_SEND="$TMP/notify-send" NIRUCLIP_FFMPEG="$TMP/ffmpeg-ok" common "$BIN" --full --audio both --mic scarlett --countdown 0 --output "$TMP/out/mic-missing.mkv" >/dev/null 2>&1 &
+pid=$!
+wait_state recording mic-missing.mkv
+common "$BIN" --status --json | grep -q '"fallback": "microphone \\"scarlett\\" not found"'
+common "$BIN" --status | grep -q '^warning: microphone "scarlett" not found; using the system default'
+common "$BIN" --stop >/dev/null
+wait "$pid"
+grep -q '@DEFAULT_SOURCE@' "$TMP/mic-missing.log"
+grep -q '@DEFAULT_MONITOR@' "$TMP/mic-missing.log"
+grep -q 'not found; recording from the system default' "$FAKE_NOTIFY_LOG"
+# Desktop-only and silent recordings never list sources.
+export FAKE_SOURCES_LOG="$TMP/sources.log"; : > "$FAKE_SOURCES_LOG"
+export FAKE_LOG="$TMP/mic-desktop.log"; NIRUCLIP_FFMPEG="$TMP/ffmpeg-ok" common "$BIN" --full --audio desktop --mic webcam --countdown 0 --output "$TMP/out/mic-desktop.mkv" >/dev/null 2>&1 &
+pid=$!
+wait_state recording mic-desktop.mkv
+if common "$BIN" --status --json | grep -q '"mic"'; then echo 'desktop-only recording has a mic' >&2; exit 1; fi
+common "$BIN" --stop >/dev/null
+wait "$pid"
+[ ! -s "$FAKE_SOURCES_LOG" ]
+unset FAKE_SOURCES_LOG
+# A saved profile remembers the microphone.
+common "$BIN" --save-profile mic-profile --full --audio mic --mic webcam
+grep -q 'mic = "webcam"' "$TMP/config/config.toml"
 
 # Profiles are listable, saveable and apply the camera-only mode.
 common "$BIN" --list-profiles | grep -q '^camera-mic'
