@@ -12,7 +12,7 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const VERSION: &str = "0.6.0";
+const VERSION: &str = "0.6.1";
 const SCHEMA: u32 = 1;
 const ACTIVE_STATES: &[&str] = &[
     "countdown",
@@ -392,6 +392,11 @@ struct Recovery {
     /// Keep the camera's USB autosuspend off while reopening, when this user
     /// may change it (never with root or sudo).
     autosuspend: bool,
+    /// Set the camera's `exposure_dynamic_framerate` to 0 for a steady 30 fps
+    /// in low light (`camera_steady_framerate`). Off by default: the HP 5MP
+    /// laptop camera answers it with its privacy image (the UVC privacy
+    /// control turns on) after one or two seconds of streaming.
+    steady_framerate: bool,
 }
 
 impl Default for Recovery {
@@ -401,6 +406,7 @@ impl Default for Recovery {
             stall: Duration::from_secs(2),
             reopen_attempts: 2,
             autosuspend: true,
+            steady_framerate: false,
         }
     }
 }
@@ -428,6 +434,9 @@ impl Recovery {
         }
         if let Some(value) = config.camera_reopen_autosuspend {
             recovery.autosuspend = value;
+        }
+        if let Some(value) = config.camera_steady_framerate {
+            recovery.steady_framerate = value;
         }
         Ok(recovery)
     }
@@ -525,6 +534,8 @@ struct Config {
     camera_reopen_attempts: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     camera_reopen_autosuspend: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    camera_steady_framerate: Option<bool>,
     #[serde(default)]
     profiles: BTreeMap<String, Profile>,
 }
@@ -566,6 +577,7 @@ impl Config {
             camera_stall_seconds: None,
             camera_reopen_attempts: None,
             camera_reopen_autosuspend: None,
+            camera_steady_framerate: None,
             profiles: BTreeMap::new(),
         };
         for (name, profile) in builtin_profiles() {
@@ -583,6 +595,7 @@ impl Config {
             config.camera_stall_seconds = loaded.camera_stall_seconds;
             config.camera_reopen_attempts = loaded.camera_reopen_attempts;
             config.camera_reopen_autosuspend = loaded.camera_reopen_autosuspend;
+            config.camera_steady_framerate = loaded.camera_steady_framerate;
             for (name, profile) in loaded.profiles {
                 let merged = match config.profiles.remove(&name) {
                     Some(builtin) => profile.over(builtin),
@@ -2782,9 +2795,11 @@ fn record(options: Options, camera: &mut Option<CameraRestore>) -> Result<(), St
         eprintln!("niruclip: {message}");
         notify(&options, "NIRUCLIP camera", &capitalize(&message));
     }
-    if capture.camera.is_some() {
-        // Ask for a steady 30 fps: dynamic exposure framerate halves the
-        // camera rate in low light. The previous value is persisted first.
+    if capture.camera.is_some() && options.recovery.steady_framerate {
+        // Opt-in (camera_steady_framerate): ask for a steady 30 fps, since
+        // dynamic exposure framerate halves the camera rate in low light. Off
+        // by default because the HP 5MP camera switches to its privacy image
+        // when this control is 0. The previous value is persisted first.
         let device = capture
             .camera
             .as_ref()

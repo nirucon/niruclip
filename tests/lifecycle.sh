@@ -413,6 +413,18 @@ kill_recorder() {
   [ -z "$child" ] || kill -9 -- "-$child" 2>/dev/null || true
 }
 printf 1 > "$FAKE_V4L2_STATE"
+# Default: the camera control is never touched (the HP 5MP camera shows its
+# privacy image when exposure_dynamic_framerate is 0).
+rm -f "$TMP/config/config.toml"; : > "$FAKE_V4L2_STATE.log"
+NIRUCLIP_FFMPEG="$TMP/ffmpeg-ok" common "$BIN" --webcam-only --audio none --countdown 0 --output "$TMP/out/cam-default.mkv" >/dev/null 2>&1 &
+pid=$!
+wait_state recording
+[ "$(ctrl)" = 1 ] || { echo 'the camera control changed without camera_steady_framerate' >&2; exit 1; }
+common "$BIN" --stop >/dev/null
+wait "$pid"
+[ ! -s "$FAKE_V4L2_STATE.log" ] || { echo 'v4l2-ctl --set-ctrl ran without camera_steady_framerate' >&2; exit 1; }
+# Opt-in: the control is set to 0 and always restored.
+mkdir -p "$TMP/config"; printf 'camera_steady_framerate = true\n' > "$TMP/config/config.toml"
 NIRUCLIP_FFMPEG="$TMP/ffmpeg-ok" common "$BIN" --webcam-only --audio none --countdown 0 --output "$TMP/out/cam-normal.mkv" >/dev/null 2>&1 &
 pid=$!
 wait_state recording

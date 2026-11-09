@@ -3,6 +3,22 @@
 All notable changes to NIRUCLIP. Earlier releases are described in their
 GitHub release notes and commit messages.
 
+## 0.6.1 (2026-11-09)
+
+The HP 5MP laptop camera no longer switches itself off after a second.
+
+### Fixed
+
+- NIRUCLIP set the camera's `exposure_dynamic_framerate` control to 0 for a
+  steady 30 fps. The HP 5MP camera answers that by turning its UVC privacy
+  control on and showing its crossed-out-camera image one or two seconds into
+  the stream (reproduced with plain ffmpeg and v4l2-ctl), so every camera
+  recording on that laptop lost the camera after about a second and reported
+  "the camera privacy switch is on".
+- The control is now left alone by default. `camera_steady_framerate = true`
+  turns the old behaviour back on for cameras that halve their rate in low
+  light; the previous value is still saved first and always restored.
+
 ## 0.6.0 (2026-11-09)
 
 Choose the microphone per recording.

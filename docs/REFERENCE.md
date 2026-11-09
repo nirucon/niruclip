@@ -36,9 +36,12 @@ each input was shifted to zero on its own, and because the inputs are opened
 one after another the camera overlay ended up about 0.3 s out of sync with
 the microphone.
 
-The camera is requested at 30 fps and its `exposure_dynamic_framerate`
-control is set to 0 during capture, so a 30 fps screen overlay does not show
-a 15 fps camera. When a camera overlay is used, the camera input is opened
+The camera is requested at 30 fps. With `camera_steady_framerate = true` its
+`exposure_dynamic_framerate` control is set to 0 during capture (and restored
+afterwards), so a 30 fps screen overlay does not show a 15 fps camera in low
+light. It is off by default: the HP 5MP laptop camera turns its UVC privacy
+control on and shows its crossed-out-camera image about a second after that
+control is 0, which looked like the camera switching itself off. When a camera overlay is used, the camera input is opened
 before the screen input.
 
 ### Overlay

@@ -256,8 +256,10 @@ personal recording as cleanup.
 - **"Camera is in use by ...":** another program (a browser or a video call)
   is streaming from the camera. Close it, or record without the camera.
 - **Choppy camera overlay:** check `--status` for the drop warning. NIRUCLIP
-  already requests 30 fps and disables dynamic exposure framerate during
-  capture.
+  requests 30 fps. In low light many cameras halve their rate; set
+  `camera_steady_framerate = true` to turn their dynamic exposure framerate
+  off during capture (not on HP 5MP laptop cameras: they show their privacy
+  image then).
 - **Hardware encoding not used:** `--status` shows the encoder and any
   fallback. Delete `vaapi-probe.json` after a driver change, or force
   `--encoder software`.
