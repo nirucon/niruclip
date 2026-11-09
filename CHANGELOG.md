@@ -3,6 +3,17 @@
 All notable changes to NIRUCLIP. Earlier releases are described in their
 GitHub release notes and commit messages.
 
+## 0.5.1 (2026-11-09)
+
+### Fixed
+
+- A segment whose ffmpeg had to be killed (a camera that hangs its reader)
+  lost everything since its start, because Matroska clusters were only
+  written every few seconds. Recordings now use one-second clusters, so at
+  most about a second is lost and the segment repair (or `--recover` after a
+  power loss) keeps the rest. Measured on the HP 5MP Camera with a blocked
+  reader: 3 s + 5 s segments gave 5.0 s with 0.5.0 and 8.2 s with 0.5.1.
+
 ## 0.5.0 (2026-11-09)
 
 Camera recording that survives a camera going away.

@@ -11,7 +11,7 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const VERSION: &str = "0.5.0";
+const VERSION: &str = "0.5.1";
 const SCHEMA: u32 = 1;
 const ACTIVE_STATES: &[&str] = &[
     "countdown",
@@ -2052,6 +2052,10 @@ fn build_plan(
         argv.extend(["-c:a".into(), "aac".into(), "-b:a".into(), "160k".into()]);
     }
     argv.extend(["-avoid_negative_ts".into(), "make_zero".into()]);
+    // One-second Matroska clusters: when ffmpeg has to be killed (a camera
+    // that hangs its reader, a power loss) at most about a second is still
+    // unwritten, and --recover or the segment repair keeps the rest.
+    argv.extend(["-cluster_time_limit".into(), "1000".into()]);
     argv.push(partial.display().to_string());
     if let (Some(path), Some(_)) = (probe, capture.camera_index) {
         // A tiny greyscale copy of every camera frame for the live picture

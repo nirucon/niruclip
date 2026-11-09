@@ -187,6 +187,7 @@ The default destination is `~/Videos/NIRUCLIP-YYYY-MM-DD_HH-MM-SS.mkv`.
 `NIRUCLIP_OUTPUT` changes the directory and `--output` selects a file or an
 existing/created directory. Existing output and partial files are never
 overwritten; a numeric suffix is chosen instead. MKV is written as `.part.mkv`
+(in one-second clusters, so a killed ffmpeg loses at most about a second)
 and renamed only after it contains a usable video stream.
 
 - A controlled stop finalizes a valid partial as a normal saved recording.
