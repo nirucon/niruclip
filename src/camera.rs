@@ -168,7 +168,7 @@ impl Mode {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Camera {
     pub device: String,
     pub name: String,
@@ -219,7 +219,14 @@ fn frame_rates(fd: i32, format: u32, width: u32, height: u32) -> f64 {
 /// Query one device node. None when it is not a video-capture node (UVC
 /// metadata nodes, loopback outputs) or cannot be opened.
 pub fn query(device: &str) -> Option<Camera> {
-    let file = open_device(device)?;
+    query_node(device).ok()
+}
+
+/// Query a node. Err(true): it is definitely not a capture device (worth
+/// caching); Err(false): it could not be asked (absent, no permission, busy
+/// resuming), so the answer may change.
+fn query_node(device: &str) -> Result<Camera, bool> {
+    let file = open_device(device).ok_or(false)?;
     let fd = file.as_raw_fd();
     let mut cap = Capability {
         driver: [0; 16],
@@ -230,14 +237,14 @@ pub fn query(device: &str) -> Option<Camera> {
         device_caps: 0,
         reserved: [0; 3],
     };
-    xioctl(fd, VIDIOC_QUERYCAP, &mut cap).ok()?;
+    xioctl(fd, VIDIOC_QUERYCAP, &mut cap).map_err(|_| true)?;
     let caps = if cap.capabilities & CAP_DEVICE_CAPS != 0 {
         cap.device_caps
     } else {
         cap.capabilities
     };
     if caps & CAP_VIDEO_CAPTURE == 0 {
-        return None;
+        return Err(true);
     }
     let mut modes = Vec::new();
     for index in 0..64 {
@@ -291,7 +298,7 @@ pub fn query(device: &str) -> Option<Camera> {
             }
         }
     }
-    Some(Camera {
+    Ok(Camera {
         device: device.to_string(),
         name: c_string(&cap.card),
         bus: c_string(&cap.bus_info),
@@ -326,7 +333,7 @@ pub fn discover() -> Vec<Camera> {
     nodes.sort_by_key(|path| video_index(path));
     let mut cameras: Vec<Camera> = nodes
         .iter()
-        .filter_map(|path| query(&path.display().to_string()))
+        .filter_map(|path| query_cached(&path.display().to_string()))
         .collect();
     cameras.sort_by_key(|camera| camera.infrared());
     cameras
@@ -361,10 +368,15 @@ pub fn resolve(explicit: Option<&str>) -> Result<Camera, String> {
         use std::os::unix::fs::FileTypeExt;
         let metadata =
             fs::metadata(device).map_err(|_| format!("camera {device} is unavailable"))?;
-        if !metadata.file_type().is_char_device() {
+        if !metadata.file_type().is_char_device() && test_input_format().is_none() {
             return Err(format!("camera {device} is not a character device"));
         }
-        let mut camera = query(device).unwrap_or_else(|| Camera {
+        let queried = if test_input_format().is_some() {
+            None
+        } else {
+            query_cached(device)
+        };
+        let mut camera = queried.unwrap_or_else(|| Camera {
             device: device.to_string(),
             ..Camera::default()
         });
@@ -452,6 +464,9 @@ pub fn privacy(device: &str) -> Option<bool> {
     if let Ok(value) = std::env::var("NIRUCLIP_TEST_PRIVACY") {
         return Some(value == "1");
     }
+    if !char_device(device) {
+        return None;
+    }
     let file = open_device(device)?;
     let mut control = Control {
         id: CID_PRIVACY,
@@ -467,6 +482,9 @@ pub fn privacy(device: &str) -> Option<bool> {
 pub fn busy(device: &str) -> bool {
     if std::env::var("NIRUCLIP_TEST_CAMERA_BUSY").as_deref() == Ok("1") {
         return true;
+    }
+    if !char_device(device) {
+        return false;
     }
     let Some(file) = open_device(device) else {
         return false;
@@ -518,6 +536,212 @@ pub fn holders(device: &str) -> Vec<String> {
         }
     }
     names
+}
+
+// ---------------------------------------------------------------------------
+// Presence, the capability cache, reopening and USB power.
+// ---------------------------------------------------------------------------
+
+fn char_device(device: &str) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    fs::metadata(device)
+        .map(|meta| meta.file_type().is_char_device())
+        .unwrap_or(false)
+}
+
+/// Test hook: `NIRUCLIP_TEST_CAMERA_FORMAT=nut` reads the "camera" with that
+/// ffmpeg demuxer (for example from a FIFO a feeder ffmpeg writes to), so
+/// losing and regaining a camera can be simulated without root or
+/// v4l2loopback. Never set in normal use.
+pub fn test_input_format() -> Option<String> {
+    std::env::var("NIRUCLIP_TEST_CAMERA_FORMAT")
+        .ok()
+        .filter(|value| !value.is_empty())
+}
+
+/// True while the device node exists (a USB camera's node disappears when it
+/// is unplugged or the bus resets).
+pub fn present(device: &str) -> bool {
+    match fs::metadata(device) {
+        Ok(meta) => {
+            use std::os::unix::fs::FileTypeExt;
+            meta.file_type().is_char_device() || test_input_format().is_some()
+        }
+        Err(_) => false,
+    }
+}
+
+static CACHE_PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Where query results are cached (set once by main; unset means no cache).
+pub fn set_cache_path(path: PathBuf) {
+    let _ = CACHE_PATH.set(path);
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct CacheFile {
+    #[serde(default)]
+    boot: String,
+    #[serde(default)]
+    nodes: std::collections::BTreeMap<String, CacheEntry>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct CacheEntry {
+    key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    camera: Option<Camera>,
+}
+
+fn boot_id() -> String {
+    fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .map(|text| text.trim().to_string())
+        .unwrap_or_default()
+}
+
+/// What identifies one appearance of a device node: a replugged camera gets
+/// a new node (new inode and change time), so its cache entry is not reused.
+pub fn node_key(device: &str) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = fs::metadata(device).ok()?;
+    Some(format!(
+        "{}:{}:{}.{}",
+        meta.rdev(),
+        meta.ino(),
+        meta.ctime(),
+        meta.ctime_nsec()
+    ))
+}
+
+/// The capability lookup for camera-check and recording start: the ioctl
+/// enumeration (which can wake an autosuspended USB camera) runs once per
+/// node appearance per boot, then the cached answer is used.
+pub fn query_cached(device: &str) -> Option<Camera> {
+    let Some(path) = CACHE_PATH.get() else {
+        return query(device);
+    };
+    let key = node_key(device)?;
+    let boot = boot_id();
+    let mut cache: CacheFile = fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .filter(|cache: &CacheFile| cache.boot == boot)
+        .unwrap_or_default();
+    if let Some(entry) = cache.nodes.get(device).filter(|entry| entry.key == key) {
+        return entry.camera.clone();
+    }
+    let result = query_node(device);
+    let camera = match result {
+        Ok(camera) => Some(camera),
+        Err(true) => None,
+        // Not cached: the node may answer in a moment (permissions, resume).
+        Err(false) => return None,
+    };
+    cache.boot = boot;
+    cache.nodes.insert(
+        device.to_string(),
+        CacheEntry {
+            key,
+            camera: camera.clone(),
+        },
+    );
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(text) = serde_json::to_vec(&cache) {
+        let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+        if fs::write(&tmp, text).is_ok() && fs::rename(&tmp, path).is_err() {
+            let _ = fs::remove_file(&tmp);
+        }
+    }
+    camera
+}
+
+/// The mode for reopen attempt `attempt` (1-based) after the camera showed
+/// its firmware placeholder: first the same size in another pixel format,
+/// then other full-rate sizes of the same aspect, nearest first. Each one
+/// makes the driver negotiate the stream again. When the camera offers
+/// nothing else, the current mode is reopened as is.
+pub fn reopen_mode(modes: &[Mode], current: Option<&Mode>, attempt: u32) -> Option<Mode> {
+    let current = current?;
+    let floor = current.fps.min(25.0) - 0.5;
+    let aspect = |mode: &Mode| mode.width as f64 / mode.height.max(1) as f64;
+    let area = |mode: &Mode| mode.width as i64 * mode.height as i64;
+    let usable: Vec<&Mode> = modes
+        .iter()
+        .filter(|mode| {
+            mode.ffmpeg_format().is_some()
+                && mode.width > 0
+                && mode.height > 0
+                && mode.fps >= floor
+                && mode.format != "GREY"
+                && *mode != current
+        })
+        .collect();
+    let mut order: Vec<&Mode> = usable
+        .iter()
+        .copied()
+        .filter(|mode| mode.width == current.width && mode.height == current.height)
+        .collect();
+    order.sort_by_key(|mode| format_rank(&mode.format));
+    let mut others: Vec<&Mode> = usable
+        .iter()
+        .copied()
+        .filter(|mode| (mode.width, mode.height) != (current.width, current.height))
+        .collect();
+    others.sort_by_key(|mode| {
+        (
+            ((aspect(mode) - aspect(current)).abs() > 0.02) as u8,
+            (area(mode) - area(current)).abs(),
+            (mode.format != current.format) as u8,
+        )
+    });
+    // One mode per size from the others: a size change is what matters.
+    let mut seen = Vec::new();
+    for mode in others {
+        if !seen.contains(&(mode.width, mode.height)) {
+            seen.push((mode.width, mode.height));
+            order.push(mode);
+        }
+    }
+    Some(
+        order
+            .get(attempt.saturating_sub(1) as usize)
+            .map(|mode| (*mode).clone())
+            .unwrap_or_else(|| current.clone()),
+    )
+}
+
+/// The `power/control` file of the USB device behind a video node, when
+/// there is one. `NIRUCLIP_SYSFS` points tests at a fake tree.
+pub fn usb_power_control(device: &str) -> Option<PathBuf> {
+    let sys = std::env::var_os("NIRUCLIP_SYSFS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/sys"));
+    usb_power_control_in(&sys, device)
+}
+
+fn usb_power_control_in(sys: &Path, device: &str) -> Option<PathBuf> {
+    let real = fs::canonicalize(device).ok()?;
+    let name = real.file_name()?.to_str()?.to_string();
+    let mut dir =
+        fs::canonicalize(sys.join("class/video4linux").join(&name).join("device")).ok()?;
+    for _ in 0..4 {
+        if dir.join("idVendor").exists() && dir.join("power/control").exists() {
+            return Some(dir.join("power/control"));
+        }
+        dir = dir.parent()?.to_path_buf();
+    }
+    None
+}
+
+/// True when this user may write the file (no root, no sudo, no helper).
+pub fn writable(path: &Path) -> bool {
+    let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: a valid NUL-terminated path.
+    unsafe { libc::access(c_path.as_ptr(), libc::W_OK) == 0 }
 }
 
 // ---------------------------------------------------------------------------
@@ -926,6 +1150,108 @@ mod tests {
             assert_eq!(VIDIOC_G_FMT, 0xc0d0_5604);
             assert_eq!(VIDIOC_S_FMT, 0xc0d0_5605);
         }
+    }
+
+    #[test]
+    fn reopen_tries_another_format_then_another_size() {
+        let hp = modes(
+            "MJPG 640x480@30,MJPG 640x360@30,MJPG 1280x720@30,MJPG 1920x1080@30,\
+             YUYV 640x480@30,YUYV 640x360@30,YUYV 1280x720@10",
+        );
+        let current = choose_mode(&hp, (1280, 720)).unwrap();
+        assert_eq!(current.label(), "MJPG 1280x720@30");
+        // YUYV 720p is only 10 fps: not a full-rate alternative. The
+        // nearest size of the same aspect comes next, then the next one.
+        let first = reopen_mode(&hp, Some(&current), 1).unwrap();
+        assert_eq!(first.label(), "MJPG 640x360@30");
+        let second = reopen_mode(&hp, Some(&current), 2).unwrap();
+        assert_eq!(second.label(), "MJPG 1920x1080@30");
+        // Same size in another format comes first when the camera has one.
+        let both = modes("YUYV 1280x720@30,MJPG 1280x720@30,MJPG 640x360@30");
+        let yuyv = choose_mode(&both, (1280, 720)).unwrap();
+        assert_eq!(yuyv.format, "YUYV");
+        assert_eq!(
+            reopen_mode(&both, Some(&yuyv), 1).unwrap().label(),
+            "MJPG 1280x720@30"
+        );
+        assert_eq!(
+            reopen_mode(&both, Some(&yuyv), 2).unwrap().label(),
+            "MJPG 640x360@30"
+        );
+        // Nothing else to offer: reopen the same mode; unknown mode: none.
+        assert_eq!(reopen_mode(&both, Some(&yuyv), 5).unwrap(), yuyv);
+        let only = modes("MJPG 1280x720@30");
+        assert_eq!(reopen_mode(&only, only.first(), 1), only.first().cloned());
+        assert_eq!(reopen_mode(&only, None, 1), None);
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "niruclip-camera-test-{}-{name}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn usb_power_control_is_found_above_the_interface() {
+        let dir = scratch("sysfs");
+        let sys = dir.join("sys");
+        let usb = sys.join("devices/pci0/usb3/3-1");
+        fs::create_dir_all(usb.join("3-1:1.0/video4linux/video0")).unwrap();
+        fs::create_dir_all(usb.join("power")).unwrap();
+        fs::write(usb.join("idVendor"), "30c9\n").unwrap();
+        fs::write(usb.join("power/control"), "auto\n").unwrap();
+        fs::create_dir_all(sys.join("class/video4linux/video0")).unwrap();
+        std::os::unix::fs::symlink(
+            usb.join("3-1:1.0"),
+            sys.join("class/video4linux/video0/device"),
+        )
+        .unwrap();
+        let node = dir.join("video0");
+        fs::write(&node, "").unwrap();
+        let found = usb_power_control_in(&sys, node.to_str().unwrap()).unwrap();
+        assert!(found.ends_with("3-1/power/control"));
+        assert!(writable(&found));
+        // A node without a USB parent (a loopback device) has none.
+        let lone = dir.join("video9");
+        fs::write(&lone, "").unwrap();
+        assert!(usb_power_control_in(&sys, lone.to_str().unwrap()).is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_replugged_node_gets_a_new_cache_key() {
+        let dir = scratch("nodekey");
+        let node = dir.join("video0");
+        fs::write(&node, "").unwrap();
+        let first = node_key(node.to_str().unwrap()).unwrap();
+        assert_eq!(node_key(node.to_str().unwrap()).unwrap(), first);
+        fs::remove_file(&node).unwrap();
+        assert!(node_key(node.to_str().unwrap()).is_none());
+        assert!(!present(node.to_str().unwrap()));
+        // Keep the old inode alive so the new file cannot reuse it.
+        let keep = dir.join("keep");
+        fs::write(&keep, "").unwrap();
+        fs::write(&node, "").unwrap();
+        assert_ne!(node_key(node.to_str().unwrap()).unwrap(), first);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn non_devices_are_never_asked_for_privacy_or_busy() {
+        let dir = scratch("nondevice");
+        let file = dir.join("video0");
+        fs::write(&file, "").unwrap();
+        if std::env::var_os("NIRUCLIP_TEST_PRIVACY").is_none() {
+            assert_eq!(privacy(file.to_str().unwrap()), None);
+        }
+        if std::env::var_os("NIRUCLIP_TEST_CAMERA_BUSY").is_none() {
+            assert!(!busy(file.to_str().unwrap()));
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

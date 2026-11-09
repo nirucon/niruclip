@@ -31,7 +31,15 @@ NIRUBAR shows the running, paused, interrupted or failed recording.
 - Camera health checks: the countdown and the running recording detect a
   privacy image (for example HP's crossed-out camera), a frozen picture, a
   camera that delivers no frames or one that another program is using, and
-  say so in a notification, `--status`, NIRUBAR and NIRU Launcher.
+  say so in a notification, `--status`, NIRUBAR and NIRU Launcher. The
+  check runs with every countdown, also a short one.
+- Camera recovery: a camera that is unplugged or stops delivering frames
+  mid-recording no longer freezes the overlay. A screen recording continues
+  without the camera at once and takes it back when it returns within 10 s;
+  a camera-only recording waits up to 10 s for it and otherwise saves what
+  was recorded. A camera that shows its firmware placeholder is closed and
+  reopened in another mode (twice by default) before NIRUCLIP warns. The
+  result is always one playable file.
 - `--check-camera` and a live `--preview` of the overlay.
 - `--export mp4|gif` (with `--from`/`--to` trimming) and `--share` through
   NIRU Share.
@@ -166,7 +174,17 @@ camera_border = "theme"     # theme, none or RRGGBB
 ```
 
 `camera`, `camera_shape`, `camera_mirror` and `camera_border` can also be set
-at the top level as defaults for every recording. A `/dev/v4l/by-path/` link
+at the top level as defaults for every recording.
+
+Camera recovery is set at the top level. Every key is optional; a missing
+key means its default, so older configs work unchanged:
+
+```toml
+camera_reconnect_seconds = 10     # wait for a lost camera; 0 = off (0.4.0 behaviour)
+camera_stall_seconds = 2          # no new camera frame this long = lost (0.5..30)
+camera_reopen_attempts = 2        # reopens on a placeholder/frozen picture; 0 = only warn
+camera_reopen_autosuspend = true  # keep USB autosuspend off while reopening, if allowed without root
+``` A `/dev/v4l/by-path/` link
 keeps pointing at the same USB port; on some laptops the `by-id` link
 `...-video-index0` is the infrared sensor, not the camera.
 
@@ -182,6 +200,7 @@ the [reference](docs/REFERENCE.md#environment-overrides).
 | `~/.config/niruclip/config.toml` | Profiles, default profile, encoder |
 | `~/.local/state/niruclip/session.json` | Recording state (schema 1), read by NIRUBAR and NIRU Launcher |
 | `~/.local/state/niruclip/vaapi-probe.json` | Cached VAAPI probe result per boot |
+| `~/.local/state/niruclip/camera-cache.json` | Cached camera capabilities per device node and boot |
 | `~/Videos/NIRUCLIP-*.mkv` | Recordings (`*.part.mkv` while recording); `--export` writes `.mp4`/`.gif` next to them |
 | `$XDG_RUNTIME_DIR/niruclip-PID.pgm` | A 128x96 grey copy of the current camera frame while recording (tmpfs, removed at the end) |
 
@@ -196,7 +215,14 @@ personal recording as cleanup.
   camera's own privacy image. Press the camera/privacy key (on HP laptops
   often F10 or a key with a camera symbol), open the shutter, or check the
   BIOS camera setting. `niruclip --check-camera` tells you when the picture
-  is usable again.
+  is usable again. NIRUCLIP already closes and reopens the camera (in
+  another mode) before it warns; `camera_events` in `--status --json` shows
+  what it tried.
+- **The camera was unplugged during a recording:** a screen recording goes
+  on without it and picks it up again when it is plugged back in within
+  `camera_reconnect_seconds`; a camera-only recording is saved when it does
+  not come back. The saved file is one video; each switch shows as a short
+  jump of about 1-2 s.
 - **"Camera is in use by ...":** another program (a browser or a video call)
   is streaming from the camera. Close it, or record without the camera.
 - **Choppy camera overlay:** check `--status` for the drop warning. NIRUCLIP

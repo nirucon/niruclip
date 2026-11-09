@@ -59,9 +59,14 @@ than a plain one. `--mirror` flips the camera horizontally.
   refused with EBUSY), and the programs holding it are named. Camera-only
   recording then fails clearly; a screen recording continues without the
   camera and says so.
-- **During the countdown** (2 s or more): a separate short ffmpeg reads tiny
-  greyscale frames (128x96, 5 per second, in memory only) and judges the
-  frames after the first second.
+- **With every countdown** (also 0 or 1 s): a separate short ffmpeg reads
+  tiny greyscale frames (128x96, 5 per second, in memory only) in parallel
+  with the countdown and judges the frames after the first second. When the
+  countdown is shorter than the check (about 1.5-2 s), the start waits for
+  it (at most 4 s from its start) instead of skipping it. The camera's
+  capabilities (formats, sizes, rates) are enumerated once per device node
+  and boot and cached in `camera-cache.json`; a replugged camera gets a new
+  node and is enumerated again.
 - **While recording:** ffmpeg also writes a 128x96 greyscale copy of every
   camera frame to one tmpfs file (atomically replaced); NIRUCLIP looks at it
   twice a second, and also reads the UVC privacy control when the camera has
@@ -73,11 +78,60 @@ symbol on black (90 % of the pixels at most 24, some above 140). It is
 **frozen** when every frame is bit-identical. A dark room is never reported:
 a real sensor, however dark, has noise, so its frames are never identical
 and their mean change stays far above 0.2. **No frames** means the camera
-stopped delivering for 6 seconds (unplugged, or taken over). Problems and
+stopped delivering for 6 seconds (only when loss recovery is off; see below). Problems and
 recovery are notified once each, stored as `camera.status`/`camera.message`
 in the session (`ok`, `checking`, `privacy`, `frozen`, `no-frames`, `busy`,
 `missing`) and shown by `--status`, NIRUBAR (`● rec 00:12 · cam off`) and
 NIRU Launcher.
+
+### Camera recovery
+
+A camera counts as **lost** when its device node disappears, ffmpeg logs a
+camera input error (`VIDIOC_DQBUF`, "No such device", an error on the camera
+input), no new camera frame reaches the live check for
+`camera_stall_seconds` (default 2), the recording itself stops producing
+frames for that long, or, camera-only, ffmpeg reaches the end of the camera
+stream. The loss is notified at once, the current segment is closed (a
+segment that ffmpeg could not finish is remuxed losslessly, an empty one is
+removed), and then:
+
+- **Screen with camera overlay:** a new segment records the screen without
+  the camera right away. While it runs, NIRUCLIP looks for the camera every
+  half second (the same explicit device, or for `auto` a camera with the
+  same name and USB port). When it is back, a separate short probe must get
+  frames from it first, so a camera that is present but silent never costs
+  screen time; then a new segment with the camera starts and "Camera is
+  back" is notified. After `camera_reconnect_seconds` (default 10) without
+  it, NIRUCLIP says so and the recording continues screen-only.
+- **Camera only:** there is nothing to record without the camera. NIRUCLIP
+  waits up to `camera_reconnect_seconds` (the state stays `recording`,
+  `camera.status` is `missing`);
+  a returned camera continues the recording in a new segment, at the size of
+  the first one (scaled and padded if the mode differs). Otherwise the
+  recording is saved and the notification says why.
+
+A camera that is lost more than three times within a minute is given up on
+(overlay: screen-only from then on; camera-only: saved). All segments are
+joined losslessly into one file on stop, as for pause and resume; the switch
+itself is a jump of about 1-2 s. `camera_reconnect_seconds = 0` turns this
+off (the 0.4.0 behaviour: the last frame stays and "no frames" is reported).
+
+**Placeholder reopen.** When the pre-check or the live check sees the
+firmware placeholder (privacy image) or a frozen picture, and the UVC privacy
+control is not on, NIRUCLIP closes and reopens the camera, up to
+`camera_reopen_attempts` times (default 2): first the same size in another
+pixel format, then the nearest other full-rate size of the same aspect. In a
+recording each reopen is a new segment. When a reopen gives a live picture
+nothing is notified; when the attempts are used up, the 0.4.0 warning is
+shown. The pre-check and the recording share the attempts; a picture that
+stays live for a minute makes them available again. When
+`camera_reopen_autosuspend` is true (default) and this user may write the
+camera's USB `power/control` file, autosuspend is switched off ("on") for the
+rest of the recording and restored afterwards; normally that file is
+root-only, and NIRUCLIP only logs that it left it alone (it never uses sudo).
+
+Every step is logged in the session as `camera_events` (time and text, the
+last 40), shown by `--status` (last five) and printed on stderr.
 
 `--check-camera` lists the cameras, the chosen modes and the privacy
 control, checks for another user and looks at the picture for 2.5 s; it exits
@@ -154,7 +208,9 @@ a false "recording" state.
 State is stored at `${XDG_STATE_HOME:-$HOME/.local/state}/niruclip/session.json`
 (`NIRUCLIP_STATE_DIR` overrides the directory) and published atomically with
 schema version 1. NIRUBAR and NIRU Launcher read the same file and show the
-active or paused recording, an interrupted recovery, or a failure.
+active or paused recording, an interrupted recovery, or a failure. Since 0.5.0
+the optional `camera_events` list records what the camera recovery did; no new
+states were added.
 
 While recording, the state carries an optional `performance` object with
 encoded frames, fps, dropped/duplicated frames and encoder speed.
@@ -215,3 +271,4 @@ NIRU Share (`nirulauncher --share`) with it.
 | `NIRUCLIP_NOTIFY=0` | Disable notifications |
 | `NIRUCLIP_FFMPEG`, `NIRUCLIP_FFPROBE`, `NIRUCLIP_FFPLAY`, `NIRUCLIP_SLOP`, `NIRUCLIP_XRANDR`, `NIRUCLIP_V4L2CTL`, `NIRUCLIP_NOTIFY_SEND`, `NIRUCLIP_LAUNCHER` | Alternative helper programs (used by the tests) |
 | `NIRUCLIP_CAMERA_MODES`, `NIRUCLIP_TEST_CAMERA_BUSY`, `NIRUCLIP_TEST_PRIVACY`, `NIRUCLIP_PROBE_DIR`, `NIRUCLIP_DEV_DIR` | Test hooks for camera modes, a busy camera, the privacy control, the live-check directory and the device directory |
+| `NIRUCLIP_TEST_CAMERA_FORMAT`, `NIRUCLIP_TEST_CAMERA_PROTOCOL`, `NIRUCLIP_SYSFS` | Test hooks: read the "camera" with another ffmpeg demuxer and protocol (a file or socket stand-in that can be removed to simulate an unplug), and a fake sysfs tree for USB power control |

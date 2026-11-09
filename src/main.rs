@@ -11,7 +11,7 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const VERSION: &str = "0.4.0";
+const VERSION: &str = "0.5.0";
 const SCHEMA: u32 = 1;
 const ACTIVE_STATES: &[&str] = &[
     "countdown",
@@ -301,6 +301,7 @@ struct Options {
     camera_mirror: bool,
     /// `theme` (NIRUX accent), `none` or a hex colour.
     camera_border: String,
+    recovery: Recovery,
     check_camera: bool,
     preview: bool,
     /// `mp4` or `gif`.
@@ -341,6 +342,7 @@ impl Default for Options {
             camera_shape: camera::Shape::Rounded,
             camera_mirror: false,
             camera_border: "theme".into(),
+            recovery: Recovery::default(),
             check_camera: false,
             preview: false,
             export: None,
@@ -361,6 +363,67 @@ impl Default for Options {
             version: false,
             help: false,
         }
+    }
+}
+
+/// What NIRUCLIP does when the camera goes away or shows its firmware
+/// placeholder. Config keys (top level, all optional): camera_reconnect_seconds,
+/// camera_stall_seconds, camera_reopen_attempts, camera_reopen_autosuspend.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Recovery {
+    /// How long to wait for a lost camera to come back; zero turns loss
+    /// recovery off (0.4.0 behaviour: the last frame stays).
+    reconnect: Duration,
+    /// No new camera frame for this long counts as a lost camera.
+    stall: Duration,
+    /// Close and reopen the camera at most this often when it shows its
+    /// privacy placeholder or a frozen picture; zero only warns.
+    reopen_attempts: u32,
+    /// Keep the camera's USB autosuspend off while reopening, when this user
+    /// may change it (never with root or sudo).
+    autosuspend: bool,
+}
+
+impl Default for Recovery {
+    fn default() -> Self {
+        Self {
+            reconnect: Duration::from_secs(10),
+            stall: Duration::from_secs(2),
+            reopen_attempts: 2,
+            autosuspend: true,
+        }
+    }
+}
+
+impl Recovery {
+    fn from_config(config: &Config) -> Result<Self, String> {
+        let mut recovery = Self::default();
+        if let Some(value) = config.camera_reconnect_seconds {
+            if !(0.0..=300.0).contains(&value) {
+                return Err("camera_reconnect_seconds must be 0..300".into());
+            }
+            recovery.reconnect = Duration::from_secs_f64(value);
+        }
+        if let Some(value) = config.camera_stall_seconds {
+            if !(0.5..=30.0).contains(&value) {
+                return Err("camera_stall_seconds must be 0.5..30".into());
+            }
+            recovery.stall = Duration::from_secs_f64(value);
+        }
+        if let Some(value) = config.camera_reopen_attempts {
+            if value > 10 {
+                return Err("camera_reopen_attempts must be 0..10".into());
+            }
+            recovery.reopen_attempts = value;
+        }
+        if let Some(value) = config.camera_reopen_autosuspend {
+            recovery.autosuspend = value;
+        }
+        Ok(recovery)
+    }
+
+    fn reconnect_enabled(&self) -> bool {
+        !self.reconnect.is_zero()
     }
 }
 
@@ -412,6 +475,15 @@ struct Config {
     camera_mirror: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     camera_border: Option<String>,
+    /// Camera recovery (see Recovery); absent keys use the defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    camera_reconnect_seconds: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    camera_stall_seconds: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    camera_reopen_attempts: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    camera_reopen_autosuspend: Option<bool>,
     #[serde(default)]
     profiles: BTreeMap<String, Profile>,
 }
@@ -426,6 +498,10 @@ impl Config {
             camera_shape: None,
             camera_mirror: None,
             camera_border: None,
+            camera_reconnect_seconds: None,
+            camera_stall_seconds: None,
+            camera_reopen_attempts: None,
+            camera_reopen_autosuspend: None,
             profiles: BTreeMap::new(),
         };
         for (name, profile) in builtin_profiles() {
@@ -450,6 +526,10 @@ impl Config {
             config.camera_shape = loaded.camera_shape;
             config.camera_mirror = loaded.camera_mirror;
             config.camera_border = loaded.camera_border;
+            config.camera_reconnect_seconds = loaded.camera_reconnect_seconds;
+            config.camera_stall_seconds = loaded.camera_stall_seconds;
+            config.camera_reopen_attempts = loaded.camera_reopen_attempts;
+            config.camera_reopen_autosuspend = loaded.camera_reopen_autosuspend;
             config.profiles.extend(loaded.profiles);
         }
         Ok(config)
@@ -773,6 +853,32 @@ struct Session {
     /// The camera in use and whether its picture is usable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     camera: Option<CameraStatus>,
+    /// What the camera recovery did (lost, back, reopened), oldest first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    camera_events: Option<Vec<CameraEvent>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct CameraEvent {
+    /// Unix time in seconds.
+    time: f64,
+    event: String,
+}
+
+const CAMERA_EVENTS_KEPT: usize = 40;
+
+/// Record a camera recovery step in session.json (the recovery file) and on
+/// stderr.
+fn camera_event(session: &mut Session, event: impl Into<String>) {
+    let event = event.into();
+    eprintln!("niruclip: camera: {event}");
+    let events = session.camera_events.get_or_insert_with(Vec::new);
+    events.push(CameraEvent { time: now(), event });
+    if events.len() > CAMERA_EVENTS_KEPT {
+        let extra = events.len() - CAMERA_EVENTS_KEPT;
+        events.drain(..extra);
+    }
+    let _ = write_state(session);
 }
 
 /// Camera health as shown by --status, NIRUBAR and NIRU Launcher.
@@ -826,6 +932,7 @@ impl Session {
             segments: None,
             elapsed_before: None,
             camera: None,
+            camera_events: None,
         }
     }
 
@@ -1300,6 +1407,10 @@ struct CaptureInputs {
     camera: Option<camera::Camera>,
     camera_mode: Option<camera::Mode>,
     camera_status: Option<CameraStatus>,
+    /// Camera-only: the size of the first segment. Later segments (after a
+    /// reconnect or reopen in another mode) are scaled and padded to it so
+    /// they join losslessly.
+    fixed_output: Option<(u32, u32)>,
 }
 
 /// Packets each live input may queue while the filter graph is busy. 8 (screen)
@@ -1313,6 +1424,31 @@ const INPUT_QUEUE: &str = "512";
 /// wall-clock time like x11grab and pulse use, so with `-copyts` every input
 /// shares one clock (see build_plan).
 fn camera_input(device: &str, mode: Option<&camera::Mode>) -> Vec<String> {
+    if let Some(format) = camera::test_input_format() {
+        // Test stand-in (a FIFO fed by another ffmpeg): "FORMAT [input
+        // options]"; wall-clock timestamps play the part of `-ts abs`.
+        let mut words = format.split_whitespace().map(str::to_string);
+        let mut argv: Vec<String> = vec![
+            "-thread_queue_size".into(),
+            INPUT_QUEUE.into(),
+            "-f".into(),
+            words.next().unwrap_or_default(),
+        ];
+        argv.extend(words);
+        // NIRUCLIP_TEST_CAMERA_PROTOCOL=unix reads a socket whose server
+        // starts a fresh stream for every reader, like a camera does.
+        let url = match std::env::var("NIRUCLIP_TEST_CAMERA_PROTOCOL") {
+            Ok(protocol) if !protocol.is_empty() => format!("{protocol}:{device}"),
+            _ => device.to_string(),
+        };
+        argv.extend([
+            "-use_wallclock_as_timestamps".into(),
+            "1".into(),
+            "-i".into(),
+            url,
+        ]);
+        return argv;
+    }
     let mut argv: Vec<String> = ["-thread_queue_size", INPUT_QUEUE, "-f", "v4l2"]
         .iter()
         .map(|value| (*value).to_string())
@@ -1439,6 +1575,26 @@ fn capture_input(resolved: &Options, display: &str) -> Result<CaptureInputs, Str
     } else {
         Some(xrandr_geometry(resolved.screen.as_deref())?)
     };
+    assemble_inputs(
+        resolved,
+        display,
+        geometry,
+        found,
+        camera_mode,
+        camera_status,
+    )
+}
+
+/// The ffmpeg inputs for a screen geometry and an optional camera. Also used
+/// to switch the camera off and on between segments of one recording.
+fn assemble_inputs(
+    resolved: &Options,
+    display: &str,
+    geometry: Option<Geometry>,
+    found: Option<camera::Camera>,
+    camera_mode: Option<camera::Mode>,
+    camera_status: Option<CameraStatus>,
+) -> Result<CaptureInputs, String> {
     let mut argv = Vec::new();
     let mut screen_index = None;
     let mut camera_index = None;
@@ -1479,6 +1635,7 @@ fn capture_input(resolved: &Options, display: &str) -> Result<CaptureInputs, Str
         camera: found,
         camera_mode,
         camera_status,
+        fixed_output: None,
     })
 }
 
@@ -1767,17 +1924,28 @@ fn build_plan(
             .ok_or_else(|| "camera input is missing".to_string())?;
         let max_width = resolved.preset.camera_max_width();
         let source = camera_source(&mut filters, camera_index);
-        filters.push(format!(
-            "[{source}]{mirror}scale=w='trunc(min(iw,{max_width})/2)*2':h=-2:flags=bicubic,setsar=1[{vout}]"
-        ));
-        match &capture.camera_mode {
-            Some(mode) => {
+        if let Some((fixed_width, fixed_height)) = capture.fixed_output {
+            filters.push(format!(
+                "[{source}]{mirror}scale={fixed_width}:{fixed_height}:force_original_aspect_ratio=decrease:flags=bicubic,\
+                 pad={fixed_width}:{fixed_height}:(ow-iw)/2:(oh-ih)/2,setsar=1[{vout}]"
+            ));
+        } else {
+            filters.push(format!(
+                "[{source}]{mirror}scale=w='trunc(min(iw,{max_width})/2)*2':h=-2:flags=bicubic,setsar=1[{vout}]"
+            ));
+        }
+        match (&capture.camera_mode, capture.fixed_output) {
+            (_, Some((fixed_width, fixed_height))) => {
+                width = fixed_width;
+                height = fixed_height;
+            }
+            (Some(mode), None) => {
                 width = even(mode.width.min(max_width));
                 height = even(
                     ((mode.height as f64) * (width as f64) / (mode.width as f64)).round() as u32,
                 );
             }
-            None => {
+            (None, None) => {
                 width = max_width;
                 height = 0;
             }
@@ -1995,6 +2163,7 @@ fn parse_args(argv: &[String], config: &Config) -> Result<Options, String> {
     if let Some(value) = &config.encoder {
         options.encoder = EncoderChoice::parse(value)?;
     }
+    options.recovery = Recovery::from_config(config)?;
     apply_camera_settings(
         &mut options,
         config.camera.as_deref(),
@@ -2310,6 +2479,12 @@ fn status(options: &Options) {
             println!("warning: {message}");
         }
     }
+    if let Some(events) = &session.camera_events {
+        let skip = events.len().saturating_sub(5);
+        for event in &events[skip..] {
+            println!("camera event: {}", event.event);
+        }
+    }
     if !session.output.is_empty() {
         println!("output: {}", session.output);
     }
@@ -2506,6 +2681,7 @@ fn record(options: Options, camera: &mut Option<CameraRestore>) -> Result<(), St
         segments: None,
         elapsed_before: None,
         camera: capture.camera_status.clone(),
+        camera_events: None,
     };
     write_state(&session)?;
     if let Some(status) = session.camera.as_ref().filter(|status| status.problem()) {
@@ -2533,18 +2709,19 @@ fn record(options: Options, camera: &mut Option<CameraRestore>) -> Result<(), St
             set_camera_control(&device, CAMERA_CONTROL, "0");
         }
     }
-    // A countdown of 2 s or more doubles as a camera check: a short probe
-    // reads the camera while the user waits, so a privacy image, a frozen or
-    // a silent camera is reported before anything is recorded.
+    // The camera pre-check runs with every countdown, in parallel with it: a
+    // short probe reads the camera while the user waits, so a privacy image,
+    // a frozen or a silent camera is reported (and a placeholder reopened)
+    // before anything is recorded. A countdown shorter than the check delays
+    // the start a little instead of skipping it.
     let ffmpeg_for_preroll = command_path("ffmpeg", "NIRUCLIP_FFMPEG");
-    let mut preroll = match (&capture.camera, options.countdown >= 2) {
-        (Some(found), true) => PreRoll::start(
+    let mut preroll = capture.camera.as_ref().and_then(|found| {
+        PreRoll::start(
             &ffmpeg_for_preroll,
             &found.device,
             capture.camera_mode.as_ref(),
-        ),
-        _ => None,
-    };
+        )
+    });
     if options.countdown > 0 {
         let mut remaining = options.countdown;
         while remaining > 0 {
@@ -2576,8 +2753,28 @@ fn record(options: Options, camera: &mut Option<CameraRestore>) -> Result<(), St
             remaining -= 1;
         }
     }
-    if let Some(preroll) = preroll.take() {
-        let verdict = preroll.finish();
+    let recovery = options.recovery;
+    let mut recorder = Recorder {
+        options: &options,
+        capture,
+        ffmpeg,
+        encoder: selection.encoder,
+        progress: progress_path.clone(),
+        probe: probe.clone(),
+        display: display.clone().unwrap_or_default(),
+        probe_wanted: probe.clone(),
+    };
+    let mut recovery_state = RecoveryState::default();
+    if let Some(mut first) = preroll.take() {
+        first.wait_ready();
+        let verdict = first.finish();
+        let verdict = reopen_at_start(
+            &mut recorder,
+            &mut session,
+            &ffmpeg_for_preroll,
+            verdict,
+            &mut recovery_state,
+        );
         let device = session
             .camera
             .as_ref()
@@ -2599,14 +2796,6 @@ fn record(options: Options, camera: &mut Option<CameraRestore>) -> Result<(), St
     // A pause or resume request that arrived during the countdown is stale.
     PAUSE.store(false, Ordering::SeqCst);
     RESUME.store(false, Ordering::SeqCst);
-    let mut recorder = Recorder {
-        options: &options,
-        capture,
-        ffmpeg,
-        encoder: selection.encoder,
-        progress: progress_path.clone(),
-        probe: probe.clone(),
-    };
     let mut monitor = match (&capture_device(&recorder), &recorder.probe) {
         (Some(device), Some(path)) => Some(CameraMonitor::new(device, path)),
         _ => None,
@@ -2622,6 +2811,10 @@ fn record(options: Options, camera: &mut Option<CameraRestore>) -> Result<(), St
             valid,
             no_frames,
         } => {
+            if !valid {
+                // Nothing usable was written: leave no empty file behind.
+                let _ = fs::remove_file(&partial);
+            }
             session.recoverable = valid;
             finish_session(
                 &mut session,
@@ -2638,6 +2831,11 @@ fn record(options: Options, camera: &mut Option<CameraRestore>) -> Result<(), St
             });
         }
     };
+    if options.mode == Mode::WebcamOnly && session.height > 0 {
+        // Later segments (a reconnect or a reopen in another mode) keep this
+        // size, so every part joins losslessly.
+        recorder.capture.fixed_output = Some((session.width, session.height));
+    }
     if SIGNAL.load(Ordering::SeqCst) == 0 {
         session.state = "recording".into();
         write_state(&session)?;
@@ -2649,8 +2847,14 @@ fn record(options: Options, camera: &mut Option<CameraRestore>) -> Result<(), St
     // How the last segment ended: Some(status) when ffmpeg exited by
     // itself, None when NIRUCLIP stopped it (stop, pause, low disk space).
     let mut unrequested_exit: Option<ExitStatus> = None;
+    let mut next_presence = Instant::now();
+    let mut live_since: Option<Instant> = None;
+    let mut log_watch = LogWatch::default();
+    let mut progress_frame: Option<u64> = None;
+    let mut progress_at = Instant::now();
     'capture: loop {
         let mut pause_requested = false;
+        let mut camera_action: Option<CameraAction> = None;
         loop {
             if SIGNAL.load(Ordering::SeqCst) != 0 {
                 notify(&options, "NIRUCLIP", "Saving…");
@@ -2662,21 +2866,139 @@ fn record(options: Options, camera: &mut Option<CameraRestore>) -> Result<(), St
             }
             RESUME.store(false, Ordering::SeqCst);
             if let Some(performance) = read_progress(&recorder.progress) {
+                if performance.frame != progress_frame {
+                    progress_frame = performance.frame;
+                    progress_at = Instant::now();
+                }
                 if session.performance.as_ref() != Some(&performance) {
                     session.performance = Some(performance);
                     let _ = write_state(&session);
                 }
             }
-            if let Some(monitor) = monitor.as_mut() {
-                if recorder.probe.is_none() {
-                    monitor.probe = None;
+            if recorder.camera_attached() {
+                if let Some(monitor) = monitor.as_mut() {
+                    if recorder.probe.is_none() {
+                        monitor.probe = None;
+                    }
+                    if let Some((state, message)) = monitor.poll() {
+                        if reopenable(state)
+                            && !monitor.from_control
+                            && recovery_state.reopens < recovery.reopen_attempts
+                        {
+                            camera_action = Some(CameraAction::Reopen(state));
+                            break;
+                        }
+                        update_camera_status(&mut session, &options, state, message);
+                    }
                 }
-                if let Some((state, message)) = monitor.poll() {
-                    update_camera_status(&mut session, &options, state, message);
+                // A picture that stays live for a minute earns the reopen
+                // attempts back, for a later placeholder episode.
+                let live = session
+                    .camera
+                    .as_ref()
+                    .map(|status| status.status == "ok")
+                    .unwrap_or(false);
+                match live_since {
+                    _ if !live => live_since = None,
+                    None => live_since = Some(Instant::now()),
+                    Some(since)
+                        if recovery_state.reopens > 0
+                            && since.elapsed() > Duration::from_secs(60) =>
+                    {
+                        recovery_state.reopens = 0;
+                        camera_event(
+                            &mut session,
+                            "picture live for a minute; reopen attempts are available again",
+                        );
+                    }
+                    Some(_) => {}
+                }
+                if recovery.reconnect_enabled() {
+                    if let Some(reason) = camera_loss(
+                        &recorder,
+                        monitor.as_ref(),
+                        &mut log_watch,
+                        progress_at,
+                        recovery.stall,
+                    ) {
+                        camera_action = Some(CameraAction::Lost(reason));
+                        break;
+                    }
+                }
+            } else if let Some(deadline) = recovery_state
+                .lost
+                .as_ref()
+                .map(|(_, _, deadline)| *deadline)
+            {
+                if Instant::now() >= deadline {
+                    if let Some((_, probe)) = recovery_state.candidate.take() {
+                        probe.finish();
+                    }
+                    let device = recovery_state
+                        .lost
+                        .take()
+                        .map(|(found, _, _)| found.device)
+                        .unwrap_or_default();
+                    camera_event(
+                        &mut session,
+                        format!(
+                            "{device} did not come back within {:.0} s; recording continues without the camera",
+                            recovery.reconnect.as_secs_f64()
+                        ),
+                    );
+                    update_camera_status(
+                        &mut session,
+                        &options,
+                        "missing",
+                        Some(format!(
+                            "camera {device} did not come back; the recording continues without it"
+                        )),
+                    );
+                } else if let Some((_, probe)) = recovery_state.candidate.as_mut() {
+                    // Switch only once the returned camera delivers frames.
+                    if probe.frame_count() >= 2 {
+                        if let Some((found, probe)) = recovery_state.candidate.take() {
+                            probe.finish();
+                            camera_action = Some(CameraAction::Returned(found));
+                            break;
+                        }
+                    } else if probe.exited() || probe.started.elapsed() > PREROLL_LIMIT {
+                        if let Some((_, probe)) = recovery_state.candidate.take() {
+                            probe.finish();
+                        }
+                        next_presence = Instant::now() + Duration::from_secs(1);
+                    }
+                } else if Instant::now() >= next_presence {
+                    next_presence = Instant::now() + Duration::from_millis(500);
+                    let back = recovery_state
+                        .lost
+                        .as_ref()
+                        .and_then(|(found, _, _)| recorder.camera_returned(found));
+                    if let Some(found) = back {
+                        let previous = recovery_state
+                            .lost
+                            .as_ref()
+                            .and_then(|(_, mode, _)| mode.clone());
+                        let mode = recorder.mode_for(&found, previous.as_ref());
+                        if let Some(probe) =
+                            PreRoll::start(&recorder.ffmpeg, &found.device, mode.as_ref())
+                        {
+                            recovery_state.candidate = Some((found, probe));
+                        }
+                    }
                 }
             }
             match child.try_wait() {
                 Ok(Some(exit)) => {
+                    if recorder.camera_attached()
+                        && recovery.reconnect_enabled()
+                        && SIGNAL.load(Ordering::SeqCst) == 0
+                    {
+                        if let Some(reason) = camera_exit_loss(&recorder, exit, &mut log_watch) {
+                            camera_action = Some(CameraAction::Lost(reason));
+                            break;
+                        }
+                    }
                     unrequested_exit = Some(exit);
                     break;
                 }
@@ -2723,17 +3045,59 @@ fn record(options: Options, camera: &mut Option<CameraRestore>) -> Result<(), St
             }
             std::thread::sleep(Duration::from_millis(100));
         }
+        if let Some(CameraAction::Lost(reason)) = &camera_action {
+            announce_loss(&mut session, &options, &mut recovery_state, reason);
+        }
         if unrequested_exit.is_none() {
-            session.state = if pause_requested {
-                "pausing".into()
+            if camera_action.is_none() {
+                session.state = if pause_requested {
+                    "pausing".into()
+                } else {
+                    "finalizing".into()
+                };
+                let _ = write_state(&session);
+            }
+            // A camera that stopped delivering can leave ffmpeg blocked in a
+            // read; do not wait the full grace time for it.
+            let grace = if camera_action.is_some() {
+                Duration::from_millis(1500)
             } else {
-                "finalizing".into()
+                Duration::from_secs(8)
             };
-            let _ = write_state(&session);
-            stop_child(&mut child, Duration::from_secs(8));
+            stop_child(&mut child, grace);
         }
         if let Some(performance) = read_progress(&recorder.progress) {
             session.performance = Some(performance);
+        }
+        if let Some(action) = camera_action.take() {
+            close_segment(&mut session, &mut segments);
+            let started = camera_recovery(
+                action,
+                &mut recorder,
+                &mut session,
+                &mut segments,
+                &partial,
+                &mut recovery_state,
+                &mut stop_reason,
+            )?;
+            match started {
+                Some(next_child) => {
+                    child = next_child;
+                    if let Some(monitor) = monitor.as_mut() {
+                        monitor.reset();
+                        if let Some(found) = recorder.capture.camera.as_ref() {
+                            monitor.device = found.device.clone();
+                        }
+                    }
+                    log_watch = LogWatch::default();
+                    progress_frame = None;
+                    progress_at = Instant::now();
+                    live_since = None;
+                    next_presence = Instant::now() + Duration::from_millis(500);
+                    continue 'capture;
+                }
+                None => break 'capture,
+            }
         }
         if !pause_requested || unrequested_exit.is_some() {
             break 'capture;
@@ -2774,6 +3138,9 @@ fn record(options: Options, camera: &mut Option<CameraRestore>) -> Result<(), St
                 if let Some(monitor) = monitor.as_mut() {
                     monitor.reset();
                 }
+                log_watch = LogWatch::default();
+                progress_frame = None;
+                progress_at = Instant::now();
                 notify(&options, "NIRUCLIP", "Recording resumed");
                 eprintln!("NIRUCLIP resumed");
             }
@@ -2862,6 +3229,648 @@ fn record(options: Options, camera: &mut Option<CameraRestore>) -> Result<(), St
                 "Recording could not be finalized; run niruclip --recover",
             );
             Err(format!("could not finalize recording: {error}"))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Camera recovery: a lost camera, a camera that comes back, and reopening a
+// camera that shows its firmware placeholder.
+// ---------------------------------------------------------------------------
+
+enum CameraAction {
+    /// The camera is gone or stopped delivering (the reason is logged).
+    Lost(String),
+    /// Overlay: the lost camera is back.
+    Returned(camera::Camera),
+    /// The picture is the privacy placeholder or frozen.
+    Reopen(&'static str),
+}
+
+/// What the camera recovery remembers during one recording.
+#[derive(Default)]
+struct RecoveryState {
+    /// Overlay only: the camera that was lost, its mode, and until when a
+    /// return is picked up again.
+    lost: Option<(camera::Camera, Option<camera::Mode>, Instant)>,
+    /// Reopen attempts used in the current placeholder episode.
+    reopens: u32,
+    /// When the camera was lost recently: a camera that keeps failing is
+    /// given up on instead of restarting the recording over and over.
+    losses: Vec<Instant>,
+    /// Set when a loss was already announced (logged, counted, notified).
+    announced: Option<bool>,
+    /// Overlay: a returned camera under test. The screen keeps recording
+    /// until a separate probe got frames from it, so a camera that is
+    /// present but silent never costs screen time.
+    candidate: Option<(camera::Camera, PreRoll)>,
+    autosuspend: Autosuspend,
+}
+
+impl Drop for RecoveryState {
+    fn drop(&mut self) {
+        if let Some((_, probe)) = self.candidate.take() {
+            probe.finish();
+        }
+    }
+}
+
+/// Log a camera loss and tell the user at once (before the segment is
+/// closed, which can take a moment with a camera that hangs). Returns
+/// whether the camera is worth waiting for.
+fn announce_loss(
+    session: &mut Session,
+    options: &Options,
+    memory: &mut RecoveryState,
+    reason: &str,
+) -> bool {
+    camera_event(session, reason.to_string());
+    let retry = memory.may_retry();
+    if !retry {
+        camera_event(
+            session,
+            format!(
+                "the camera failed {} times within a minute; not trying again",
+                memory.losses.len()
+            ),
+        );
+    }
+    let wait = options.recovery.reconnect.as_secs_f64();
+    let message = match (options.mode == Mode::WebcamOnly, retry) {
+        (false, true) => format!(
+            "{reason}; recording continues without the camera and picks it up again if it returns within {wait:.0} s"
+        ),
+        (false, false) => {
+            format!("{reason}; it keeps failing, so the recording continues without it")
+        }
+        (true, true) => format!("{reason}; waiting up to {wait:.0} s for it to come back"),
+        (true, false) => format!("{reason}; it keeps failing, so the recording is saved"),
+    };
+    update_camera_status(session, options, "missing", Some(message));
+    memory.announced = Some(retry);
+    retry
+}
+
+/// Losses within this window that make NIRUCLIP give up on the camera.
+const LOSS_WINDOW: Duration = Duration::from_secs(60);
+const LOSSES_ALLOWED: usize = 3;
+
+impl RecoveryState {
+    /// Count a loss; false when the camera failed too often to try again.
+    fn may_retry(&mut self) -> bool {
+        let now = Instant::now();
+        self.losses
+            .retain(|at| now.duration_since(*at) < LOSS_WINDOW);
+        self.losses.push(now);
+        self.losses.len() <= LOSSES_ALLOWED
+    }
+}
+
+/// Picture states a close and reopen may cure.
+fn reopenable(state: &str) -> bool {
+    matches!(state, "privacy" | "frozen")
+}
+
+fn describe_picture(state: &str) -> &'static str {
+    match state {
+        "privacy" => "privacy placeholder",
+        "frozen" => "frozen",
+        _ => "unusable",
+    }
+}
+
+/// Set the camera status without a notification (an automatic step the
+/// user does not need to act on).
+fn quiet_camera_status(session: &mut Session, state: &str, message: Option<String>) {
+    if let Some(status) = session.camera.as_mut() {
+        status.status = state.into();
+        status.message = message;
+    }
+    let _ = write_state(session);
+}
+
+/// Point the session's camera status at a (re)attached camera and mode.
+fn attached_camera_status(
+    session: &mut Session,
+    found: &camera::Camera,
+    mode: Option<&camera::Mode>,
+) {
+    if let Some(status) = session.camera.as_mut() {
+        status.device = found.device.clone();
+        status.name = (!found.name.is_empty()).then(|| found.name.clone());
+        status.mode = mode.map(camera::Mode::label);
+    }
+}
+
+/// New ffmpeg log lines (the log is recreated for every segment), checked
+/// for the camera input failing.
+#[derive(Default)]
+struct LogWatch {
+    offset: u64,
+}
+
+impl LogWatch {
+    fn camera_error(&mut self, camera_index: usize) -> Option<String> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = File::open(state_dir().join("ffmpeg.log")).ok()?;
+        let len = file.metadata().ok()?.len();
+        if len < self.offset {
+            self.offset = 0;
+        }
+        if len == self.offset {
+            return None;
+        }
+        file.seek(SeekFrom::Start(self.offset)).ok()?;
+        let mut bytes = Vec::new();
+        file.take(len - self.offset).read_to_end(&mut bytes).ok()?;
+        // Only complete lines; a partial line is read again next time.
+        let complete = bytes
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map(|at| at + 1)?;
+        self.offset += complete as u64;
+        camera_error_line(&String::from_utf8_lossy(&bytes[..complete]), camera_index)
+    }
+}
+
+/// An ffmpeg log line saying the camera input failed: an input error on the
+/// camera's input index or a V4L2 buffer error ("No such device" after an
+/// unplug).
+fn camera_error_line(text: &str, camera_index: usize) -> Option<String> {
+    let prefix = format!("[in#{camera_index}/");
+    text.lines()
+        .find(|line| {
+            (line.contains(&prefix)
+                && (line.contains("Error")
+                    || line.contains("error")
+                    || line.contains("No such device")))
+                || line.contains("VIDIOC_DQBUF")
+                || ((line.contains("video4linux2") || line.contains("v4l2"))
+                    && line.contains("No such device"))
+        })
+        .map(|line| line.trim().chars().take(200).collect())
+}
+
+/// Why the attached camera counts as lost right now, if it does: its node
+/// disappeared, ffmpeg logged a camera input error, or no new camera frame
+/// (probe) or no new output frame arrived for the stall time.
+fn camera_loss(
+    recorder: &Recorder,
+    monitor: Option<&CameraMonitor>,
+    log: &mut LogWatch,
+    progress_at: Instant,
+    stall: Duration,
+) -> Option<String> {
+    let device = recorder.capture.camera.as_ref()?.device.clone();
+    if !camera::present(&device) {
+        return Some(format!("camera {device} was disconnected"));
+    }
+    if let Some(line) = recorder
+        .capture
+        .camera_index
+        .and_then(|index| log.camera_error(index))
+    {
+        return Some(format!("camera {device} failed ({line})"));
+    }
+    let seconds = stall.as_secs_f64();
+    if monitor
+        .map(|monitor| monitor.stalled(stall))
+        .unwrap_or(false)
+    {
+        return Some(format!(
+            "camera {device} delivered no frames for {seconds:.1} s"
+        ));
+    }
+    if progress_at.elapsed() > stall {
+        return Some(format!(
+            "the recording stalled for {seconds:.1} s waiting for camera {device}"
+        ));
+    }
+    None
+}
+
+/// ffmpeg ended by itself while a camera was attached: a camera loss when the
+/// node is gone, the log says so, or a camera-only recording reached the end
+/// of its only input. Anything else is the ordinary "interrupted" case.
+fn camera_exit_loss(recorder: &Recorder, exit: ExitStatus, log: &mut LogWatch) -> Option<String> {
+    let device = recorder.capture.camera.as_ref()?.device.clone();
+    if !camera::present(&device) {
+        return Some(format!("camera {device} was disconnected"));
+    }
+    if let Some(line) = recorder
+        .capture
+        .camera_index
+        .and_then(|index| log.camera_error(index))
+    {
+        return Some(format!("camera {device} failed ({line})"));
+    }
+    if recorder.options.mode == Mode::WebcamOnly && exit.success() {
+        return Some(format!("camera {device} ended its stream"));
+    }
+    None
+}
+
+/// The segment that just ended: count its length, or remove it when it holds
+/// no usable video (a camera that failed at once), so that the join and
+/// --recover only see good parts.
+fn close_segment(session: &mut Session, segments: &mut Vec<Segment>) {
+    if let Some(last) = segments.last() {
+        let path = PathBuf::from(&last.path);
+        if usable_or_repaired(&path) {
+            if let Some(duration) = media_duration(&path) {
+                session.elapsed_before = Some(session.elapsed_before.unwrap_or(0.0) + duration);
+            }
+        } else {
+            let _ = fs::remove_file(&path);
+            if segments.len() > 1 {
+                segments.pop();
+            }
+        }
+    }
+    session.segments = (segments.len() > 1).then(|| segments.clone());
+    session.child_pid = 0;
+    session.child_start = 0;
+    session.performance = None;
+    let _ = write_state(session);
+}
+
+/// Start the next segment with the recorder's current inputs. None when it
+/// could not start (an empty attempt is removed again).
+fn next_segment(
+    recorder: &mut Recorder,
+    session: &mut Session,
+    segments: &mut Vec<Segment>,
+    partial: &Path,
+) -> Result<Option<std::process::Child>, String> {
+    let next = segment_path(partial, segments.len() + 1);
+    segments.push(Segment {
+        path: next.display().to_string(),
+        encoder: recorder.encoder.as_str().into(),
+    });
+    session.segments = Some(segments.clone());
+    write_state(session)?;
+    match recorder.start_segment(session, &next)? {
+        SegmentStart::Running(child) => {
+            if let Some(segment) = segments.last_mut() {
+                segment.encoder = recorder.encoder.as_str().into();
+            }
+            session.segments = Some(segments.clone());
+            session.state = "recording".into();
+            write_state(session)?;
+            Ok(Some(child))
+        }
+        SegmentStart::Failed { valid, .. } => {
+            if !valid {
+                let _ = fs::remove_file(&next);
+                segments.pop();
+            }
+            session.segments = (segments.len() > 1).then(|| segments.clone());
+            session.state = "recording".into();
+            let _ = write_state(session);
+            Ok(None)
+        }
+    }
+}
+
+/// Sleep up to `duration`, waking early for a stop signal.
+fn nap(duration: Duration) {
+    let until = Instant::now() + duration;
+    while Instant::now() < until && SIGNAL.load(Ordering::SeqCst) == 0 {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Act on a camera event after the current segment was closed. Returns the
+/// ffmpeg of the next segment, or None when the recording should be saved
+/// now (stop_reason says why).
+fn camera_recovery(
+    action: CameraAction,
+    recorder: &mut Recorder,
+    session: &mut Session,
+    segments: &mut Vec<Segment>,
+    partial: &Path,
+    memory: &mut RecoveryState,
+    stop_reason: &mut Option<String>,
+) -> Result<Option<std::process::Child>, String> {
+    let options = recorder.options;
+    let recovery = options.recovery;
+    let wait = recovery.reconnect.as_secs_f64();
+    let mut action = action;
+    loop {
+        match action {
+            CameraAction::Reopen(picture) => {
+                memory.reopens += 1;
+                let Some(found) = recorder.capture.camera.clone() else {
+                    action = CameraAction::Lost("the camera is no longer attached".into());
+                    continue;
+                };
+                let current = recorder.capture.camera_mode.clone();
+                let mode =
+                    camera::reopen_mode(&found.modes, current.as_ref(), memory.reopens).or(current);
+                let label = mode
+                    .as_ref()
+                    .map(camera::Mode::label)
+                    .unwrap_or_else(|| "its default mode".into());
+                camera_event(
+                    session,
+                    format!(
+                        "{} picture; reopening {} in {label} (attempt {} of {})",
+                        describe_picture(picture),
+                        found.device,
+                        memory.reopens,
+                        recovery.reopen_attempts
+                    ),
+                );
+                memory.autosuspend.prepare(options, &found.device, session);
+                attached_camera_status(session, &found, mode.as_ref());
+                quiet_camera_status(
+                    session,
+                    "checking",
+                    Some(format!(
+                        "reopening the camera after a {} picture (attempt {} of {})",
+                        describe_picture(picture),
+                        memory.reopens,
+                        recovery.reopen_attempts
+                    )),
+                );
+                recorder.set_camera(Some(found.clone()), mode)?;
+                match next_segment(recorder, session, segments, partial)? {
+                    Some(child) => return Ok(Some(child)),
+                    None => {
+                        action = CameraAction::Lost(format!(
+                            "camera {} could not be reopened",
+                            found.device
+                        ));
+                    }
+                }
+            }
+            CameraAction::Returned(found) => {
+                let previous = memory.lost.as_ref().and_then(|(_, mode, _)| mode.clone());
+                let mode = recorder.mode_for(&found, previous.as_ref());
+                recorder.set_camera(Some(found.clone()), mode.clone())?;
+                attached_camera_status(session, &found, mode.as_ref());
+                quiet_camera_status(session, "checking", None);
+                if let Some(child) = next_segment(recorder, session, segments, partial)? {
+                    memory.lost = None;
+                    camera_event(
+                        session,
+                        format!(
+                            "{} is back; recording with the camera again ({})",
+                            found.device,
+                            mode.as_ref()
+                                .map(camera::Mode::label)
+                                .unwrap_or_else(|| "default mode".into())
+                        ),
+                    );
+                    notify(
+                        options,
+                        "NIRUCLIP camera",
+                        "Camera is back; the recording continues with it",
+                    );
+                    return Ok(Some(child));
+                }
+                // Back but not usable yet: continue the screen and keep
+                // looking until the deadline.
+                camera_event(
+                    session,
+                    format!("{} is back but could not be opened yet", found.device),
+                );
+                quiet_camera_status(
+                    session,
+                    "missing",
+                    Some(format!("camera {} could not be opened", found.device)),
+                );
+                recorder.set_camera(None, None)?;
+                nap(Duration::from_millis(500));
+                match next_segment(recorder, session, segments, partial)? {
+                    Some(child) => return Ok(Some(child)),
+                    None => {
+                        *stop_reason = Some(
+                            "the screen recording could not continue without the camera".into(),
+                        );
+                        return Ok(None);
+                    }
+                }
+            }
+            CameraAction::Lost(reason) => {
+                let found = recorder.capture.camera.clone();
+                let mode = recorder.capture.camera_mode.clone();
+                let retry = match memory.announced.take() {
+                    Some(retry) => retry,
+                    None => announce_loss(session, options, memory, &reason),
+                };
+                if options.mode != Mode::WebcamOnly {
+                    // Overlay: the screen recording goes on without the
+                    // camera right away; a camera that returns within the
+                    // reconnect time is picked up again.
+                    recorder.set_camera(None, None)?;
+                    memory.lost = None;
+                    if retry {
+                        if let Some(found) = found {
+                            memory.lost = Some((found, mode, Instant::now() + recovery.reconnect));
+                        }
+                    }
+                    return match next_segment(recorder, session, segments, partial)? {
+                        Some(child) => Ok(Some(child)),
+                        None => {
+                            *stop_reason =
+                                Some(format!("{reason}; the screen recording could not continue"));
+                            Ok(None)
+                        }
+                    };
+                }
+                // Camera-only: nothing to record without it. Wait for it,
+                // then continue in a new segment; else save what there is.
+                if !retry {
+                    *stop_reason = Some(format!("{reason}; the camera kept failing"));
+                    return Ok(None);
+                }
+                // The state stays "recording" (NIRUBAR and NIRU Launcher know
+                // it); camera.status "missing" says what is going on.
+                let _ = write_state(session);
+                let Some(found) = found else {
+                    *stop_reason = Some(reason);
+                    return Ok(None);
+                };
+                let deadline = Instant::now() + recovery.reconnect;
+                while Instant::now() < deadline && SIGNAL.load(Ordering::SeqCst) == 0 {
+                    if let Some(back) = recorder.camera_returned(&found) {
+                        let back_mode = recorder.mode_for(&back, mode.as_ref());
+                        recorder.set_camera(Some(back.clone()), back_mode.clone())?;
+                        attached_camera_status(session, &back, back_mode.as_ref());
+                        quiet_camera_status(session, "checking", None);
+                        if let Some(child) = next_segment(recorder, session, segments, partial)? {
+                            camera_event(
+                                session,
+                                format!("{} is back; recording continues", back.device),
+                            );
+                            notify(
+                                options,
+                                "NIRUCLIP camera",
+                                "Camera is back; the recording continues",
+                            );
+                            return Ok(Some(child));
+                        }
+                        camera_event(
+                            session,
+                            format!("{} is back but could not be opened yet", back.device),
+                        );
+                        nap(Duration::from_secs(1));
+                        continue;
+                    }
+                    nap(Duration::from_millis(250));
+                }
+                if SIGNAL.load(Ordering::SeqCst) != 0 {
+                    notify(options, "NIRUCLIP", "Saving…");
+                    *stop_reason = Some(format!("{reason}; stopped while waiting for it"));
+                    return Ok(None);
+                }
+                camera_event(
+                    session,
+                    format!(
+                        "{} did not come back within {wait:.0} s; saving the recording",
+                        found.device
+                    ),
+                );
+                notify(
+                    options,
+                    "NIRUCLIP camera",
+                    "The camera did not come back; saving the recording…",
+                );
+                *stop_reason = Some(format!("{reason}; it did not come back within {wait:.0} s"));
+                return Ok(None);
+            }
+        }
+    }
+}
+
+/// The pre-check found the placeholder or a frozen picture: close and reopen
+/// the camera (another mode each time) up to the configured attempts, and
+/// record in the mode that gave a live picture.
+fn reopen_at_start(
+    recorder: &mut Recorder,
+    session: &mut Session,
+    ffmpeg: &str,
+    mut verdict: PreRollVerdict,
+    memory: &mut RecoveryState,
+) -> PreRollVerdict {
+    let options = recorder.options;
+    let attempts = options.recovery.reopen_attempts;
+    let mut attempt = 0;
+    loop {
+        // The recording shares the attempts: a placeholder that survived
+        // the pre-check reopens is not reopened again right away.
+        memory.reopens = attempt;
+        let Some(found) = recorder.capture.camera.clone() else {
+            return verdict;
+        };
+        let state = verdict.status(&found.device).map(|(state, _)| state);
+        let bad = state.map(reopenable).unwrap_or(false);
+        if attempt > 0 && state == Some("ok") {
+            camera_event(
+                session,
+                format!(
+                    "pre-check: live picture after reopen {attempt} ({})",
+                    recorder
+                        .capture
+                        .camera_mode
+                        .as_ref()
+                        .map(camera::Mode::label)
+                        .unwrap_or_else(|| "default mode".into())
+                ),
+            );
+        }
+        if !bad || attempt >= attempts || SIGNAL.load(Ordering::SeqCst) != 0 {
+            return verdict;
+        }
+        // A UVC privacy control that is on cannot be cured by a reopen.
+        if camera::privacy(&found.device) == Some(true) {
+            return verdict;
+        }
+        attempt += 1;
+        let mode =
+            camera::reopen_mode(&found.modes, recorder.capture.camera_mode.as_ref(), attempt)
+                .or_else(|| recorder.capture.camera_mode.clone());
+        camera_event(
+            session,
+            format!(
+                "pre-check: {} picture; reopening {} in {} (attempt {attempt} of {attempts})",
+                describe_picture(state.unwrap_or_default()),
+                found.device,
+                mode.as_ref()
+                    .map(camera::Mode::label)
+                    .unwrap_or_else(|| "its default mode".into())
+            ),
+        );
+        memory.autosuspend.prepare(options, &found.device, session);
+        if recorder
+            .set_camera(Some(found.clone()), mode.clone())
+            .is_err()
+        {
+            return verdict;
+        }
+        attached_camera_status(session, &found, mode.as_ref());
+        let _ = write_state(session);
+        let Some(mut probe) = PreRoll::start(ffmpeg, &found.device, mode.as_ref()) else {
+            return verdict;
+        };
+        probe.wait_ready();
+        verdict = probe.finish();
+    }
+}
+
+/// USB autosuspend for the camera, switched off ("on") for the rest of the
+/// recording when a reopen is needed and this user may write the sysfs file
+/// (never with root or sudo), and put back when the recorder ends.
+#[derive(Default)]
+struct Autosuspend {
+    tried: bool,
+    restore: Option<(PathBuf, String)>,
+}
+
+impl Autosuspend {
+    fn prepare(&mut self, options: &Options, device: &str, session: &mut Session) {
+        if !options.recovery.autosuspend || self.tried || camera::test_input_format().is_some() {
+            return;
+        }
+        self.tried = true;
+        let Some(path) = camera::usb_power_control(device) else {
+            camera_event(
+                session,
+                "USB autosuspend: no USB power control for this camera",
+            );
+            return;
+        };
+        let previous = fs::read_to_string(&path)
+            .map(|text| text.trim().to_string())
+            .unwrap_or_default();
+        if previous == "on" {
+            camera_event(session, "USB autosuspend is already off for this camera");
+            return;
+        }
+        if !camera::writable(&path) {
+            camera_event(
+                session,
+                "USB autosuspend left as is (changing it needs root; NIRUCLIP never asks for it)",
+            );
+            return;
+        }
+        if fs::write(&path, "on").is_ok() {
+            camera_event(
+                session,
+                "USB autosuspend off for the rest of this recording",
+            );
+            self.restore = Some((path, previous));
+        }
+    }
+}
+
+impl Drop for Autosuspend {
+    fn drop(&mut self) {
+        if let Some((path, previous)) = self.restore.take() {
+            if !previous.is_empty() {
+                let _ = fs::write(path, previous);
+            }
         }
     }
 }
@@ -3103,6 +4112,95 @@ struct Recorder<'a> {
     progress: PathBuf,
     /// Live picture-check output; dropped if ffmpeg cannot write it.
     probe: Option<PathBuf>,
+    /// The X display for screen modes (empty for camera-only).
+    display: String,
+    /// The probe path to use again when a camera is re-attached.
+    probe_wanted: Option<PathBuf>,
+}
+
+impl Recorder<'_> {
+    fn camera_attached(&self) -> bool {
+        self.capture.camera_index.is_some() && self.capture.camera.is_some()
+    }
+
+    /// Rebuild the inputs with this camera (and mode), or without a camera.
+    fn set_camera(
+        &mut self,
+        found: Option<camera::Camera>,
+        mode: Option<camera::Mode>,
+    ) -> Result<(), String> {
+        let fixed_output = self.capture.fixed_output;
+        let status = self.capture.camera_status.clone();
+        let attach = found.is_some();
+        self.capture = assemble_inputs(
+            self.options,
+            &self.display,
+            self.capture.geometry,
+            found,
+            mode,
+            status,
+        )?;
+        self.capture.fixed_output = fixed_output;
+        self.probe = if attach {
+            self.probe_wanted.clone()
+        } else {
+            None
+        };
+        Ok(())
+    }
+
+    /// The lost camera, if it is back and can be opened: the same explicit
+    /// device, or (auto) a camera with the same name and USB port, then the
+    /// same name, then the same node.
+    fn camera_returned(&self, lost: &camera::Camera) -> Option<camera::Camera> {
+        let test = camera::test_input_format().is_some();
+        let usable = |found: &camera::Camera| {
+            camera::present(&found.device) && (test || !camera::busy(&found.device))
+        };
+        if explicit_camera(self.options).is_some() || test {
+            if !camera::present(&lost.device) {
+                return None;
+            }
+            if !test && camera::query_cached(&lost.device).is_none() {
+                // The node is back but does not answer yet (udev, resume).
+                return None;
+            }
+            let mut found = camera::resolve(Some(&lost.device)).ok()?;
+            if found.modes.is_empty() {
+                found.modes = lost.modes.clone();
+            }
+            return usable(&found).then_some(found);
+        }
+        let cameras = camera::discover();
+        let pick = cameras
+            .iter()
+            .find(|found| found.name == lost.name && found.bus == lost.bus)
+            .or_else(|| cameras.iter().find(|found| found.name == lost.name))
+            .or_else(|| {
+                cameras
+                    .iter()
+                    .find(|found| found.device == lost.device && !found.infrared())
+            })?;
+        usable(pick).then(|| pick.clone())
+    }
+
+    /// The mode to reopen a returned camera in: the one it had when it is
+    /// still offered, else a fresh choice.
+    fn mode_for(
+        &self,
+        found: &camera::Camera,
+        previous: Option<&camera::Mode>,
+    ) -> Option<camera::Mode> {
+        if let Some(previous) = previous.filter(|mode| found.modes.contains(mode)) {
+            return Some(previous.clone());
+        }
+        if found.modes.is_empty() {
+            return previous.cloned();
+        }
+        let camera_only = self.options.mode == Mode::WebcamOnly;
+        let want = camera::wanted_size(camera_only, self.options.preset.camera_max_width());
+        camera::choose_mode(&found.modes, want)
+    }
 }
 
 fn capture_device(recorder: &Recorder) -> Option<String> {
@@ -3180,10 +4278,37 @@ fn on_tmpfs(dir: &Path) -> bool {
 
 /// The countdown camera check: a separate short ffmpeg that reads tiny
 /// greyscale frames from the camera into memory. Nothing is stored.
+/// Pre-check frames with their arrival time, shared with the reader thread.
+type SharedFrames = std::sync::Arc<std::sync::Mutex<Vec<(Instant, Vec<u8>)>>>;
+
 struct PreRoll {
     child: std::process::Child,
-    reader: std::thread::JoinHandle<Vec<(Instant, Vec<u8>)>>,
+    frames: SharedFrames,
+    reader: std::thread::JoinHandle<()>,
     errors: std::thread::JoinHandle<String>,
+    started: Instant,
+}
+
+/// Frames after the first one that are judged: the HP firmware shows about a
+/// second of real picture before its placeholder.
+const PREROLL_SETTLE: Duration = Duration::from_millis(900);
+/// Settled frames (5 fps) needed for a verdict.
+const PREROLL_FRAMES: usize = 4;
+/// The longest a pre-check may take from its start; a short countdown waits
+/// for it up to here instead of skipping it.
+const PREROLL_LIMIT: Duration = Duration::from_millis(4000);
+
+fn settled_frames(frames: &[(Instant, Vec<u8>)]) -> Vec<&[u8]> {
+    let first = frames.first().map(|(at, _)| *at);
+    frames
+        .iter()
+        .filter(|(at, _)| {
+            first
+                .map(|first| at.duration_since(first) >= PREROLL_SETTLE)
+                .unwrap_or(false)
+        })
+        .map(|(_, frame)| frame.as_slice())
+        .collect()
 }
 
 struct PreRollVerdict {
@@ -3257,16 +4382,20 @@ impl PreRoll {
             .ok()?;
         let mut stdout = child.stdout.take()?;
         let mut stderr = child.stderr.take()?;
+        let frames = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let shared = frames.clone();
         let reader = std::thread::spawn(move || {
-            let mut frames = Vec::new();
             let mut frame = vec![0u8; camera::PROBE_BYTES];
             while stdout.read_exact(&mut frame).is_ok() {
+                let Ok(mut frames) = shared.lock() else {
+                    break;
+                };
                 frames.push((Instant::now(), frame.clone()));
                 if frames.len() > 64 {
-                    frames.remove(0);
+                    // Keep the first frame: it anchors the settle time.
+                    frames.remove(1);
                 }
             }
-            frames
         });
         let errors = std::thread::spawn(move || {
             let mut text = String::new();
@@ -3275,9 +4404,42 @@ impl PreRoll {
         });
         Some(Self {
             child,
+            frames,
             reader,
             errors,
+            started: Instant::now(),
         })
+    }
+
+    fn frame_count(&self) -> usize {
+        self.frames.lock().map(|frames| frames.len()).unwrap_or(0)
+    }
+
+    fn exited(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(Some(_)))
+    }
+
+    /// Enough settled frames for a verdict, or the probe ended.
+    fn ready(&mut self) -> bool {
+        if matches!(self.child.try_wait(), Ok(Some(_))) {
+            return true;
+        }
+        self.frames
+            .lock()
+            .map(|frames| settled_frames(&frames).len() >= PREROLL_FRAMES)
+            .unwrap_or(true)
+    }
+
+    /// Wait (in 50 ms steps, a stop signal ends it) until ready() or the
+    /// pre-check limit. Returns false when interrupted by a signal.
+    fn wait_ready(&mut self) -> bool {
+        while !self.ready() && self.started.elapsed() < PREROLL_LIMIT {
+            if SIGNAL.load(Ordering::SeqCst) != 0 {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        true
     }
 
     /// Stop the probe (the camera is released before the recording opens
@@ -3287,19 +4449,15 @@ impl PreRoll {
     fn finish(mut self) -> PreRollVerdict {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let frames = self.reader.join().unwrap_or_default();
+        let _ = self.reader.join();
         let errors = self.errors.join().unwrap_or_default();
+        let frames = self
+            .frames
+            .lock()
+            .map(|frames| frames.clone())
+            .unwrap_or_default();
         let count = frames.len();
-        let first = frames.first().map(|(at, _)| *at);
-        let settled: Vec<&[u8]> = frames
-            .iter()
-            .filter(|(at, _)| {
-                first
-                    .map(|first| at.duration_since(first) >= Duration::from_millis(900))
-                    .unwrap_or(false)
-            })
-            .map(|(_, frame)| frame.as_slice())
-            .collect();
+        let settled = settled_frames(&frames);
         PreRollVerdict {
             picture: camera::assess(&settled),
             frames: count,
@@ -3318,6 +4476,9 @@ struct CameraMonitor {
     last_frame: Instant,
     next_check: Instant,
     reported: Option<&'static str>,
+    /// The last reported problem came from the UVC privacy control (a
+    /// reopen cannot help) rather than from the picture.
+    from_control: bool,
 }
 
 impl CameraMonitor {
@@ -3330,14 +4491,25 @@ impl CameraMonitor {
             last_frame: Instant::now(),
             next_check: Instant::now(),
             reported: None,
+            from_control: false,
         }
     }
 
-    /// A new segment (resume) opens the camera again.
+    /// A new segment (resume, reconnect, reopen) opens the camera again:
+    /// judge it from scratch.
     fn reset(&mut self) {
         self.frames.clear();
         self.last_mtime = None;
         self.last_frame = Instant::now();
+        self.next_check = Instant::now();
+        self.reported = None;
+        self.from_control = false;
+    }
+
+    /// No new probe frame for `limit`: the camera stopped delivering (the
+    /// recording graph keeps going with the last frame, or blocks).
+    fn stalled(&self, limit: Duration) -> bool {
+        self.probe.is_some() && self.last_frame.elapsed() > limit
     }
 
     /// The new (status, message) when it changed.
@@ -3373,17 +4545,20 @@ impl CameraMonitor {
                 verdict = picture_status(camera::assess(&frames));
             }
         }
+        let mut from_control = false;
         if camera::privacy(&self.device) == Some(true) {
+            from_control = true;
             verdict = Some((
                 "privacy",
                 Some("the camera privacy switch is on (camera key or shutter)".into()),
             ));
         }
         let (state, message) = verdict?;
-        if self.reported == Some(state) {
+        if self.reported == Some(state) && self.from_control == from_control {
             return None;
         }
         self.reported = Some(state);
+        self.from_control = from_control;
         Some((state, message))
     }
 }
@@ -3443,6 +4618,10 @@ impl Recorder<'_> {
             session.child_pid = child.id();
             session.child_start = proc_start(child.id()).unwrap_or(0);
             session.encoder = Some(self.encoder.as_str().into());
+            if plan.height > 0 {
+                session.width = plan.width;
+                session.height = plan.height;
+            }
             write_state(session)?;
             match wait_first_frame(&mut child, &self.progress) {
                 Startup::Frames(performance) => {
@@ -3485,6 +4664,7 @@ impl Recorder<'_> {
                             );
                             let _ = fs::remove_file(path);
                             self.probe = None;
+                            self.probe_wanted = None;
                             continue;
                         }
                     }
@@ -4312,6 +5492,8 @@ fn main() {
         }
         let config = Config::load()?;
         let options = parse_args(&argv, &config)?;
+        // Camera capabilities are enumerated once per node and boot.
+        camera::set_cache_path(state_dir().join("camera-cache.json"));
         if options.version {
             println!("NIRUCLIP {VERSION}");
             return Ok(());
@@ -4400,6 +5582,174 @@ mod tests {
             })
         );
         assert!(parse_geometry("1200+0+0").is_none());
+    }
+
+    #[test]
+    fn camera_recovery_defaults_and_config_keys() {
+        // A 0.4.0 config without the new keys loads and means the defaults.
+        let old: Config = toml::from_str(
+            "schema = 1\ncamera = \"/dev/video0\"\n[profiles.mine]\nmode = \"full\"\n",
+        )
+        .unwrap();
+        let recovery = Recovery::from_config(&old).unwrap();
+        assert_eq!(recovery, Recovery::default());
+        assert_eq!(recovery.reconnect, Duration::from_secs(10));
+        assert_eq!(recovery.stall, Duration::from_secs(2));
+        assert_eq!(recovery.reopen_attempts, 2);
+        assert!(recovery.autosuspend);
+        assert!(recovery.reconnect_enabled());
+        let set: Config = toml::from_str(
+            "camera_reconnect_seconds = 0\ncamera_stall_seconds = 3.5\n\
+             camera_reopen_attempts = 0\ncamera_reopen_autosuspend = false\n",
+        )
+        .unwrap();
+        let recovery = Recovery::from_config(&set).unwrap();
+        assert!(!recovery.reconnect_enabled());
+        assert_eq!(recovery.stall, Duration::from_millis(3500));
+        assert_eq!(recovery.reopen_attempts, 0);
+        assert!(!recovery.autosuspend);
+        for bad in [
+            "camera_reconnect_seconds = -1",
+            "camera_reconnect_seconds = 301",
+            "camera_stall_seconds = 0.1",
+            "camera_reopen_attempts = 11",
+        ] {
+            let config: Config = toml::from_str(bad).unwrap();
+            assert!(Recovery::from_config(&config).is_err(), "{bad}");
+        }
+        // Saving a profile does not write recovery keys that were not set.
+        let text = toml::to_string_pretty(&old).unwrap();
+        assert!(!text.contains("camera_reconnect"));
+    }
+
+    #[test]
+    fn camera_failures_are_found_in_the_ffmpeg_log() {
+        let unplugged = "[video4linux2,v4l2 @ 0x55] ioctl(VIDIOC_DQBUF): No such device\n";
+        assert!(camera_error_line(unplugged, 0).is_some());
+        let demux = "[in#0/video4linux2,v4l2 @ 0x55] Error during demuxing: No such device\n";
+        assert!(camera_error_line(demux, 0).is_some());
+        // The same message for the screen input (index 1) is not the camera.
+        let screen = "[in#1/x11grab @ 0x55] Error during demuxing: Input/output error\n";
+        assert!(camera_error_line(screen, 0).is_none());
+        let harmless = "[mjpeg @ 0x55] unable to decode APP fields\nPast duration 0.6 too large\n";
+        assert!(camera_error_line(harmless, 0).is_none());
+    }
+
+    #[test]
+    fn a_camera_that_keeps_failing_is_given_up_on() {
+        let mut state = RecoveryState::default();
+        for _ in 0..LOSSES_ALLOWED {
+            assert!(state.may_retry());
+        }
+        assert!(!state.may_retry());
+    }
+
+    #[test]
+    fn picture_problems_that_a_reopen_may_cure() {
+        assert!(reopenable("privacy"));
+        assert!(reopenable("frozen"));
+        for state in ["ok", "checking", "no-frames", "busy", "missing"] {
+            assert!(!reopenable(state), "{state}");
+        }
+    }
+
+    #[test]
+    fn precheck_judges_only_frames_after_the_settle_time() {
+        let start = Instant::now();
+        let frames: Vec<(Instant, Vec<u8>)> = (0..10)
+            .map(|i| (start + Duration::from_millis(200 * i), vec![i as u8]))
+            .collect();
+        let settled = settled_frames(&frames);
+        // 0, 200, ..., 800 ms are settling; 1000 ms and later count.
+        assert_eq!(settled.len(), 5);
+        assert_eq!(settled[0], &[5u8][..]);
+        assert!(settled_frames(&[]).is_empty());
+    }
+
+    #[test]
+    fn later_camera_only_segments_keep_the_first_size() {
+        let options = Options {
+            mode: Mode::WebcamOnly,
+            webcam: Webcam::Only,
+            audio: Audio::None,
+            ..Options::default()
+        };
+        let found = camera::Camera {
+            device: "/dev/video0".into(),
+            ..camera::Camera::default()
+        };
+        let mode = camera::parse_modes("MJPG 640x360@30").pop();
+        let mut capture = assemble_inputs(&options, "", None, Some(found), mode, None).unwrap();
+        let free = build_plan(
+            &options,
+            &capture,
+            Path::new("/tmp/x.part.mkv"),
+            Path::new("/tmp/p"),
+            &Encoder::Software,
+            None,
+        )
+        .unwrap();
+        assert_eq!((free.width, free.height), (640, 360));
+        capture.fixed_output = Some((1920, 1080));
+        let fixed = build_plan(
+            &options,
+            &capture,
+            Path::new("/tmp/x.part.mkv"),
+            Path::new("/tmp/p"),
+            &Encoder::Software,
+            None,
+        )
+        .unwrap();
+        assert_eq!((fixed.width, fixed.height), (1920, 1080));
+        let graph = fixed.argv.join(" ");
+        assert!(graph.contains(
+            "scale=1920:1080:force_original_aspect_ratio=decrease:flags=bicubic,pad=1920:1080:(ow-iw)/2:(oh-ih)/2"
+        ));
+    }
+
+    #[test]
+    fn screen_only_segments_drop_the_camera_input() {
+        let options = Options {
+            webcam: Webcam::Corner,
+            audio: Audio::Mic,
+            ..Options::default()
+        };
+        let geometry = Some(Geometry {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        });
+        let found = camera::Camera {
+            device: "/dev/video0".into(),
+            ..camera::Camera::default()
+        };
+        let with = assemble_inputs(&options, ":0", geometry, Some(found), None, None).unwrap();
+        assert_eq!(
+            (with.camera_index, with.screen_index, with.audio_index),
+            (Some(0), Some(1), 2)
+        );
+        let without = assemble_inputs(&options, ":0", geometry, None, None, None).unwrap();
+        assert_eq!(
+            (
+                without.camera_index,
+                without.screen_index,
+                without.audio_index
+            ),
+            (None, Some(0), 1)
+        );
+        assert!(!without.argv.iter().any(|arg| arg == "v4l2"));
+        let plan = build_plan(
+            &options,
+            &without,
+            Path::new("/tmp/x.part.mkv"),
+            Path::new("/tmp/p"),
+            &Encoder::Software,
+            None,
+        )
+        .unwrap();
+        assert_eq!((plan.width, plan.height), (1920, 1080));
+        assert!(plan.argv.iter().any(|arg| arg == "1:a:0"));
     }
 
     #[test]

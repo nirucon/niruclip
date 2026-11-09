@@ -38,6 +38,19 @@ if printf '%s\n' "$@" | grep -qx concat; then
 fi
 # A resume that cannot start a new segment.
 if [ -n "${FAKE_FAIL_FLAG:-}" ] && [ -e "$FAKE_FAIL_FLAG" ]; then exit 1; fi
+# The camera pre-check: 128x96 grey frames on stdout at 5 fps, a live
+# (changing) picture unless FAKE_PRECHECK_FRAME names a PGM to repeat.
+if printf '%s\n' "$@" | grep -qx rawvideo; then
+  [ -z "${FAKE_PRECHECK_LOG:-}" ] || printf '%s\n' "$*" >> "$FAKE_PRECHECK_LOG"
+  [ "${FAKE_PRECHECK:-live}" != none ] || exit 1
+  i=0
+  while [ "$i" -lt 150 ]; do
+    if [ -n "${FAKE_PRECHECK_FRAME:-}" ]; then tail -c 12288 "$FAKE_PRECHECK_FRAME"; else head -c 12288 /dev/urandom; fi || exit 0
+    sleep 0.2
+    i=$((i + 1))
+  done
+  exit 0
+fi
 # The one-frame VAAPI probe writes to the null muxer ("-").
 if [ "$last" = "-" ]; then
   [ -z "${FAKE_PROBE_COUNT:-}" ] || printf 'probe\n' >> "$FAKE_PROBE_COUNT"
@@ -53,19 +66,39 @@ fi
 : > "$last"
 printf 'partial' >> "$last"
 [ -z "$progress" ] || printf 'frame=1\nfps=30.0\ndrop_frames=0\ndup_frames=0\nspeed=1.0x\nout_time_us=33333\nprogress=continue\n' > "$progress"
-# The live camera check: rewrite the probe frame twice a second.
+# New frames keep arriving (FAKE_STALL_FLAG freezes the counter).
+if [ -n "$progress" ]; then
+  (n=1; parent=$$; while kill -0 "$parent" 2>/dev/null; do sleep 0.5; [ -n "${FAKE_STALL_FLAG:-}" ] && [ -e "$FAKE_STALL_FLAG" ] && continue; n=$((n + 15)); printf 'frame=%s\nfps=30.0\ndrop_frames=0\ndup_frames=0\nspeed=1.0x\nout_time_us=33333\nprogress=continue\n' "$n" > "$progress.tmp" && mv "$progress.tmp" "$progress"; done) &
+  ticker=$!
+fi
+# The live camera check: rewrite the probe frame three times a second, a
+# changing picture unless FAKE_PROBE_FRAME names a PGM to repeat.
 probe=; prev=
 for arg in "$@"; do [ "$prev" = pgm ] && probe=$arg; prev=$arg; done
-if [ -n "$probe" ] && [ -n "${FAKE_PROBE_FRAME:-}" ]; then
-  (while :; do cp "$FAKE_PROBE_FRAME" "$probe.tmp" && mv "$probe.tmp" "$probe"; sleep 0.3; done) &
+if [ -n "$probe" ]; then
+  (parent=$$; while kill -0 "$parent" 2>/dev/null; do
+    if [ -n "${FAKE_STALL_FLAG:-}" ] && [ -e "$FAKE_STALL_FLAG" ]; then sleep 0.3; continue; fi
+    if [ -n "${FAKE_PROBE_FRAME:-}" ]; then cp "$FAKE_PROBE_FRAME" "$probe.tmp"
+    elif [ -n "${FAKE_PLACEHOLDER_ONCE:-}" ] && [ -e "$FAKE_PLACEHOLDER_ONCE" ]; then cp "$FAKE_PLACEHOLDER_ONCE" "$probe.tmp"; else { printf 'P5\n128 96\n255\n'; head -c 12288 /dev/urandom; } > "$probe.tmp"; fi
+    mv "$probe.tmp" "$probe"; sleep 0.3
+  done) &
   writer=$!
 fi
-trap '[ -z "${writer:-}" ] || kill "$writer" 2>/dev/null; exit 0' INT TERM
+trap '[ -z "${writer:-}" ] || kill "$writer" 2>/dev/null; [ -z "${ticker:-}" ] || kill "$ticker" 2>/dev/null; [ -z "${FAKE_PLACEHOLDER_ONCE:-}" ] || rm -f "$FAKE_PLACEHOLDER_ONCE"; exit 0' INT TERM
+# A camera stream that ends by itself (end of file on the only input).
+if [ -n "${FAKE_EXIT_AFTER:-}" ]; then
+  sleep "$FAKE_EXIT_AFTER"
+  [ -z "${writer:-}" ] || kill "$writer" 2>/dev/null
+  [ -z "${ticker:-}" ] || kill "$ticker" 2>/dev/null
+  exit 0
+fi
 sleep 30 &
 wait $!
 EOF
 cat > "$TMP/ffmpeg-fail" <<'EOF'
 #!/bin/sh
+# The camera pre-check gets no frames from this fake.
+if printf '%s\n' "$@" | grep -qx rawvideo; then exit 1; fi
 last=
 for arg in "$@"; do
   if [ "$arg" = "[probe]" ]; then probeout=1; last=$mainout; fi
@@ -77,6 +110,8 @@ exit 1
 EOF
 cat > "$TMP/ffmpeg-interrupt" <<'EOF'
 #!/bin/sh
+# The camera pre-check gets no frames from this fake.
+if printf '%s\n' "$@" | grep -qx rawvideo; then exit 1; fi
 last=; progress=; prev=
 for arg in "$@"; do
   [ "$prev" = "-progress" ] && progress=$arg
@@ -93,6 +128,8 @@ exit 1
 EOF
 cat > "$TMP/ffmpeg-silent" <<'EOF'
 #!/bin/sh
+# The camera pre-check gets no frames from this fake.
+if printf '%s\n' "$@" | grep -qx rawvideo; then exit 1; fi
 last=
 for arg in "$@"; do
   if [ "$arg" = "[probe]" ]; then probeout=1; last=$mainout; fi
@@ -151,7 +188,7 @@ chmod +x "$TMP"/ffmpeg-ok "$TMP"/ffmpeg-fail "$TMP"/ffmpeg-interrupt "$TMP"/ffmp
 common() {
   NIRUCLIP_STATE_DIR="$TMP/state" \
   NIRUCLIP_CONFIG="$TMP/config/config.toml" \
-  NIRUCLIP_CAMERA=/dev/zero \
+  NIRUCLIP_CAMERA="${FAKE_CAMERA:-/dev/zero}" \
   NIRUCLIP_PROBE_DIR="$TMP/state" \
   NIRUCLIP_XRANDR="$TMP/xrandr" \
   NIRUCLIP_SLOP="$TMP/slop" \
@@ -650,6 +687,209 @@ until common "$BIN" --status --json | grep -q 'privacy switch is on'; do
 done
 common "$BIN" --stop >/dev/null
 wait "$pid"
+
+# 0.5.0 camera recovery. NIRUCLIP_TEST_CAMERA_FORMAT lets a plain file stand
+# in for the camera node, so "unplugging" is removing it (no root needed).
+wait_json() {
+  i=0
+  until common "$BIN" --status --json | grep -q -- "$1"; do
+    i=$((i + 1))
+    [ "$i" -lt 150 ] || { common "$BIN" --status --json >&2; echo "timed out waiting for $1" >&2; exit 1; }
+    sleep 0.1
+  done
+}
+CAM="$TMP/cam0"
+export FAKE_LOG="$TMP/args.log"
+recover_run() { # output args...
+  out=$1; shift
+  FAKE_CAMERA="$CAM" NIRUCLIP_TEST_CAMERA_FORMAT=nut FAKE_NOTIFY=1 NIRUCLIP_NOTIFY_SEND="$TMP/notify-send" \
+    NIRUCLIP_FFMPEG="$TMP/ffmpeg-ok" common "$BIN" "$@" --audio none --countdown 0 --output "$TMP/out/$out.mkv" >/dev/null 2>&1
+}
+parts() { grep -o partial "$1" | wc -l | tr -d ' '; }
+
+# Overlay: the camera is unplugged, the screen recording continues without
+# it in a new segment, the camera comes back and is attached again; the
+# three segments are joined into one file.
+: > "$CAM"; : > "$FAKE_NOTIFY_LOG"
+recover_run lost --full --webcam corner &
+pid=$!
+wait_state recording lost.mkv
+rm "$CAM"
+wait_json 'was disconnected'
+wait_json 'lost.seg2.part.mkv'
+wait_state recording lost.seg2
+if grep -q use_wallclock "$TMP/args.log"; then echo 'screen-only segment still opened the camera' >&2; exit 1; fi
+: > "$CAM"
+wait_json 'is back; recording with the camera again'
+wait_state recording lost.seg3
+grep -q use_wallclock "$TMP/args.log" || { echo 'returned camera was not attached again' >&2; exit 1; }
+common "$BIN" --stop >/dev/null
+wait "$pid"
+common "$BIN" --status --json | grep -q '"state": "finished"'
+[ "$(parts "$TMP/out/lost.mkv")" -eq 3 ] || { echo 'reconnect segments were not joined' >&2; exit 1; }
+if ls "$TMP/out" | grep -q '^lost\..*part'; then echo 'reconnect segments left behind' >&2; exit 1; fi
+sleep 0.3
+grep -q 'was disconnected; recording continues without the camera' "$FAKE_NOTIFY_LOG"
+grep -qx 'Camera is back; the recording continues with it' "$FAKE_NOTIFY_LOG"
+
+# Overlay: a camera that does not come back within camera_reconnect_seconds
+# is given up on; the screen recording goes on.
+printf 'camera_reconnect_seconds = 1.5\n' > "$TMP/config/config.toml"
+: > "$CAM"; : > "$FAKE_NOTIFY_LOG"
+recover_run gone --full --webcam corner &
+pid=$!
+wait_state recording gone.mkv
+rm "$CAM"
+wait_json 'did not come back within 2 s; recording continues without the camera'
+: > "$CAM"
+sleep 1.5
+common "$BIN" --status --json | grep -q '"state": "recording"'
+if common "$BIN" --status --json | grep -q 'gone.seg3'; then echo 'camera re-attached after the reconnect time' >&2; exit 1; fi
+common "$BIN" --stop >/dev/null
+wait "$pid"
+[ "$(parts "$TMP/out/gone.mkv")" -eq 2 ]
+sleep 0.3
+grep -q 'did not come back; the recording continues without it' "$FAKE_NOTIFY_LOG"
+
+# Camera-only: the recorder waits for the camera and continues when it
+# returns ...
+rm -f "$TMP/config/config.toml"
+: > "$CAM"
+recover_run only-back --webcam-only &
+pid=$!
+wait_state recording only-back.mkv
+rm "$CAM"
+wait_json 'waiting up to 10 s for it to come back'
+common "$BIN" --status --json | grep -q '"state": "recording"'
+: > "$CAM"
+wait_state recording only-back.seg2
+common "$BIN" --stop >/dev/null
+wait "$pid"
+[ "$(parts "$TMP/out/only-back.mkv")" -eq 2 ]
+# ... and saves a valid file by itself when it does not.
+printf 'camera_reconnect_seconds = 1.5\n' > "$TMP/config/config.toml"
+: > "$CAM"; : > "$FAKE_NOTIFY_LOG"
+recover_run only-gone --webcam-only &
+pid=$!
+wait_state recording only-gone.mkv
+rm "$CAM"
+wait "$pid"
+common "$BIN" --status --json | grep -q '"state": "finished"'
+common "$BIN" --status --json | grep -q 'it did not come back within 2 s'
+[ -s "$TMP/out/only-gone.mkv" ] && [ ! -e "$TMP/out/only-gone.part.mkv" ]
+sleep 0.3
+grep -qx 'The camera did not come back; saving the recording…' "$FAKE_NOTIFY_LOG"
+grep -q '^Saved .*only-gone.mkv' "$FAKE_NOTIFY_LOG"
+
+# A camera that stops delivering frames (probe and progress freeze) counts as
+# lost after camera_stall_seconds; it is picked up again once it delivers.
+export FAKE_STALL_FLAG="$TMP/stall"
+: > "$CAM"
+recover_run stall --full --webcam corner &
+pid=$!
+wait_state recording stall.mkv
+touch "$FAKE_STALL_FLAG"
+wait_json 'delivered no frames for 2.0 s'
+rm -f "$FAKE_STALL_FLAG"
+wait_json 'is back; recording with the camera again'
+common "$BIN" --stop >/dev/null
+wait "$pid"
+[ "$(parts "$TMP/out/stall.mkv")" -ge 2 ]
+unset FAKE_STALL_FLAG
+
+# A camera-only stream that keeps ending is retried, but not forever.
+: > "$CAM"
+FAKE_EXIT_AFTER=0.5 recover_run flaky --webcam-only &
+pid=$!
+wait "$pid"
+common "$BIN" --status --json | grep -q 'ended its stream; the camera kept failing'
+common "$BIN" --status --json | grep -q 'failed 4 times within a minute; not trying again'
+[ -s "$TMP/out/flaky.mkv" ] && [ "$(parts "$TMP/out/flaky.mkv")" -eq 4 ]
+
+# camera_reconnect_seconds = 0 turns loss recovery off (0.4.0 behaviour).
+printf 'camera_reconnect_seconds = 0\n' > "$TMP/config/config.toml"
+: > "$CAM"
+recover_run off --full --webcam corner &
+pid=$!
+wait_state recording off.mkv
+rm "$CAM"
+sleep 2.5
+if common "$BIN" --status --json | grep -q 'disconnected'; then echo 'recovery ran although it is off' >&2; exit 1; fi
+common "$BIN" --stop >/dev/null
+wait "$pid"
+[ "$(parts "$TMP/out/off.mkv")" -eq 1 ]
+rm -f "$TMP/config/config.toml"
+unset FAKE_LOG
+
+# The pre-check runs with every countdown, also 0 (it delays the start a
+# little instead of being skipped).
+export FAKE_PRECHECK_LOG="$TMP/precheck.log"
+: > "$FAKE_PRECHECK_LOG"
+NIRUCLIP_FFMPEG="$TMP/ffmpeg-ok" common "$BIN" --webcam-only --audio none --countdown 0 --output "$TMP/out/pre0.mkv" >/dev/null 2>&1 &
+pid=$!
+wait_state recording pre0.mkv
+[ "$(wc -l < "$FAKE_PRECHECK_LOG")" -eq 1 ] || { echo 'no camera pre-check with countdown 0' >&2; exit 1; }
+common "$BIN" --status --json | grep -q '"status": "ok"'
+common "$BIN" --stop >/dev/null
+wait "$pid"
+
+# A placeholder in the pre-check: the camera is reopened in another mode
+# each time (same size in another format, then another size), then the
+# warning is given as before. USB autosuspend is switched off meanwhile
+# when the sysfs file is writable, and restored afterwards.
+mkdir -p "$TMP/sys/class/video4linux/zero" "$TMP/sys/devices/usb1/1-1/1-1:1.0" "$TMP/sys/devices/usb1/1-1/power"
+: > "$TMP/sys/devices/usb1/1-1/idVendor"
+printf 'auto\n' > "$TMP/sys/devices/usb1/1-1/power/control"
+ln -s "../../../devices/usb1/1-1/1-1:1.0" "$TMP/sys/class/video4linux/zero/device"
+: > "$FAKE_PRECHECK_LOG"
+NIRUCLIP_SYSFS="$TMP/sys" NIRUCLIP_CAMERA_MODES='YUYV 1280x720@30,MJPG 1280x720@30,MJPG 640x360@30' \
+  FAKE_PRECHECK_FRAME="$TMP/placeholder.pgm" NIRUCLIP_TEST_PRIVACY=0 NIRUCLIP_FFMPEG="$TMP/ffmpeg-ok" \
+  common "$BIN" --full --webcam corner --audio none --countdown 1 --output "$TMP/out/reopen.mkv" >/dev/null 2>&1 &
+pid=$!
+wait_state recording reopen.mkv
+[ "$(wc -l < "$FAKE_PRECHECK_LOG")" -eq 3 ] || { cat "$FAKE_PRECHECK_LOG" >&2; echo 'expected 3 pre-checks' >&2; exit 1; }
+sed -n 1p "$FAKE_PRECHECK_LOG" | grep -q 'yuyv422 -video_size 1280x720'
+sed -n 2p "$FAKE_PRECHECK_LOG" | grep -q 'mjpeg -video_size 1280x720'
+sed -n 3p "$FAKE_PRECHECK_LOG" | grep -q 'mjpeg -video_size 640x360'
+json=$(common "$BIN" --status --json)
+printf '%s\n' "$json" | grep -q 'reopening /dev/zero in MJPG 1280x720@30 (attempt 1 of 2)'
+printf '%s\n' "$json" | grep -q 'reopening /dev/zero in MJPG 640x360@30 (attempt 2 of 2)'
+printf '%s\n' "$json" | grep -q 'USB autosuspend off for the rest of this recording'
+printf '%s\n' "$json" | grep -q '"status": "privacy"'
+[ "$(cat "$TMP/sys/devices/usb1/1-1/power/control")" = on ]
+common "$BIN" --stop >/dev/null
+wait "$pid"
+[ "$(cat "$TMP/sys/devices/usb1/1-1/power/control")" = auto ] || { echo 'autosuspend was not restored' >&2; exit 1; }
+# A root-only sysfs file is left alone and the log says why.
+printf 'auto\n' > "$TMP/sys/devices/usb1/1-1/power/control"
+chmod 444 "$TMP/sys/devices/usb1/1-1/power/control"
+if [ "$(id -u)" != 0 ]; then
+  NIRUCLIP_SYSFS="$TMP/sys" FAKE_PRECHECK_FRAME="$TMP/placeholder.pgm" NIRUCLIP_TEST_PRIVACY=0 NIRUCLIP_FFMPEG="$TMP/ffmpeg-ok" \
+    common "$BIN" --webcam-only --audio none --countdown 0 --output "$TMP/out/reopen-ro.mkv" >/dev/null 2>&1 &
+  pid=$!
+  wait_state recording reopen-ro.mkv
+  common "$BIN" --status --json | grep -q 'USB autosuspend left as is (changing it needs root'
+  common "$BIN" --stop >/dev/null
+  wait "$pid"
+  [ "$(cat "$TMP/sys/devices/usb1/1-1/power/control")" = auto ]
+fi
+chmod 644 "$TMP/sys/devices/usb1/1-1/power/control"
+unset FAKE_PRECHECK_LOG
+
+# A placeholder during the recording that a reopen cures: no warning.
+cp "$TMP/placeholder.pgm" "$TMP/placeholder-once.pgm"; : > "$FAKE_NOTIFY_LOG"
+FAKE_PLACEHOLDER_ONCE="$TMP/placeholder-once.pgm" NIRUCLIP_TEST_PRIVACY=0 FAKE_NOTIFY=1 NIRUCLIP_NOTIFY_SEND="$TMP/notify-send" \
+  NIRUCLIP_FFMPEG="$TMP/ffmpeg-ok" common "$BIN" --full --webcam corner --audio none --countdown 0 --output "$TMP/out/cured.mkv" >/dev/null 2>&1 &
+pid=$!
+wait_state recording cured.mkv
+wait_json 'privacy placeholder picture; reopening /dev/zero'
+wait_state recording cured.seg2
+wait_json '"status": "ok"'
+common "$BIN" --stop >/dev/null
+wait "$pid"
+sleep 0.3
+if grep -q 'privacy image' "$FAKE_NOTIFY_LOG"; then echo 'a cured placeholder was still reported' >&2; exit 1; fi
+[ "$(parts "$TMP/out/cured.mkv")" -eq 2 ]
 
 # Profiles are listable, saveable and apply the camera-only mode.
 common "$BIN" --list-profiles | grep -q '^camera-mic'
