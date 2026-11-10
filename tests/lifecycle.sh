@@ -15,7 +15,8 @@ if printf '%s\n' "$@" | grep -qx -- -sources; then
   printf '%s\n' 'Auto-detected sources for pulse:' \
     '* fake_output.analog-stereo.monitor [Monitor of Fake Speakers] (none)' \
     '  alsa_input.fake-builtin.analog-stereo [Built-in Audio Analog Stereo] (none)' \
-    '  alsa_input.usb-Fake_Webcam-02.mono-fallback [Fake Webcam Mono] (none)'
+    '  alsa_input.usb-Fake_Webcam-02.mono-fallback [Fake Webcam Mono] (none)' \
+    '  alsa_input.usb-Fake_UMC-00.capture.0.0 [Fake UMC Capture] (none)'
   exit 0
 fi
 last=; progress=; prev=; vaapi=
@@ -67,7 +68,7 @@ if [ "$last" = "-" ]; then
   [ "${FAKE_VAAPI_PROBE:-fail}" = ok ] && exit 0
   exit 1
 fi
-if [ -n "${FAKE_LOG:-}" ]; then printf '%s\n' "$@" > "$FAKE_LOG"; fi
+if [ -n "${FAKE_LOG:-}" ]; then printf '%s\n' "$@" > "$FAKE_LOG"; printf '%s\n' "${PULSE_PROP:-}" > "$FAKE_LOG.env"; fi
 if [ -n "$vaapi" ] && [ "${FAKE_VAAPI_RUNTIME:-ok}" = fail ]; then
   echo 'Failed to initialise VAAPI connection' >&2
   : > "$last"
@@ -193,6 +194,19 @@ case "$3" in
 esac
 EOF
 chmod +x "$TMP/v4l2-ctl"
+# pw-dump: the fake UMC has 6 inputs (AUX0..AUX5), the builtin is stereo.
+cat > "$TMP/pw-dump" <<'EOF'
+#!/bin/sh
+[ "${FAKE_PW_DUMP:-ok}" = ok ] || exit 1
+cat <<'JSON'
+[
+ {"id": 40, "type": "PipeWire:Interface:Node", "info": {"props": {"media.class": "Audio/Source", "node.name": "alsa_input.usb-Fake_UMC-00.capture.0.0"},
+  "params": {"EnumFormat": [{"channels": 6, "position": ["AUX0","AUX1","AUX2","AUX3","AUX4","AUX5"]}]}}},
+ {"id": 41, "type": "PipeWire:Interface:Node", "info": {"props": {"media.class": "Audio/Source", "node.name": "alsa_input.fake-builtin.analog-stereo", "audio.channels": 2, "audio.position": "FL,FR"}, "params": {}}}
+]
+JSON
+EOF
+chmod +x "$TMP/pw-dump"
 chmod +x "$TMP"/ffmpeg-ok "$TMP"/ffmpeg-fail "$TMP"/ffmpeg-interrupt "$TMP"/ffmpeg-silent "$TMP"/ffprobe "$TMP"/xrandr "$TMP"/slop
 
 common() {
@@ -204,6 +218,7 @@ common() {
   NIRUCLIP_SLOP="$TMP/slop" \
   NIRUCLIP_FFPROBE="$TMP/ffprobe" \
   NIRUCLIP_V4L2CTL="$TMP/v4l2-ctl" \
+  NIRUCLIP_PW_DUMP="$TMP/pw-dump" \
   NIRUCLIP_NOTIFY="${FAKE_NOTIFY:-0}" \
   NIRUCLIP_VAAPI_DEVICE="${FAKE_RENDER_NODE:-$TMP/no-render-node}" \
   DISPLAY=:0 \
@@ -956,6 +971,58 @@ unset FAKE_SOURCES_LOG
 # A saved profile remembers the microphone.
 common "$BIN" --save-profile mic-profile --full --audio mic --mic webcam
 grep -q 'mic = "webcam"' "$TMP/config/config.toml"
+
+# Multichannel inputs. --list-mics shows channel counts and names, and how to
+# pick inputs only for sources with more than two.
+NIRUCLIP_FFMPEG="$TMP/ffmpeg-ok" common "$BIN" --list-mics > "$TMP/mics.txt"
+grep -qx '    6 channels: AUX0 AUX1 AUX2 AUX3 AUX4 AUX5' "$TMP/mics.txt"
+grep -qx '    2 channels: FL FR' "$TMP/mics.txt"
+[ "$(grep -c -- '--mic-channels' "$TMP/mics.txt")" -eq 1 ]
+NIRUCLIP_FFMPEG="$TMP/ffmpeg-ok" common "$BIN" --list-mics --json | grep -q '"multichannel": true'
+# Without pw-dump the list is as before.
+FAKE_PW_DUMP=fail NIRUCLIP_FFMPEG="$TMP/ffmpeg-ok" common "$BIN" --list-mics > "$TMP/mics-plain.txt"
+if grep -q channels "$TMP/mics-plain.txt"; then echo 'channels listed without pw-dump' >&2; exit 1; fi
+# Input 3 as mono: all six inputs opened, dont-remix for this ffmpeg, pan.
+export FAKE_LOG="$TMP/chan.log"; NIRUCLIP_FFMPEG="$TMP/ffmpeg-ok" common "$BIN" --full --audio mic --mic umc --mic-channels 3 --countdown 0 --output "$TMP/out/chan.mkv" >/dev/null 2>&1 &
+pid=$!
+wait_state recording chan.mkv
+common "$BIN" --status | grep -qx 'mic: Fake UMC Capture (alsa_input.usb-Fake_UMC-00.capture.0.0), input 3 of 6 (AUX2) as mono'
+common "$BIN" --status --json | grep -q '"inputs": "3"'
+common "$BIN" --stop >/dev/null
+wait "$pid"
+grep -A4 -x -- pulse "$TMP/chan.log" | tr '\n' ' ' | grep -q -- '-channels 6 -i alsa_input.usb-Fake_UMC-00.capture.0.0'
+grep -q 'pan=mono|c0=c2\[a\]' "$TMP/chan.log"
+grep -qx 'stream.dont-remix=true' "$TMP/chan.log.env"
+# A pair mixed with desktop audio, from a profile key.
+cat >> "$TMP/config/config.toml" <<'EOF'
+
+[profiles.duo]
+mode = "full"
+audio = "both"
+mic = "umc"
+mic_channels = "1,2"
+EOF
+export FAKE_LOG="$TMP/chan-both.log"; NIRUCLIP_FFMPEG="$TMP/ffmpeg-ok" common "$BIN" --profile duo --countdown 0 --output "$TMP/out/chan-both.mkv" >/dev/null 2>&1 &
+pid=$!
+wait_state recording chan-both.mkv
+common "$BIN" --stop >/dev/null
+wait "$pid"
+grep -q 'pan=stereo|c0=c0|c1=c1\[mic\];\[mic\]\[2:a\]amix' "$TMP/chan-both.log"
+grep -q '@DEFAULT_MONITOR@' "$TMP/chan-both.log"
+# An input the source does not have: recorded as before, with a notification.
+: > "$FAKE_NOTIFY_LOG"
+export FAKE_LOG="$TMP/chan-bad.log"; FAKE_NOTIFY=1 NIRUCLIP_NOTIFY_SEND="$TMP/notify-send" NIRUCLIP_FFMPEG="$TMP/ffmpeg-ok" common "$BIN" --full --audio mic --mic built-in --mic-channels 3 --countdown 0 --output "$TMP/out/chan-bad.mkv" >/dev/null 2>&1 &
+pid=$!
+wait_state recording chan-bad.mkv
+common "$BIN" --status | grep -q '^warning: Built-in Audio Analog Stereo has 2 inputs, so inputs 3 were not used; recording the microphone as usual'
+common "$BIN" --stop >/dev/null
+wait "$pid"
+if grep -q -- '-channels\|pan=' "$TMP/chan-bad.log"; then echo 'a missing input was still mapped' >&2; exit 1; fi
+[ ! -s "$TMP/chan-bad.log.env" ] || [ "$(cat "$TMP/chan-bad.log.env")" = "" ]
+grep -q 'were not used; recording the microphone as usual' "$FAKE_NOTIFY_LOG"
+# A saved profile remembers the inputs.
+common "$BIN" --save-profile chan-profile --full --audio mic --mic umc --mic-channels 4+5
+grep -q 'mic_channels = "4,5"' "$TMP/config/config.toml"
 
 # Profiles are listable, saveable and apply the camera-only mode.
 common "$BIN" --list-profiles | grep -q '^camera-mic'

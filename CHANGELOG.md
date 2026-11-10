@@ -3,6 +3,33 @@
 All notable changes to NIRUCLIP. Earlier releases are described in their
 GitHub release notes and commit messages.
 
+## 0.7.0 (2026-11-10)
+
+Choose the inputs of a multichannel audio interface.
+
+### Added
+
+- `--mic-channels N|N,M|all` and a `mic_channels = "..."` key (top level and
+  per profile, next to `mic`): record one input of a multichannel source as
+  mono (`3`) or a pair as stereo (`1,2` or `1+2`), numbered from 1 like the
+  interface (input 1 is AUX0). `all` or absent records the source as before.
+- `--list-mics` shows each microphone's channel count and names (from
+  `pw-dump`), plus how to pick inputs for sources with more than two channels.
+  `--list-mics --json` adds `channels`, `channel_names` and `multichannel`.
+- `session.json` `mic` has optional `channels`, `inputs`, `input_names` and
+  `inputs_fallback`; `--status` shows the inputs in use.
+- The mapping is done in the capture pipeline only (all channels opened with
+  `stream.dont-remix` for this ffmpeg, then `pan`). No PipeWire node is
+  created and the system default is not changed. Inputs the source does not
+  have, an unreadable layout or a missing microphone give a notification and
+  the usual recording, never a refused one.
+
+### Changed
+
+- The audio filters (`amix`/limiter for `--audio both`, the new `pan`) run as
+  their own filter graph instead of inside the video graph, which lowered the
+  dropped/duplicated frame counters with audio filtering in tests on othala.
+
 ## 0.6.1 (2026-11-09)
 
 The HP 5MP laptop camera no longer switches itself off after a second.

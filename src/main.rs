@@ -12,7 +12,7 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const VERSION: &str = "0.6.1";
+const VERSION: &str = "0.7.0";
 const SCHEMA: u32 = 1;
 const ACTIVE_STATES: &[&str] = &[
     "countdown",
@@ -307,6 +307,11 @@ struct Options {
     /// The source the recording opens, resolved at start; None is
     /// `@DEFAULT_SOURCE@`.
     mic_source: Option<String>,
+    /// Inputs of a multichannel source (--mic-channels / `mic_channels =`).
+    mic_channels: Option<mic::Channels>,
+    /// The source's channel count and the inputs to keep, resolved at start;
+    /// None records the microphone as before.
+    mic_layout: Option<(u32, mic::Channels)>,
     list_mics: bool,
     recovery: Recovery,
     check_camera: bool,
@@ -351,6 +356,8 @@ impl Default for Options {
             camera_border: "theme".into(),
             mic: None,
             mic_source: None,
+            mic_channels: None,
+            mic_layout: None,
             list_mics: false,
             recovery: Recovery::default(),
             check_camera: false,
@@ -457,6 +464,9 @@ struct Profile {
     /// Microphone: a source name, a description substring or `default`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     mic: Option<String>,
+    /// Inputs of a multichannel microphone: `3`, `1,2` or `all`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mic_channels: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     webcam: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -489,6 +499,7 @@ impl Profile {
             mode: self.mode.or(base.mode),
             audio: self.audio.or(base.audio),
             mic: self.mic.or(base.mic),
+            mic_channels: self.mic_channels.or(base.mic_channels),
             webcam: self.webcam.or(base.webcam),
             corner: self.corner.or(base.corner),
             webcam_size: self.webcam_size.or(base.webcam_size),
@@ -516,6 +527,10 @@ struct Config {
     /// Absent or `default`: the system default source.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     mic: Option<String>,
+    /// Inputs of a multichannel microphone for every recording: `3` (mono),
+    /// `1,2` (stereo) or `all`; a profile or --mic-channels can override it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mic_channels: Option<String>,
     /// Camera defaults for every recording; a profile can override them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     camera: Option<String>,
@@ -569,6 +584,7 @@ impl Config {
             default_profile: None,
             encoder: None,
             mic: None,
+            mic_channels: None,
             camera: None,
             camera_shape: None,
             camera_mirror: None,
@@ -587,6 +603,7 @@ impl Config {
             config.default_profile = loaded.default_profile;
             config.encoder = loaded.encoder;
             config.mic = loaded.mic;
+            config.mic_channels = loaded.mic_channels;
             config.camera = loaded.camera;
             config.camera_shape = loaded.camera_shape;
             config.camera_mirror = loaded.camera_mirror;
@@ -616,6 +633,7 @@ impl Config {
             mode: Some(options.mode.as_str().into()),
             audio: Some(options.audio.as_str().into()),
             mic: options.mic.clone(),
+            mic_channels: options.mic_channels.map(|channels| channels.as_setting()),
             webcam: Some(options.webcam.as_str().into()),
             corner: Some(options.corner.as_str().into()),
             webcam_size: Some(options.webcam_size.as_str().into()),
@@ -753,6 +771,9 @@ fn apply_profile(options: &mut Options, profile: &Profile) -> Result<(), String>
     }
     if let Some(value) = &profile.mic {
         options.mic = mic_setting(value);
+    }
+    if let Some(value) = &profile.mic_channels {
+        options.mic_channels = mic::Channels::parse(value)?;
     }
     if let Some(value) = &profile.webcam {
         options.webcam = Webcam::parse(value)?;
@@ -1404,6 +1425,8 @@ fn scaled_screen(width: u32, height: u32, preset: Preset) -> (u32, u32) {
 #[derive(Debug)]
 struct Plan {
     argv: Vec<String>,
+    /// Extra environment for ffmpeg (PULSE_PROP for chosen inputs).
+    env: Vec<(String, String)>,
     width: u32,
     height: u32,
 }
@@ -1967,6 +1990,13 @@ fn build_plan(
                 INPUT_QUEUE.into(),
                 "-f".into(),
                 "pulse".into(),
+            ]);
+            if let Some((count, _)) = resolved.mic_layout {
+                // Open every input of the multichannel source; the pan
+                // filter below keeps the chosen ones.
+                argv.extend(["-channels".into(), count.to_string()]);
+            }
+            argv.extend([
                 "-i".into(),
                 resolved
                     .mic_source
@@ -2086,22 +2116,53 @@ fn build_plan(
         filters.push("[vsrc]format=nv12,hwupload[v]".to_string());
     }
     let has_audio = resolved.audio != Audio::None;
+    let mut env = Vec::new();
+    // Chosen inputs of a multichannel microphone: PipeWire passes the
+    // channels through one to one (no remix of AUX positions onto FL/FR) for
+    // this ffmpeg only, and pan keeps the chosen inputs.
+    let mic_pan = match resolved.mic_layout {
+        Some((_, channels)) if resolved.audio == Audio::Mic || resolved.audio == Audio::Both => {
+            let prop = match std::env::var("PULSE_PROP") {
+                Ok(existing) if !existing.trim().is_empty() => {
+                    format!("{existing} {}", mic::DONT_REMIX)
+                }
+                _ => mic::DONT_REMIX.to_string(),
+            };
+            env.push(("PULSE_PROP".to_string(), prop));
+            Some(channels.pan(resolved.audio == Audio::Both))
+        }
+        _ => None,
+    };
+    // The audio filters are a graph of their own: in the video graph an
+    // audio chain made the video side wait on audio packets, which showed up
+    // as dropped and duplicated frames (measured on othala: 40 dropped in
+    // 12 s with pan in the video graph, 0 in a separate graph).
+    let mut audio_filters = Vec::new();
+    if let (Some(pan), Audio::Mic) = (&mic_pan, resolved.audio) {
+        audio_filters.push(format!("[{audio_index}:a]{pan}[a]"));
+    }
     if resolved.audio == Audio::Both {
+        let mic_label = match &mic_pan {
+            Some(pan) => {
+                audio_filters.push(format!("[{audio_index}:a]{pan}[mic]"));
+                "mic".to_string()
+            }
+            None => format!("{audio_index}:a"),
+        };
         // The mix keeps both sources at unity gain (normalize=0). A peak
         // limiter at 0.95 (level=0: no automatic make-up gain) only acts when
         // the sum would clip, so levels are otherwise unchanged.
-        filters.push(format!(
-            "[{audio_index}:a][{}:a]amix=inputs=2:normalize=0,alimiter=limit=0.95:level=0[a]",
+        audio_filters.push(format!(
+            "[{mic_label}][{}:a]amix=inputs=2:normalize=0,alimiter=limit=0.95:level=0[a]",
             audio_index + 1
         ));
     }
-    argv.extend([
-        "-filter_complex".into(),
-        filters.join(";"),
-        "-map".into(),
-        "[v]".into(),
-    ]);
-    if resolved.audio == Audio::Both {
+    argv.extend(["-filter_complex".into(), filters.join(";")]);
+    if !audio_filters.is_empty() {
+        argv.extend(["-filter_complex".into(), audio_filters.join(";")]);
+    }
+    argv.extend(["-map".into(), "[v]".into()]);
+    if !audio_filters.is_empty() {
         argv.extend(["-map".into(), "[a]".into()]);
     } else if has_audio {
         argv.extend(["-map".into(), format!("{audio_index}:a:0")]);
@@ -2159,6 +2220,7 @@ fn build_plan(
     }
     Ok(Plan {
         argv,
+        env,
         width,
         height,
     })
@@ -2254,6 +2316,9 @@ fn parse_args(argv: &[String], config: &Config) -> Result<Options, String> {
     if let Some(value) = &config.mic {
         options.mic = mic_setting(value);
     }
+    if let Some(value) = &config.mic_channels {
+        options.mic_channels = mic::Channels::parse(value)?;
+    }
     apply_camera_settings(
         &mut options,
         config.camera.as_deref(),
@@ -2297,6 +2362,10 @@ fn parse_args(argv: &[String], config: &Config) -> Result<Options, String> {
             }
             "--mic" => {
                 options.mic = mic_setting(&next()?);
+                index += 1;
+            }
+            "--mic-channels" => {
+                options.mic_channels = mic::Channels::parse(&next()?)?;
                 index += 1;
             }
             "--list-mics" => options.list_mics = true,
@@ -2436,7 +2505,9 @@ Usage: niruclip --full|--region|--window|--webcam-only [options]\n\
 Options:\n\
   --audio none|mic|desktop|both\n\
   --mic SOURCE|default              microphone: source name or part of its description\n\
-  --list-mics [--json]              list microphones (* marks the system default)\n\
+  --mic-channels N|N,M|all          inputs of a multichannel microphone: one as mono,\n\
+                                    a pair as stereo (1-based, see --list-mics)\n\
+  --list-mics [--json]              list microphones and their channels (* = default)\n\
   --webcam off|corner|only          camera placement\n\
   --corner top-left|top-right|bottom-left|bottom-right\n\
   --webcam-size small|medium|large  camera height: 20, 26 or 34 % of the video\n\
@@ -2549,6 +2620,9 @@ fn status(options: &Options) {
         println!("mic: {}", mic.label());
         if let Some(fallback) = &mic.fallback {
             println!("warning: {fallback}; using the system default");
+        }
+        if let Some(fallback) = &mic.inputs_fallback {
+            println!("warning: {fallback}; recording the microphone as usual");
         }
     }
     if let Some(encoder) = &session.encoder {
@@ -4712,7 +4786,7 @@ impl Recorder<'_> {
                 &self.encoder,
                 self.probe.as_deref(),
             )?;
-            let mut child = match spawn_ffmpeg(&self.ffmpeg, &plan.argv) {
+            let mut child = match spawn_ffmpeg(&self.ffmpeg, &plan.argv, &plan.env) {
                 Ok(child) => child,
                 Err(reason) => {
                     return Ok(SegmentStart::Failed {
@@ -4857,13 +4931,18 @@ fn started_message(session: &Session) -> String {
     }
 }
 
-fn spawn_ffmpeg(ffmpeg: &str, argv: &[String]) -> Result<std::process::Child, String> {
+fn spawn_ffmpeg(
+    ffmpeg: &str,
+    argv: &[String],
+    env: &[(String, String)],
+) -> Result<std::process::Child, String> {
     let log_path = state_dir().join("ffmpeg.log");
     let log = File::create(&log_path)
         .map_err(|error| format!("could not create {}: {error}", log_path.display()))?;
     let mut command = Command::new(ffmpeg);
     command
         .args(argv)
+        .envs(env.iter().map(|(key, value)| (key, value)))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::from(log));
@@ -5585,11 +5664,22 @@ fn mic_setting(value: &str) -> Option<String> {
 /// default instead of failing. The system default itself is never changed.
 fn resolve_microphone(options: &mut Options, ffmpeg: &str) -> Option<mic::MicStatus> {
     options.mic_source = None;
+    options.mic_layout = None;
     if options.audio != Audio::Mic && options.audio != Audio::Both {
         return None;
     }
     let sources = mic::list_sources(ffmpeg);
-    let status = mic::resolve(options.mic.as_deref(), sources.as_deref());
+    let mut status = mic::resolve(options.mic.as_deref(), sources.as_deref());
+    if options.mic_channels.is_some() {
+        let layouts = mic::list_layouts(&command_path("pw-dump", "NIRUCLIP_PW_DUMP"));
+        options.mic_layout =
+            mic::resolve_channels(&mut status, options.mic_channels, layouts.as_deref());
+        if let Some(reason) = &status.inputs_fallback {
+            let message = format!("{reason}; recording the microphone as usual");
+            eprintln!("niruclip: {message}");
+            notify(options, "NIRUCLIP microphone", &capitalize(&message));
+        }
+    }
     if status.source != mic::DEFAULT_SOURCE {
         options.mic_source = Some(status.source.clone());
     }
@@ -5619,23 +5709,34 @@ fn list_mics(options: &Options) -> Result<(), String> {
     let ffmpeg = command_path("ffmpeg", "NIRUCLIP_FFMPEG");
     let sources = mic::list_sources(&ffmpeg)
         .ok_or("could not list audio sources (is PipeWire's Pulse interface running?)")?;
+    // Channel counts and names; without pw-dump the list is as before.
+    let layouts = mic::list_layouts(&command_path("pw-dump", "NIRUCLIP_PW_DUMP"));
     if options.json {
         let mics: Vec<serde_json::Value> = sources
             .iter()
             .filter(|source| !source.monitor())
             .map(|source| {
-                serde_json::json!({
+                let mut entry = serde_json::json!({
                     "name": source.name,
                     "description": source.description,
                     "default": source.default,
-                })
+                });
+                if let Some(layout) = layouts
+                    .as_deref()
+                    .and_then(|list| mic::layout_of(list, &source.name))
+                {
+                    entry["channels"] = layout.count.into();
+                    entry["channel_names"] = layout.positions.clone().into();
+                    entry["multichannel"] = (layout.count > 2).into();
+                }
+                entry
             })
             .collect();
         let text = serde_json::to_string_pretty(&mics)
             .map_err(|error| format!("could not serialize sources: {error}"))?;
         println!("{text}");
     } else {
-        print!("{}", mic::format_list(&sources));
+        print!("{}", mic::format_list(&sources, layouts.as_deref()));
     }
     Ok(())
 }
@@ -6079,6 +6180,115 @@ mod tests {
         let session: Session =
             serde_json::from_str(&serde_json::to_string(&Session::empty()).unwrap()).unwrap();
         assert!(session.mic.is_none());
+    }
+
+    #[test]
+    fn chosen_inputs_are_opened_and_panned() {
+        let geometry = Some(Geometry {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        });
+        let plan = |options: &Options| {
+            let capture = assemble_inputs(options, ":0", geometry, None, None, None).unwrap();
+            build_plan(
+                options,
+                &capture,
+                Path::new("/tmp/x.part.mkv"),
+                Path::new("/tmp/p"),
+                &Encoder::Software,
+                None,
+            )
+            .unwrap()
+        };
+        let graphs = |plan: &Plan| {
+            plan.argv
+                .windows(2)
+                .filter(|pair| pair[0] == "-filter_complex")
+                .map(|pair| pair[1].clone())
+                .collect::<Vec<_>>()
+        };
+        let maps = |plan: &Plan| {
+            plan.argv
+                .windows(2)
+                .filter(|pair| pair[0] == "-map")
+                .map(|pair| pair[1].clone())
+                .collect::<Vec<_>>()
+        };
+        // No choice: the pulse input, map and environment are as before.
+        let mut options = Options {
+            audio: Audio::Mic,
+            mic_source: Some("umc".into()),
+            ..Options::default()
+        };
+        let before = plan(&options);
+        assert!(before.env.is_empty());
+        assert!(!before.argv.iter().any(|arg| arg == "-channels"));
+        assert_eq!(maps(&before), ["[v]", "1:a:0"]);
+        // Input 3 of 18 as mono.
+        options.mic_layout = Some((18, mic::Channels::Mono(3)));
+        let mono = plan(&options);
+        let at = mono.argv.iter().position(|arg| arg == "-channels").unwrap();
+        assert_eq!(&mono.argv[at..at + 4], ["-channels", "18", "-i", "umc"]);
+        // The audio chain is its own graph, apart from the video graph.
+        assert_eq!(graphs(&mono).len(), 2);
+        assert_eq!(graphs(&mono)[1], "[1:a]pan=mono|c0=c2[a]");
+        assert!(!graphs(&mono)[0].contains(":a]"));
+        assert_eq!(graphs(&before).len(), 1);
+        assert_eq!(maps(&mono), ["[v]", "[a]"]);
+        assert_eq!(mono.env.len(), 1);
+        assert_eq!(mono.env[0].0, "PULSE_PROP");
+        assert!(mono.env[0].1.ends_with("stream.dont-remix=true"));
+        // A pair mixed with desktop audio: only the microphone gets -channels.
+        options.audio = Audio::Both;
+        options.mic_layout = Some((18, mic::Channels::Stereo(1, 2)));
+        let both = plan(&options);
+        assert_eq!(
+            both.argv.iter().filter(|arg| *arg == "-channels").count(),
+            1
+        );
+        assert!(graphs(&both)[1]
+            .starts_with("[1:a]pan=stereo|c0=c0|c1=c1[mic];[mic][2:a]amix=inputs=2:normalize=0"));
+        assert_eq!(maps(&both), ["[v]", "[a]"]);
+        // Desktop audio only: a stored choice does not apply.
+        options.audio = Audio::Desktop;
+        let desktop = plan(&options);
+        assert!(desktop.env.is_empty() && !desktop.argv.iter().any(|arg| arg == "-channels"));
+    }
+
+    #[test]
+    fn mic_channels_from_config_profile_and_flag() {
+        let args = |list: &[&str]| list.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+        let config = Config::with_builtins(Some(
+            toml::from_str(
+                "mic = \"UMC1820\"\nmic_channels = \"1,2\"\n[profiles.voice]\nmic_channels = \"3\"\n",
+            )
+            .unwrap(),
+        ));
+        let options = parse_args(&args(&["--full"]), &config).unwrap();
+        assert_eq!(options.mic_channels, Some(mic::Channels::Stereo(1, 2)));
+        let options = parse_args(&args(&["--profile", "voice"]), &config).unwrap();
+        assert_eq!(options.mic_channels, Some(mic::Channels::Mono(3)));
+        let options = parse_args(
+            &args(&["--profile", "voice", "--mic-channels", "4+5"]),
+            &config,
+        )
+        .unwrap();
+        assert_eq!(options.mic_channels, Some(mic::Channels::Stereo(4, 5)));
+        let options = parse_args(&args(&["--mic-channels", "all"]), &config).unwrap();
+        assert_eq!(options.mic_channels, None);
+        assert!(parse_args(&args(&["--mic-channels", "0"]), &config).is_err());
+        assert!(parse_args(&args(&["--mic-channels"]), &config).is_err());
+        // A plain config has no mic_channels key.
+        let plain = Config::with_builtins(None);
+        assert!(!toml::to_string_pretty(&plain)
+            .unwrap()
+            .contains("mic_channels"));
+        assert_eq!(
+            parse_args(&args(&["--full"]), &plain).unwrap().mic_channels,
+            None
+        );
     }
 
     #[test]

@@ -6,5 +6,6 @@ expected=$(awk -F '"' '/^version = / {print $2; exit}' "$(dirname "$0")/../Cargo
 "$BIN" --status | grep -q '^state:'
 "$BIN" --help | grep -q -- '--webcam-only'
 "$BIN" --help | grep -q -- '--mic SOURCE'
+"$BIN" --help | grep -q -- '--mic-channels'
 "$BIN" --list-profiles | grep -q '^screen-camera'
 echo 'NIRUCLIP smoke tests: PASS'

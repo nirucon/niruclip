@@ -92,6 +92,8 @@ niruclip --full --audio mic
 niruclip --region --audio both
 niruclip --full --audio mic --mic webcam     # this recording only
 niruclip --list-mics
+niruclip --full --audio mic --mic UMC1820 --mic-channels 3     # input 3 as mono
+niruclip --full --audio mic --mic UMC1820 --mic-channels 1,2   # inputs 1 and 2 as stereo
 niruclip --full --webcam corner --corner bottom-right --webcam-size large
 niruclip --webcam-only --audio mic
 niruclip --profile screen-camera
@@ -115,6 +117,7 @@ niruclip --share
 | Mode | `--full`, `--region`, `--window`, `--webcam-only` |
 | Audio | `--audio none`, `mic`, `desktop`, `both` |
 | Microphone | `--mic SOURCE` or `default` (default: the system default source); `--list-mics [--json]` |
+| Microphone inputs | `--mic-channels N` (one input as mono), `N,M` (a pair as stereo) or `all` (default: the source as before) |
 | Camera | `--webcam off`, `corner`, `only` |
 | Corner | `--corner top-left`, `top-right`, `bottom-left`, `bottom-right` |
 | Camera size | `--webcam-size small`, `medium` (default), `large`: 20, 26 or 34 % of the video height |
@@ -168,6 +171,7 @@ description = "Custom capture profile"
 mode = "full"               # full, region, window, webcam-only
 audio = "desktop"           # none, mic, desktop, both
 mic = "UMC1820"             # optional; absent means the system default source
+mic_channels = "1,2"        # optional: N (mono), N,M (stereo) or all
 webcam = "off"              # off, corner, only
 corner = "bottom-right"
 webcam_size = "medium"      # small, medium, large
@@ -202,6 +206,26 @@ mic = "webcam"
 If the chosen microphone is not there (unplugged), NIRUCLIP warns with a
 notification and records from the system default instead of failing;
 `--status` and `session.json` (`mic`) show which source was used and why.
+
+### Inputs of a multichannel interface
+
+An audio interface such as the Behringer UMC1820 shows up as one source with
+many channels (18, named AUX0 to AUX17). `--list-mics` prints the channel count
+and names under each microphone and, only for sources with more than two
+channels, how to pick inputs. `--mic-channels 3` records input 3 alone as
+mono, `--mic-channels 1,2` (or `1+2`) records inputs 1 and 2 as left and right.
+Inputs are numbered from 1, like the labels on the interface. The key
+`mic_channels` works at the top of the config and in profiles, with the same
+precedence as `mic`; `all` or no setting records the source as before.
+
+The mapping happens only inside the recording: ffmpeg opens every channel of
+the source and keeps the chosen ones. No PipeWire node is created, the system
+default and the routing are not changed, and nothing is left behind after the
+recording. If the source has fewer inputs than asked for, the channel layout
+cannot be read (`pw-dump` from PipeWire), or the chosen microphone is missing,
+NIRUCLIP notifies and records the microphone as usual. If the interface
+disappears during a recording, the recording continues and is saved; the
+chosen inputs are silent from then on.
 
 `camera`, `camera_shape`, `camera_mirror` and `camera_border` can also be set
 at the top level as defaults for every recording.

@@ -268,6 +268,53 @@ one was not used. `--status` prints `mic: <description> (<name>)`, with
 ", system default" when the default was used, and a warning line after a
 fallback. A system default that is itself a monitor is noted on stderr.
 
+### Inputs of a multichannel source
+
+`--mic-channels N|N,M|all` (config `mic_channels`, top level or per profile,
+precedence `--mic-channels`, profile, top level) picks inputs of the resolved
+microphone: one input recorded as mono, or a pair as stereo (left, right).
+Inputs are 1-based (input 1 is AUX0) and go up to 32. `all`, `default` or no
+setting keeps the 0.6 behaviour.
+
+Channel layouts come from `pw-dump` (`NIRUCLIP_PW_DUMP` overrides the command;
+three-second limit): for each `Audio/Source*` node the negotiated `Format`,
+else the first `EnumFormat`, the DSP `PortConfig`, or the `audio.channels` and
+`audio.position` properties. `--list-mics` adds an indented line per
+microphone, `N channels: AUX0 AUX1 ...`, and for sources with more than two
+channels a hint for `--mic-channels`. `--list-mics --json` adds `channels`,
+`channel_names` and `multichannel` (more than two channels) when known, for
+menus that should show an input choice only for multichannel interfaces.
+Without `pw-dump` the listing is as before.
+
+How it records: the pulse input gets `-channels <count of the source>` and
+ffmpeg runs with `PULSE_PROP=stream.dont-remix=true` (appended to an existing
+`PULSE_PROP`), so PipeWire hands the channels over one to one instead of
+mapping AUX positions onto FL/FR (without it, only AUX0 and AUX1 arrive and
+the other inputs are silent). A `pan` filter keeps the chosen inputs
+(`pan=mono|c0=c2` for input 3, `pan=stereo|c0=c0|c1=c1` for 1,2). With
+`--audio both` a mono input is put on both sides before the mix. The property
+applies to this ffmpeg process only; no node is created and no default or
+link is changed. Since 0.7.0 the audio filters run as their own filter graph,
+apart from the video graph (an audio chain in the video graph raised the
+dropped/duplicated frame counters).
+
+**Fallback, never refuse.** When the source has fewer inputs than requested,
+its layout is unknown, `pw-dump` fails, or the chosen microphone is missing
+(the system default is then used and the input choice is dropped), NIRUCLIP
+prints and notifies "... so inputs N were not used; recording the microphone as
+usual" and records as in 0.6.
+
+**A source that disappears mid-recording.** As with a chosen microphone,
+PipeWire moves the stream to another source and the recording continues and is
+saved. With an input choice the chosen inputs are usually silent from then on
+(the stream keeps its channel layout). A resume after the interface vanished
+reopens the source by name, which PipeWire answers with the default source.
+
+`session.json` `mic` gains optional `channels` (the source's count),
+`inputs` (`3` or `1,2`), `input_names` (`["AUX2"]`) and `inputs_fallback`
+(the reason). `--status` shows `mic: <description> (<name>), input 3 of 18
+(AUX2) as mono` and a warning line after a fallback.
+
 ### Mixing
 
 `--audio both` mixes the microphone and desktop audio at unity gain
