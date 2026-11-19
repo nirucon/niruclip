@@ -3,6 +3,16 @@
 All notable changes to NIRUCLIP. Earlier releases are described in their
 GitHub release notes and commit messages.
 
+## 0.8.0 (2026-11-19)
+
+### Added
+
+- Recording sounds: `record-start` plays just before the capture starts and
+  `record-stop` once it has stopped, so neither ends up in the recording.
+  They are NIRUX sound events (category `feedback`, on by default) played
+  through NIRUNOTIFY; `--no-notify`, `NIRUCLIP_NOTIFY=0` or
+  `NIRUCLIP_SOUND=0` keep them silent.
+
 ## 0.7.0 (2026-11-10)
 
 Choose the inputs of a multichannel audio interface.
