@@ -220,6 +220,7 @@ common() {
   NIRUCLIP_V4L2CTL="$TMP/v4l2-ctl" \
   NIRUCLIP_PW_DUMP="$TMP/pw-dump" \
   NIRUCLIP_NOTIFY="${FAKE_NOTIFY:-0}" \
+  NIRUCLIP_SOUND=0 \
   NIRUCLIP_VAAPI_DEVICE="${FAKE_RENDER_NODE:-$TMP/no-render-node}" \
   DISPLAY=:0 \
   "$@"

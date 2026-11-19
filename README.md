@@ -243,7 +243,10 @@ keeps pointing at the same USB port; on some laptops the `by-id` link
 `...-video-index0` is the infrared sensor, not the camera.
 
 Notifications are shown when `notify-send` is available; `--no-notify` or
-`NIRUCLIP_NOTIFY=0` disables them. Other environment overrides are listed in
+`NIRUCLIP_NOTIFY=0` disables them. With NIRUNOTIFY running, the NIRUX sounds `record-start`
+(just before capture begins) and `record-stop` (once capture has stopped) play,
+so neither ends up in the recording; switch them in `nirux sounds`, or turn them
+off here with `NIRUCLIP_SOUND=0` (notifications off silences them too). Other environment overrides are listed in
 the [reference](docs/REFERENCE.md#environment-overrides).
 
 ## Files and paths

@@ -1,5 +1,6 @@
 mod camera;
 mod mic;
+mod sound;
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -1243,9 +1244,7 @@ fn install_signal_handlers() {
 }
 
 fn notify(options: &Options, summary: &str, body: &str) {
-    if options.no_notify
-        || std::env::var_os("NIRUCLIP_NOTIFY").as_deref() == Some(std::ffi::OsStr::new("0"))
-    {
+    if !notifications_on(options) {
         return;
     }
     let _ = Command::new(command_path("notify-send", "NIRUCLIP_NOTIFY_SEND"))
@@ -1254,6 +1253,13 @@ fn notify(options: &Options, summary: &str, body: &str) {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn();
+}
+
+/// Notifications, and with them the record-start/stop sounds, are off with
+/// --no-notify or NIRUCLIP_NOTIFY=0.
+fn notifications_on(options: &Options) -> bool {
+    !options.no_notify
+        && std::env::var_os("NIRUCLIP_NOTIFY").as_deref() != Some(std::ffi::OsStr::new("0"))
 }
 
 fn command_path(name: &str, env_name: &str) -> String {
@@ -2986,6 +2992,8 @@ fn record(options: Options, camera: &mut Option<CameraRestore>) -> Result<(), St
         path: partial.display().to_string(),
         encoder: recorder.encoder.as_str().into(),
     }];
+    // Before ffmpeg starts, so the chime is never in the recording.
+    sound::play(&options, "record-start");
     let mut child = match recorder.start_segment(&mut session, &partial)? {
         SegmentStart::Running(child) => child,
         SegmentStart::Failed {
@@ -3340,6 +3348,8 @@ fn record(options: Options, camera: &mut Option<CameraRestore>) -> Result<(), St
             }
         }
     }
+    // ffmpeg has stopped: the chime is not recorded.
+    sound::play(&options, "record-stop");
     session.child_pid = 0;
     session.child_start = 0;
     session.state = "finalizing".into();

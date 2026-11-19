@@ -360,7 +360,8 @@ NIRU Share (`nirulauncher --share`) with it.
 | `NIRUCLIP_STATE_DIR` | State directory |
 | `NIRUCLIP_CAMERA` | Camera device (default: the first non-infrared capture camera) |
 | `NIRUCLIP_VAAPI_DEVICE` | VAAPI render node |
-| `NIRUCLIP_NOTIFY=0` | Disable notifications |
+| `NIRUCLIP_NOTIFY=0` | Disable notifications (and the record sounds) |
+| `NIRUCLIP_SOUND=0` | Do not ask NIRUNOTIFY for the `record-start` / `record-stop` sounds |
 | `NIRUCLIP_FFMPEG`, `NIRUCLIP_FFPROBE`, `NIRUCLIP_FFPLAY`, `NIRUCLIP_SLOP`, `NIRUCLIP_XRANDR`, `NIRUCLIP_V4L2CTL`, `NIRUCLIP_NOTIFY_SEND`, `NIRUCLIP_LAUNCHER` | Alternative helper programs (used by the tests) |
 | `NIRUCLIP_CAMERA_MODES`, `NIRUCLIP_TEST_CAMERA_BUSY`, `NIRUCLIP_TEST_PRIVACY`, `NIRUCLIP_PROBE_DIR`, `NIRUCLIP_DEV_DIR` | Test hooks for camera modes, a busy camera, the privacy control, the live-check directory and the device directory |
 | `NIRUCLIP_TEST_CAMERA_FORMAT`, `NIRUCLIP_TEST_CAMERA_PROTOCOL`, `NIRUCLIP_SYSFS` | Test hooks: read the "camera" with another ffmpeg demuxer and protocol (a file or socket stand-in that can be removed to simulate an unplug), and a fake sysfs tree for USB power control |
