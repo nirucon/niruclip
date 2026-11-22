@@ -121,7 +121,7 @@ niruclip --share
 | Camera | `--webcam off`, `corner`, `only` |
 | Corner | `--corner top-left`, `top-right`, `bottom-left`, `bottom-right` |
 | Camera size | `--webcam-size small`, `medium` (default), `large`: 20, 26 or 34 % of the video height |
-| Camera device | `--camera DEVICE` or `auto` (default: the first camera, infrared sensors skipped) |
+| Camera device | `--camera DEVICE` or `auto` (default: a plugged-in camera (USB, dock) before the computer's own, infrared sensors skipped) |
 | Camera shape | `--camera-shape rounded` (default), `circle`, `rect` |
 | Camera border | `--camera-border theme` (default), `none`, or a hex colour such as `8aa87e` |
 | Mirroring | `--mirror`, `--no-mirror` (default: not mirrored, so text reads correctly) |

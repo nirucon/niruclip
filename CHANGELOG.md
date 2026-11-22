@@ -3,6 +3,17 @@
 All notable changes to NIRUCLIP. Earlier releases are described in their
 GitHub release notes and commit messages.
 
+## 0.8.1 (2026-11-22)
+
+### Changed
+- **A plugged-in camera comes first.** Without a chosen camera, NIRUCLIP
+  now takes a camera on a USB port, hub or dock before the laptop's own
+  (the kernel marks built-in USB devices as fixed). A docked laptop with
+  its lid closed filmed a black picture from its own camera; it now films
+  with the external one, and with the dock unplugged the built-in camera is
+  used again. `--check-camera` lists them in this order. A camera set with
+  `camera =` or `--camera` is used as before.
+
 ## 0.8.0 (2026-11-19)
 
 ### Added

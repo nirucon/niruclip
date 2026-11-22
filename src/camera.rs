@@ -314,7 +314,29 @@ fn video_index(path: &Path) -> u32 {
         .unwrap_or(u32::MAX)
 }
 
-/// Every video-capture node, regular cameras before infrared sensors.
+/// Whether a camera node belongs to a USB device the kernel marks as fixed
+/// (built into the computer: the laptop's own camera). A camera on a USB
+/// port, a hub or a dock is not. `sys` is the sysfs root ("/sys").
+pub fn built_in(device: &str, sys: &Path) -> bool {
+    let resolved = fs::canonicalize(device).unwrap_or_else(|_| PathBuf::from(device));
+    let Some(node) = resolved.file_name() else {
+        return false;
+    };
+    let Ok(interface) = fs::canonicalize(sys.join("class/video4linux").join(node).join("device"))
+    else {
+        return false;
+    };
+    // The node's device is a USB interface (3-2:1.0); its parent is the
+    // USB device (3-2) with the `removable` attribute.
+    interface
+        .parent()
+        .and_then(|usb| fs::read_to_string(usb.join("removable")).ok())
+        .is_some_and(|v| v.trim() == "fixed")
+}
+
+/// Every video-capture node: regular cameras before infrared sensors, and
+/// a plugged-in camera (USB, dock) before the computer's own, so a docked
+/// laptop with its lid closed films with the external camera.
 pub fn discover() -> Vec<Camera> {
     let dev = std::env::var("NIRUCLIP_DEV_DIR").unwrap_or_else(|_| "/dev".into());
     let mut nodes: Vec<PathBuf> = fs::read_dir(&dev)
@@ -335,7 +357,9 @@ pub fn discover() -> Vec<Camera> {
         .iter()
         .filter_map(|path| query_cached(&path.display().to_string()))
         .collect();
-    cameras.sort_by_key(|camera| camera.infrared());
+    let sys = std::env::var("NIRUCLIP_SYS_DIR").unwrap_or_else(|_| "/sys".into());
+    let sys = Path::new(&sys);
+    cameras.sort_by_cached_key(|camera| (camera.infrared(), built_in(&camera.device, sys)));
     cameras
 }
 
@@ -1309,6 +1333,26 @@ mod tests {
             choose_mode(&cam, (1280, 720)).unwrap().label(),
             "MJPG 1920x1080@30"
         );
+    }
+
+    #[test]
+    fn a_plugged_in_camera_is_not_built_in() {
+        let root = std::env::temp_dir().join(format!("niruclip-sys-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let usb = root.join("devices/pci0000:00/usb3");
+        for (dev, removable, node) in [("3-2", "fixed", "video0"), ("3-6.3.1", "unknown", "video4")]
+        {
+            let iface = usb.join(dev).join(format!("{dev}:1.0"));
+            fs::create_dir_all(&iface).unwrap();
+            fs::write(usb.join(dev).join("removable"), format!("{removable}\n")).unwrap();
+            let class = root.join("class/video4linux").join(node);
+            fs::create_dir_all(&class).unwrap();
+            std::os::unix::fs::symlink(&iface, class.join("device")).unwrap();
+        }
+        assert!(built_in("/dev/video0", &root));
+        assert!(!built_in("/dev/video4", &root));
+        assert!(!built_in("/dev/video9", &root));
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
