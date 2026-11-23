@@ -170,6 +170,16 @@ impl Mpv {
         self.set("speed", serde_json::Value::from(speed));
     }
 
+    /// Sound filters for what plays now (a voice treatment), "" for none.
+    pub fn audio_filter(&mut self, chain: &str) {
+        let value = if chain.is_empty() {
+            String::new()
+        } else {
+            format!("lavfi=[{chain}]")
+        };
+        self.set("af", serde_json::Value::from(value));
+    }
+
     pub fn stop(&mut self) {
         self.command(&["stop"]);
     }
@@ -211,7 +221,19 @@ pub fn timeline(project: &Project) -> Option<Timeline> {
     let mut edl = 0.0;
     for (i, clip) in project.clips.iter().enumerate() {
         let media = &project.media[clip.media];
-        let path = media.path.display().to_string();
+        let path = if media.is_card() {
+            // mpv's EDL takes no lavfi source: a small picture in the colour.
+            let (w, h) = if project.width > 0 {
+                (project.width, project.height)
+            } else {
+                (1920, 1080)
+            };
+            card_picture(clip.effects.card_colour, w, h)
+                .map(|p| p.display().to_string())
+                .unwrap_or_default()
+        } else {
+            media.path.display().to_string()
+        };
         let source = clip.end - clip.start;
         if i > 0 {
             url.push(';');
@@ -230,6 +252,39 @@ pub fn timeline(project: &Project) -> Option<Timeline> {
         edl += source;
     }
     Some(Timeline { url, map })
+}
+
+/// A picture of a title card's colour in the film's shape, made once.
+fn card_picture(colour: u32, w: u32, h: u32) -> Option<std::path::PathBuf> {
+    let pw = 320u32;
+    let ph = ((f64::from(h) * f64::from(pw) / f64::from(w.max(1))).round() as u32).max(2);
+    let dir = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| super::home().join(".cache"))
+        .join("niruclip");
+    let file = dir.join(format!("card-{:06x}-{pw}x{ph}.png", colour & 0xffffff));
+    if file.exists() {
+        return Some(file);
+    }
+    let _ = std::fs::create_dir_all(&dir);
+    let ok = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+        ])
+        .arg(format!("color=c=0x{:06x}:s={pw}x{ph}", colour & 0xffffff))
+        .args(["-frames:v", "1"])
+        .arg(&file)
+        .stdin(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    ok.then_some(file)
 }
 
 impl Timeline {
@@ -269,6 +324,7 @@ mod tests {
             height: 1080,
             fps: 30.0,
             still: false,
+            ..Media::default()
         });
         p.append(m, None);
         p.split(10.0);

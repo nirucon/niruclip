@@ -14,7 +14,7 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const VERSION: &str = "0.10.0";
+const VERSION: &str = "0.11.0";
 const SCHEMA: u32 = 1;
 const ACTIVE_STATES: &[&str] = &[
     "countdown",
@@ -2158,9 +2158,12 @@ fn build_plan(
         };
         // The mix keeps both sources at unity gain (normalize=0). A peak
         // limiter at 0.95 (level=0: no automatic make-up gain) only acts when
-        // the sum would clip, so levels are otherwise unchanged.
+        // the sum would clip, so levels are otherwise unchanged. The
+        // microphone and the desktop are also kept on tracks of their own,
+        // so the editor can treat the voice alone.
         audio_filters.push(format!(
-            "[{mic_label}][{}:a]amix=inputs=2:normalize=0,alimiter=limit=0.95:level=0[a]",
+            "[{mic_label}]asplit=2[mixmic][micalone];[{}:a]asplit=2[mixdesk][deskalone];\
+             [mixmic][mixdesk]amix=inputs=2:normalize=0,alimiter=limit=0.95:level=0[a]",
             audio_index + 1
         ));
     }
@@ -2173,6 +2176,26 @@ fn build_plan(
         argv.extend(["-map".into(), "[a]".into()]);
     } else if has_audio {
         argv.extend(["-map".into(), format!("{audio_index}:a:0")]);
+    }
+    if resolved.audio == Audio::Both {
+        argv.extend([
+            "-map".into(),
+            "[micalone]".into(),
+            "-map".into(),
+            "[deskalone]".into(),
+            "-metadata:s:a:0".into(),
+            "title=Mix".into(),
+            "-metadata:s:a:1".into(),
+            "title=Mic".into(),
+            "-metadata:s:a:2".into(),
+            "title=Desktop".into(),
+            "-disposition:a:0".into(),
+            "default".into(),
+            "-disposition:a:1".into(),
+            "0".into(),
+            "-disposition:a:2".into(),
+            "0".into(),
+        ]);
     }
     if vaapi {
         argv.extend([
@@ -6263,9 +6286,15 @@ mod tests {
             both.argv.iter().filter(|arg| *arg == "-channels").count(),
             1
         );
-        assert!(graphs(&both)[1]
-            .starts_with("[1:a]pan=stereo|c0=c0|c1=c1[mic];[mic][2:a]amix=inputs=2:normalize=0"));
-        assert_eq!(maps(&both), ["[v]", "[a]"]);
+        assert!(graphs(&both)[1].starts_with(
+            "[1:a]pan=stereo|c0=c0|c1=c1[mic];[mic]asplit=2[mixmic][micalone];[2:a]asplit=2[mixdesk][deskalone];[mixmic][mixdesk]amix=inputs=2:normalize=0"
+        ));
+        // The mix first (what players play), then the two sources alone.
+        assert_eq!(maps(&both), ["[v]", "[a]", "[micalone]", "[deskalone]"]);
+        assert!(both
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "-metadata:s:a:1" && w[1] == "title=Mic"));
         // Desktop audio only: a stored choice does not apply.
         options.audio = Audio::Desktop;
         let desktop = plan(&options);

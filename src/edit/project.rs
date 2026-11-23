@@ -7,7 +7,12 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-pub const SCHEMA: u32 = 1;
+/// 2: nine title positions (was top, middle, bottom), styled titles, zoom,
+/// hidden areas, voice sound, captions, logo and loudness.
+pub const SCHEMA: u32 = 2;
+
+/// The path of the built-in title card "media": a plain colour.
+pub const CARD: &str = "niruclip:card";
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Media {
@@ -27,10 +32,58 @@ pub struct Media {
     /// A still picture (png, jpg, webp): shown for the clip's length.
     #[serde(default)]
     pub still: bool,
+    /// Titles of the sound tracks, in order ("Mix", "Mic", "Desktop" in a
+    /// NIRUCLIP recording with both sources).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tracks: Vec<String>,
+    /// Captions said in this file, in its own seconds: they follow every
+    /// cut, move and speed change.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub captions: Vec<Caption>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Caption {
+    pub start: f64,
+    pub end: f64,
+    pub text: String,
 }
 
 impl Media {
+    pub fn card() -> Self {
+        Media {
+            path: PathBuf::from(CARD),
+            duration: 4.0,
+            width: 0,
+            height: 0,
+            fps: 0.0,
+            has_video: true,
+            has_audio: false,
+            still: true,
+            tracks: Vec::new(),
+            captions: Vec::new(),
+        }
+    }
+
+    pub fn is_card(&self) -> bool {
+        self.path.as_os_str() == CARD
+    }
+
+    /// The microphone and desktop tracks of a recording with both, as
+    /// audio stream indexes.
+    pub fn split_tracks(&self) -> Option<(usize, usize)> {
+        let find = |name: &str| {
+            self.tracks
+                .iter()
+                .position(|t| t.eq_ignore_ascii_case(name))
+        };
+        Some((find("mic")?, find("desktop")?))
+    }
+
     pub fn name(&self) -> String {
+        if self.is_card() {
+            return "Title card".into();
+        }
         self.path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -127,19 +180,76 @@ pub struct Effects {
     /// A text over the clip, empty is none.
     #[serde(default)]
     pub text: String,
-    /// 0 top, 1 middle, 2 bottom.
-    #[serde(default = "two")]
+    /// Nine places, row by row: 0 top left, 1 top, 2 top right, 3 left,
+    /// 4 middle, 5 right, 6 bottom left, 7 bottom, 8 bottom right.
+    #[serde(default = "seven")]
     pub text_position: u8,
     /// Height of the text as a share of the picture height, in percent.
     #[serde(default = "text_size")]
     pub text_size: f64,
+    /// Font family (fontconfig name); empty is the desktop font.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub font: String,
+    /// 0 regular, 1 bold, 2 italic, 3 bold italic.
+    #[serde(default)]
+    pub font_style: u8,
+    /// 0xRRGGBB.
+    #[serde(default = "white")]
+    pub text_colour: u32,
+    /// 0 box behind, 1 outline, 2 shadow, 3 plain.
+    #[serde(default)]
+    pub text_look: u8,
+    /// Seconds into the clip the text shows from, and for how long (0: to
+    /// the end of the clip).
+    #[serde(default)]
+    pub text_start: f64,
+    #[serde(default)]
+    pub text_length: f64,
+    /// Fade the text in and out, seconds.
+    #[serde(default)]
+    pub text_fade: f64,
+    /// Background colour of a title card, 0xRRGGBB.
+    #[serde(default = "card_colour")]
+    pub card_colour: u32,
+    /// Zoom into this part of the picture, percent x, y, w, h of the frame;
+    /// a width of 0 is no zoom.
+    #[serde(default)]
+    pub zoom_area: [f64; 4],
+    #[serde(default)]
+    pub zoom_start: f64,
+    /// 0: to the end of the clip.
+    #[serde(default)]
+    pub zoom_length: f64,
+    /// Seconds to glide in and out.
+    #[serde(default = "zoom_ramp")]
+    pub zoom_ramp: f64,
+    /// Hide part of the picture: 0 off, 1 blur, 2 pixelate, 3 black box.
+    #[serde(default)]
+    pub hide: u8,
+    /// Percent x, y, w, h of the frame.
+    #[serde(default)]
+    pub hide_area: [f64; 4],
+    #[serde(default)]
+    pub hide_start: f64,
+    #[serde(default)]
+    pub hide_length: f64,
+}
+
+fn white() -> u32 {
+    0xffffff
+}
+fn card_colour() -> u32 {
+    0x101014
+}
+fn zoom_ramp() -> f64 {
+    0.6
+}
+fn seven() -> u8 {
+    7
 }
 
 fn one() -> f64 {
     1.0
-}
-fn two() -> u8 {
-    2
 }
 fn text_size() -> f64 {
     6.0
@@ -157,8 +267,24 @@ impl Default for Effects {
             flip: false,
             crop: [0.0; 4],
             text: String::new(),
-            text_position: 2,
+            text_position: 7,
             text_size: 6.0,
+            font: String::new(),
+            font_style: 0,
+            text_colour: 0xffffff,
+            text_look: 0,
+            text_start: 0.0,
+            text_length: 0.0,
+            text_fade: 0.0,
+            card_colour: 0x101014,
+            zoom_area: [0.0; 4],
+            zoom_start: 0.0,
+            zoom_length: 0.0,
+            zoom_ramp: 0.6,
+            hide: 0,
+            hide_area: [0.0; 4],
+            hide_start: 0.0,
+            hide_length: 0.0,
         }
     }
 }
@@ -177,6 +303,26 @@ impl Effects {
     pub fn has_crop(&self) -> bool {
         self.crop.iter().any(|c| *c > 1e-6)
     }
+
+    pub fn has_zoom(&self) -> bool {
+        self.zoom_area[2] > 0.5 && self.zoom_area[3] > 0.5
+    }
+
+    pub fn has_hide(&self) -> bool {
+        self.hide > 0 && self.hide_area[2] > 0.5 && self.hide_area[3] > 0.5
+    }
+}
+
+/// When something in a clip shows: from `start` for `length` seconds (0 is
+/// to the end), within a clip `clip` seconds long.
+pub fn window(start: f64, length: f64, clip: f64) -> (f64, f64) {
+    let a = start.clamp(0.0, clip);
+    let b = if length > 0.0 {
+        (a + length).min(clip)
+    } else {
+        clip
+    };
+    (a, b.max(a))
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -206,6 +352,13 @@ pub struct Clip {
     pub transition_length: f64,
     #[serde(default)]
     pub effects: Effects,
+    /// Sound treatment: 0 off, 1 voice, 2 voice in a noisy room, 3 even out.
+    #[serde(default)]
+    pub voice: u8,
+    /// Level of the desktop sound against the microphone, in a recording
+    /// with both on their own tracks.
+    #[serde(default = "one")]
+    pub desktop_volume: f64,
 }
 
 fn transition_length() -> f64 {
@@ -226,6 +379,8 @@ impl Clip {
             transition: None,
             transition_length: 0.8,
             effects: Effects::default(),
+            voice: 0,
+            desktop_volume: 1.0,
         }
     }
 
@@ -282,6 +437,58 @@ pub struct Project {
     pub height: u32,
     #[serde(default)]
     pub fps: f64,
+    /// Loudness of the finished film: 0 off, 1 speech and web (-16 LUFS),
+    /// 2 streaming (-14 LUFS), 3 broadcast (-23 LUFS).
+    #[serde(default)]
+    pub loudness: u8,
+    /// Lower the music while someone speaks: 0 off, 1 a little, 2 a lot.
+    #[serde(default)]
+    pub duck: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logo: Option<Logo>,
+    /// Caption text size: 0 small, 1 medium, 2 large.
+    #[serde(default = "one_u8")]
+    pub caption_size: u8,
+}
+
+fn one_u8() -> u8 {
+    1
+}
+
+/// A picture over the whole film, such as a logo or a watermark.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Logo {
+    pub path: PathBuf,
+    /// 0 top left, 1 top right, 2 bottom left, 3 bottom right.
+    #[serde(default = "logo_corner")]
+    pub corner: u8,
+    /// Width as a share of the picture width, percent.
+    #[serde(default = "logo_size")]
+    pub size: f64,
+    /// 0..1.
+    #[serde(default = "logo_opacity")]
+    pub opacity: f64,
+}
+
+fn logo_corner() -> u8 {
+    1
+}
+fn logo_size() -> f64 {
+    12.0
+}
+fn logo_opacity() -> f64 {
+    0.8
+}
+
+impl Logo {
+    pub fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            corner: 1,
+            size: 12.0,
+            opacity: 0.8,
+        }
+    }
 }
 
 impl Default for Project {
@@ -294,6 +501,12 @@ impl Default for Project {
             width: 0,
             height: 0,
             fps: 0.0,
+            // New films are levelled for speech; older projects keep what
+            // they had (off).
+            loudness: 1,
+            duck: 1,
+            logo: None,
+            caption_size: 1,
         }
     }
 }
@@ -311,12 +524,28 @@ impl Project {
                 project.schema
             ));
         }
+        if project.schema < 2 {
+            // Top, middle, bottom became three of nine places.
+            for clip in &mut project.clips {
+                let e = &mut clip.effects;
+                e.text_position = match e.text_position {
+                    0 => 1,
+                    1 => 4,
+                    _ => 7,
+                };
+            }
+        }
         project.schema = SCHEMA;
         // Relative media paths are relative to the project file.
         let base = path.parent().unwrap_or(Path::new("."));
         for media in &mut project.media {
-            if media.path.is_relative() {
+            if media.path.is_relative() && !media.is_card() {
                 media.path = base.join(&media.path);
+            }
+        }
+        if let Some(logo) = &mut project.logo {
+            if logo.path.is_relative() {
+                logo.path = base.join(&logo.path);
             }
         }
         project.repair();
@@ -348,7 +577,98 @@ impl Project {
             clip.speed = clip.speed.clamp(0.25, 4.0);
             clip.volume = clip.volume.clamp(0.0, 4.0);
             clip.transition_length = clip.transition_length.clamp(0.1, 5.0);
+            clip.desktop_volume = clip.desktop_volume.clamp(0.0, 4.0);
+            clip.voice = clip.voice.min(3);
+            let e = &mut clip.effects;
+            e.text_position = e.text_position.min(8);
+            e.font_style = e.font_style.min(3);
+            e.text_look = e.text_look.min(3);
+            e.hide = e.hide.min(3);
+            for area in [&mut e.zoom_area, &mut e.hide_area] {
+                area[0] = area[0].clamp(0.0, 100.0);
+                area[1] = area[1].clamp(0.0, 100.0);
+                area[2] = area[2].clamp(0.0, 100.0 - area[0]);
+                area[3] = area[3].clamp(0.0, 100.0 - area[1]);
+            }
         }
+        self.loudness = self.loudness.min(3);
+        self.duck = self.duck.min(2);
+        self.caption_size = self.caption_size.min(2);
+    }
+
+    /// Every caption as it lands in the finished film: (start, end, text),
+    /// in film order. A caption cut by an edit shows in the part that stays.
+    pub fn film_captions(&self) -> Vec<(f64, f64, String)> {
+        let starts = self.starts();
+        let mut out = Vec::new();
+        for (i, clip) in self.clips.iter().enumerate() {
+            let media = &self.media[clip.media];
+            for c in &media.captions {
+                let a = c.start.max(clip.start);
+                let b = c.end.min(clip.end);
+                if b - a < 0.05 {
+                    continue;
+                }
+                let speed = clip.speed.max(0.01);
+                let fa = starts[i] + (a - clip.start) / speed;
+                let fb = starts[i] + (b - clip.start) / speed;
+                out.push((fa, fb, c.text.clone()));
+            }
+        }
+        out.sort_by(|x, y| x.0.total_cmp(&y.0));
+        // A caption cut in two by a join reads as one.
+        let mut merged: Vec<(f64, f64, String)> = Vec::with_capacity(out.len());
+        for c in out {
+            if let Some(last) = merged.last_mut() {
+                if last.2 == c.2 && (c.0 - last.1).abs() < 0.05 {
+                    last.1 = last.1.max(c.1);
+                    continue;
+                }
+            }
+            merged.push(c);
+        }
+        merged
+    }
+
+    /// The source pieces behind a stretch of the film: (media, from, to).
+    pub fn sources(&self, a: f64, b: f64) -> Vec<(usize, f64, f64)> {
+        let starts = self.starts();
+        let mut out = Vec::new();
+        for (i, clip) in self.clips.iter().enumerate() {
+            let s = starts[i];
+            let e = s + clip.length();
+            let lo = a.max(s);
+            let hi = b.min(e);
+            if hi - lo < 0.02 {
+                continue;
+            }
+            out.push((clip.media, clip.source_at(lo - s), clip.source_at(hi - s)));
+        }
+        out
+    }
+
+    /// Replace the captions with ones made for the film's times.
+    pub fn set_film_captions(&mut self, captions: &[(f64, f64, String)]) {
+        for m in &mut self.media {
+            m.captions.clear();
+        }
+        for (a, b, text) in captions {
+            for (m, from, to) in self.sources(*a, *b) {
+                self.media[m].captions.push(Caption {
+                    start: from,
+                    end: to,
+                    text: text.clone(),
+                });
+            }
+        }
+        for m in &mut self.media {
+            m.captions.sort_by(|x, y| x.start.total_cmp(&y.start));
+            m.captions.dedup();
+        }
+    }
+
+    pub fn caption_count(&self) -> usize {
+        self.media.iter().map(|m| m.captions.len()).sum()
     }
 
     pub fn duration(&self) -> f64 {
@@ -404,6 +724,15 @@ impl Project {
         } else {
             Some((0, 0.0))
         }
+    }
+
+    /// The one title card media of the project.
+    pub fn card(&mut self) -> usize {
+        if let Some(i) = self.media.iter().position(Media::is_card) {
+            return i;
+        }
+        self.media.push(Media::card());
+        self.media.len() - 1
     }
 
     pub fn add_media(&mut self, media: Media) -> usize {
@@ -532,6 +861,7 @@ mod tests {
                 has_video: true,
                 has_audio: true,
                 still: false,
+                ..Media::default()
             });
             p.append(m, None);
         }
@@ -593,5 +923,52 @@ mod tests {
         let text = serde_json::to_string(&p).unwrap();
         let back: Project = serde_json::from_str(&text).unwrap();
         assert_eq!(back, p);
+    }
+
+    #[test]
+    fn captions_follow_the_cuts() {
+        let mut p = project(&[10.0]);
+        p.set_film_captions(&[(1.0, 2.0, "one".into()), (6.0, 7.0, "two".into())]);
+        assert_eq!(p.caption_count(), 2);
+        p.remove_range(3.0, 5.0);
+        let c = p.film_captions();
+        assert_eq!(c.len(), 2);
+        assert!((c[1].0 - 4.0).abs() < 1e-6, "{c:?}");
+        p.clips[0].speed = 2.0;
+        let c = p.film_captions();
+        assert!((c[0].0 - 0.5).abs() < 1e-6);
+        // One caption over a cut stays one caption.
+        let mut p = project(&[10.0]);
+        p.set_film_captions(&[(1.0, 6.0, "across".into())]);
+        p.split(3.0);
+        assert_eq!(p.caption_count(), 1);
+        p.set_film_captions(&p.film_captions());
+        assert_eq!(p.caption_count(), 2, "stored per piece");
+        assert_eq!(p.film_captions().len(), 1, "shown as one");
+    }
+
+    #[test]
+    fn an_old_project_keeps_its_title_places() {
+        let dir = std::env::temp_dir().join(format!("niruclip-schema-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("old.niruclip");
+        std::fs::write(
+            &file,
+            r#"{"schema":1,"media":[{"path":"/v/a.mkv","duration":5,"has_video":true}],
+            "clips":[{"media":0,"start":0,"end":5,"effects":{"text":"Hi","text_position":0}}]}"#,
+        )
+        .unwrap();
+        let p = Project::load(&file).unwrap();
+        assert_eq!(p.clips[0].effects.text_position, 1);
+        assert_eq!(p.loudness, 0, "an old film keeps its sound");
+        assert_eq!(Project::default().loudness, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_window_stays_inside_the_clip() {
+        assert_eq!(window(1.0, 0.0, 5.0), (1.0, 5.0));
+        assert_eq!(window(1.0, 2.0, 5.0), (1.0, 3.0));
+        assert_eq!(window(7.0, 2.0, 5.0), (5.0, 5.0));
     }
 }

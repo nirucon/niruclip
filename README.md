@@ -26,7 +26,9 @@ sources are never changed. See [Editing](#editing).
 ## Features
 
 - Full screen, region, window rectangle or camera-only recording.
-- Microphone, desktop audio or both (mixed at unity gain with a peak limiter).
+- Microphone, desktop audio or both (mixed at unity gain with a peak limiter,
+  and also kept on tracks of their own, titled Mic and Desktop, so the
+  editor can treat the voice alone).
   The microphone can be chosen per recording or profile (the webcam mic, an
   audio interface input) without changing the system default.
 - Camera overlay in any corner at three sizes, rounded, circular or square,
@@ -67,7 +69,8 @@ sources are never changed. See [Editing](#editing).
 - X11 (Debian, Arch and Void glibc, x86_64). The released binary is a static
   x86_64 musl build.
 - `ffmpeg` (with `ffprobe`), `slop` for region capture, `xrandr`.
-- For the editor: `mpv` (the preview) and a TrueType font (DejaVu or Noto).
+- For the editor: `mpv` (the preview) and a TrueType font (DejaVu or Noto);
+  `nirudictate` with a speech model for captions.
 - For camera and microphone: a V4L2 camera, `v4l2-ctl` (`v4l-utils`) and
   PipeWire's PulseAudio interface.
 - Optional: `notify-send`, a VAAPI driver for hardware encoding.
@@ -157,6 +160,7 @@ niruclip edit                      # start empty: open or import from the Videos
 niruclip edit recording.mkv b.mp4  # these videos on the timeline
 niruclip edit film.niruclip        # a saved project
 niruclip edit --export film.niruclip --format mp4 --height 1080   # render without a window
+niruclip edit --export film.niruclip --limit 10 --captions burn   # fit 10 MB, captions in the picture
 ```
 
 The window has the media you imported on the left, the preview in the
@@ -173,12 +177,16 @@ NIRUX theme and is made for the keyboard; F1 shows every key.
 | I, O, X, C | Mark the start and end of a part, cut it out, or keep only it |
 | Delete | Remove the clip (or the marked part) |
 | Alt+← → | Move the clip earlier or later |
-| M, T | Mute the clip, write a title over it |
+| M, T | Mute the clip, write a title over it (`|` starts a new line) |
+| Ctrl+T | A title card: text on a colour |
 | P | Preview with effects and transitions |
 | Tab | Timeline, settings panel, media list |
 | Ctrl+O, Ctrl+I, Ctrl+M | Open, import, add music |
 | Ctrl+S, Ctrl+E, Ctrl+Z | Save, export, undo (Ctrl+Y redo) |
 | Ctrl+R | Record from the editor |
+| Ctrl+F | The whole film: loudness, music under speech, logo, caption size |
+| Ctrl+K | Cut pauses |
+| Ctrl+L | Captions from the speech |
 
 With the mouse: drag media from the list to the timeline, drag clips to
 reorder them, drag their edges to trim, Shift+drag on the ruler to mark a
@@ -188,8 +196,49 @@ part, the wheel scrolls the timeline (Ctrl+wheel zooms).
 volume and mute, fade in and out, a transition from the clip before (cross
 fade, dissolve, through black or white, wipes, slides, circle, pixelize),
 brightness, contrast, colour (0 is black and white), blur, sharpen,
-rotate, mirror, crop and a title with position and size. Music sits under
-the film with its own volume and fades.
+rotate, mirror and crop. The panel shows only what applies: the rest of a
+group appears once its first setting is in use.
+
+**Titles**: any font installed on the computer (the list shows each name
+in its own letters; a font without the letters of the text falls back to
+the usual one), regular, bold, italic or bold italic, eight colours, a box
+behind, an outline, a shadow or plain, nine places, a size, when it starts
+and how long it lasts, and a fade. Templates set a heading, a name tag or a
+subtitle bar in one go. Several lines are written with `|`. A title card
+(Ctrl+T or + Card) is text on a colour of its own, as a clip.
+
+**Sound for speech**: a clip's treatment can be Voice (rumble out, light
+noise reduction, softer s sounds, an even level), Voice in a noisy room
+(stronger noise reduction) or Even out (for other sound). It is heard live
+in the preview. A recording with both microphone and desktop sound has
+them on tracks of their own: the treatment then works on the voice alone
+and the desktop sound has its own level. Recordings made from the editor
+with a microphone get Voice from the start. For the whole film (Ctrl+F):
+the loudness, measured first and then levelled in a second pass to
+−16 LUFS for speech and the web (the default for new films), −14 for
+streaming or −23 for broadcast, with a peak limiter; and the music, which
+can be lowered a little or a lot while someone speaks.
+
+**Cut pauses** (Ctrl+K): finds the silences longer than a chosen length
+(0.5 to 2 s), below an automatic or a chosen level, marks them red on the
+timeline and cuts them with Enter, keeping a little air around the speech.
+Ctrl+Z brings them back.
+
+**Captions** (Ctrl+L): made from the speech, in Swedish or English, by
+NIRUDICTATE on this computer (nothing leaves it; it needs `nirudictate`
+with a model, `nirudictate models install sv-small`). They are made in the
+background, cut into readable parts at the pauses, and follow every later
+cut, move and speed change. Edit or remove them in the list. At export
+they are left out, burnt into the picture, or added as a subtitle track
+with an `.srt` file beside the film.
+
+**Zoom and hide**: drag a rectangle on a still of the clip to zoom into
+that part (it glides in and out, from a chosen time for a chosen while), or
+to blur, pixelate or black out a part, such as an e-mail address or a
+password field, for as long as needed.
+
+**Logo**: a picture over the whole film in a corner, with a size and a
+strength (Ctrl+F).
 
 **Preview**: the timeline plays live in mpv, on the graphics card, with
 every cut. Speed changes, effects and transitions are shown as they will be
@@ -203,9 +252,11 @@ jpg, webp, bmp, tif.
 
 **Export**: MP4 (H.264 and AAC), a small MP4 to share, WebM (VP9 and Opus),
 MKV (high quality), GIF, and sound only as MP3, WAV, FLAC or Opus; at the
-original size or 2160p to 480p. With a part marked, only that part is
-exported. The export runs in the background with progress in the top bar
-and a notification when it is done.
+original size or 2160p to 480p. A size limit (8, 10 for Discord, 25 for
+mail, 50 or 100 MB) encodes in two passes so the file lands just under it,
+and picks a smaller picture when the film is too long for the size. With a
+part marked, only that part is exported. The export runs in the background
+with progress in the top bar and a notification when it is done.
 
 **Record from the editor**: Ctrl+R (or Record) chooses full screen (and
 which screen), a window, an area or the camera only; no sound, the

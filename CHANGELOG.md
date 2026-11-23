@@ -3,6 +3,47 @@
 All notable changes to NIRUCLIP. Earlier releases are described in their
 GitHub release notes and commit messages.
 
+## 0.11.0 (2026-11-23)
+
+### Added
+- **Titles in any installed font**, in four styles and eight colours, with
+  a box, an outline, a shadow or plain, in nine places, with their own
+  start, length and fade, over several lines (`|`). Templates for a
+  heading, a name tag and a subtitle bar. A font without the letters of
+  the text falls back to the usual one.
+- **Title cards** (Ctrl+T, + Card): text on a colour, as a clip.
+- **Sound for speech**: per clip Voice, Voice in a noisy room or Even out,
+  heard live in the preview; recordings from the editor with a microphone
+  get Voice from the start.
+- **Loudness**: the film is measured and levelled in two passes to −16 LUFS
+  (new films), −14 or −23, with a peak limiter.
+- **Music under speech**: the music is lowered a little or a lot while the
+  film speaks.
+- **Microphone and desktop on their own tracks**: a recording with both
+  keeps a mix (what players play) plus the two sources alone, so the editor
+  treats the voice without the desktop sound and gives the desktop its own
+  level.
+- **Cut pauses** (Ctrl+K): silences longer than a chosen length, at an
+  automatic or chosen level, shown on the timeline and cut in one go.
+- **Captions** (Ctrl+L): made from the speech by NIRUDICTATE, on this
+  computer, in Swedish or English; edited in a list; they follow every
+  edit. Burnt in, or as a subtitle track and an `.srt` at export.
+- **Zoom** into a part of the picture, gliding in and out, and **hide** a
+  part (blur, pixelate, black box) for a while; both drawn on a still of
+  the clip.
+- **Logo** over the whole film, in a corner, with size and strength.
+- **Size limit** at export (8, 10, 25, 50, 100 MB): two passes, a smaller
+  picture when needed. `--limit MB` and `--captions burn|track` for
+  `niruclip edit --export`.
+- The panel shows only the settings that apply to the clip.
+
+### Changed
+- Projects are schema 2. Older projects open with their titles in the same
+  place and their sound as before (no levelling).
+- A sound-only export no longer decodes the picture.
+- ffmpeg and nirudictate helpers end with the editor, also when it is
+  killed.
+
 ## 0.10.0 (2026-11-23)
 
 ### Added

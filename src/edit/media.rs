@@ -72,7 +72,7 @@ impl Cache {
 
     /// Ask for a media file's thumbnails and peaks; they arrive on `rx`.
     pub fn want(&mut self, media: &super::project::Media) {
-        if self.asked.contains_key(&media.path) {
+        if media.is_card() || self.asked.contains_key(&media.path) {
             return;
         }
         self.asked.insert(media.path.clone(), ());

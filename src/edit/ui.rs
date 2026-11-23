@@ -5,9 +5,9 @@ use super::gfx::{Canvas, Text};
 use super::job::Job;
 use super::media::{Cache, PEAKS_PER_SECOND, THUMB_H};
 use super::mpv::{self, Mpv, Timeline};
-use super::project::{AudioClip, Clip, History, Project, Transition};
+use super::project::{AudioClip, Clip, History, Media, Project, Transition};
 use super::record::{self, Recording};
-use super::{probe, Settings, Theme};
+use super::{analyze, probe, Settings, Theme};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use x11rb::connection::Connection;
@@ -96,6 +96,18 @@ enum Action {
     Recover,
     Record,
     RecordStart,
+    Film,
+    Pauses,
+    PausesApply,
+    Captions,
+    CaptionsMake,
+    CaptionEdit,
+    CaptionDelete,
+    Card,
+    AreaAccept,
+    AreaClear,
+    AreaWhole,
+    FontAccept,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -120,8 +132,15 @@ enum Hit {
     Height(usize),
     /// Inside a dialog: nothing, but the click does not fall through.
     Block,
-    /// A choice in the record dialog: row and option.
+    /// A choice in a dialog of choices (record, film, pauses): row and
+    /// option.
     Choice(usize, usize),
+    Limit(usize),
+    CaptionMode(usize),
+    /// A row in the caption or font list.
+    ListRow(usize),
+    /// The still in the area picker.
+    AreaImage,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -183,6 +202,12 @@ enum Drag {
         y0: i32,
         active: bool,
     },
+    /// Drawing the rectangle of the area picker, from (fx, fy).
+    Area {
+        fx: f64,
+        fy: f64,
+        image: Rect,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -192,8 +217,11 @@ enum Param {
     Mute,
     FadeIn,
     FadeOut,
+    Voice,
+    DesktopVolume,
     Transition,
     TransitionLength,
+    CardColour,
     Brightness,
     Contrast,
     Saturation,
@@ -205,22 +233,42 @@ enum Param {
     CropTop,
     CropRight,
     CropBottom,
+    ZoomArea,
+    ZoomStart,
+    ZoomLength,
+    ZoomRamp,
+    HideKind,
+    HideArea,
+    HideStart,
+    HideLength,
     Title,
+    Template,
+    Font,
+    FontStyle,
+    TextColour,
+    TextLook,
     TitlePosition,
     TitleSize,
+    TextStart,
+    TextLength,
+    TextFade,
     MusicVolume,
     MusicFadeIn,
     MusicFadeOut,
 }
 
-const CLIP_PARAMS: [Param; 21] = [
+/// Every clip setting, in the order the panel shows them.
+const ALL_CLIP_PARAMS: [Param; 40] = [
     Param::Speed,
     Param::Volume,
     Param::Mute,
     Param::FadeIn,
     Param::FadeOut,
+    Param::Voice,
+    Param::DesktopVolume,
     Param::Transition,
     Param::TransitionLength,
+    Param::CardColour,
     Param::Brightness,
     Param::Contrast,
     Param::Saturation,
@@ -232,17 +280,149 @@ const CLIP_PARAMS: [Param; 21] = [
     Param::CropTop,
     Param::CropRight,
     Param::CropBottom,
+    Param::ZoomArea,
+    Param::ZoomStart,
+    Param::ZoomLength,
+    Param::ZoomRamp,
+    Param::HideKind,
+    Param::HideArea,
+    Param::HideStart,
+    Param::HideLength,
     Param::Title,
+    Param::Template,
+    Param::Font,
+    Param::FontStyle,
+    Param::TextColour,
+    Param::TextLook,
     Param::TitlePosition,
     Param::TitleSize,
+    Param::TextStart,
+    Param::TextLength,
+    Param::TextFade,
 ];
 const MUSIC_PARAMS: [Param; 3] = [Param::MusicVolume, Param::MusicFadeIn, Param::MusicFadeOut];
+
+/// The settings that apply to this clip: the rest of a group shows once
+/// its first setting is in use.
+fn clip_params(c: &Clip, m: &Media) -> Vec<Param> {
+    let e = &c.effects;
+    let card = m.is_card();
+    ALL_CLIP_PARAMS
+        .iter()
+        .copied()
+        .filter(|p| match p {
+            Param::Speed => !m.still,
+            Param::Volume | Param::Mute => m.has_audio && !m.still,
+            Param::Voice => m.has_audio && !m.still,
+            Param::DesktopVolume => m.split_tracks().is_some(),
+            Param::TransitionLength => c.transition.is_some(),
+            Param::CardColour => card,
+            Param::Brightness
+            | Param::Contrast
+            | Param::Saturation
+            | Param::Blur
+            | Param::Sharpen
+            | Param::Rotate
+            | Param::Mirror
+            | Param::CropLeft
+            | Param::CropTop
+            | Param::CropRight
+            | Param::CropBottom
+            | Param::ZoomArea
+            | Param::HideKind => !card && m.has_video,
+            Param::ZoomStart | Param::ZoomLength | Param::ZoomRamp => !card && e.has_zoom(),
+            Param::HideArea | Param::HideStart | Param::HideLength => !card && e.hide > 0,
+            Param::Template
+            | Param::Font
+            | Param::FontStyle
+            | Param::TextColour
+            | Param::TextLook
+            | Param::TitlePosition
+            | Param::TitleSize
+            | Param::TextStart
+            | Param::TextLength
+            | Param::TextFade => !e.text.trim().is_empty(),
+            _ => true,
+        })
+        .collect()
+}
+
+/// Text colours to choose from.
+const TEXT_COLOURS: [(u32, &str); 8] = [
+    (0xffffff, "White"),
+    (0xffd84d, "Yellow"),
+    (0x000000, "Black"),
+    (0x7aa2f7, "Blue"),
+    (0xff6b6b, "Red"),
+    (0x6bd68a, "Green"),
+    (0xff9f43, "Orange"),
+    (0xb8b8c0, "Grey"),
+];
+
+/// Title card backgrounds.
+const CARD_COLOURS: [(u32, &str); 8] = [
+    (0x101014, "Near black"),
+    (0x000000, "Black"),
+    (0xffffff, "White"),
+    (0x1e2a4a, "Navy"),
+    (0x2f4a3a, "Forest"),
+    (0x5a1f2a, "Wine"),
+    (0x3a3a42, "Slate"),
+    (0xf4ecd8, "Cream"),
+];
+
+const PLACES: [&str; 9] = [
+    "Top left",
+    "Top",
+    "Top right",
+    "Left",
+    "Middle",
+    "Right",
+    "Bottom left",
+    "Bottom",
+    "Bottom right",
+];
+const LOOKS: [&str; 4] = ["Box behind", "Outline", "Shadow", "Plain"];
+const HIDES: [&str; 4] = ["Off", "Blur", "Pixelate", "Black box"];
+const TEMPLATES: [&str; 4] = ["Custom", "Heading", "Name tag", "Subtitle bar"];
+
+/// (position, size, look, style, start, length, fade) of each template.
+fn template(i: usize) -> Option<(u8, f64, u8, u8, f64, f64, f64)> {
+    match i {
+        1 => Some((4, 10.0, 2, 1, 0.0, 0.0, 0.5)),
+        2 => Some((6, 5.0, 0, 1, 0.5, 5.0, 0.4)),
+        3 => Some((7, 5.0, 0, 0, 0.0, 0.0, 0.0)),
+        _ => None,
+    }
+}
+
+fn template_of(e: &super::project::Effects) -> usize {
+    (1..TEMPLATES.len())
+        .find(|i| {
+            template(*i).is_some_and(|(pos, size, look, style, start, length, fade)| {
+                e.text_position == pos
+                    && (e.text_size - size).abs() < 1e-6
+                    && e.text_look == look
+                    && e.font_style == style
+                    && (e.text_start - start).abs() < 1e-6
+                    && (e.text_length - length).abs() < 1e-6
+                    && (e.text_fade - fade).abs() < 1e-6
+            })
+        })
+        .unwrap_or(0)
+}
+
+fn palette_index(list: &[(u32, &str)], colour: u32) -> usize {
+    list.iter().position(|(c, _)| *c == colour).unwrap_or(0)
+}
 
 impl Param {
     fn group(self) -> &'static str {
         match self {
             Param::Speed | Param::Volume | Param::Mute | Param::FadeIn | Param::FadeOut => "Clip",
+            Param::Voice | Param::DesktopVolume => "Sound",
             Param::Transition | Param::TransitionLength => "Transition into this clip",
+            Param::CardColour => "Title card",
             Param::Brightness
             | Param::Contrast
             | Param::Saturation
@@ -251,7 +431,21 @@ impl Param {
             | Param::Rotate
             | Param::Mirror => "Picture",
             Param::CropLeft | Param::CropTop | Param::CropRight | Param::CropBottom => "Crop",
-            Param::Title | Param::TitlePosition | Param::TitleSize => "Title",
+            Param::ZoomArea | Param::ZoomStart | Param::ZoomLength | Param::ZoomRamp => "Zoom",
+            Param::HideKind | Param::HideArea | Param::HideStart | Param::HideLength => {
+                "Hide part of the picture"
+            }
+            Param::Title
+            | Param::Template
+            | Param::Font
+            | Param::FontStyle
+            | Param::TextColour
+            | Param::TextLook
+            | Param::TitlePosition
+            | Param::TitleSize
+            | Param::TextStart
+            | Param::TextLength
+            | Param::TextFade => "Title",
             Param::MusicVolume | Param::MusicFadeIn | Param::MusicFadeOut => "Music",
         }
     }
@@ -263,8 +457,11 @@ impl Param {
             Param::Mute => "Sound",
             Param::FadeIn | Param::MusicFadeIn => "Fade in",
             Param::FadeOut | Param::MusicFadeOut => "Fade out",
+            Param::Voice => "Treatment",
+            Param::DesktopVolume => "Desktop",
             Param::Transition => "Kind",
             Param::TransitionLength => "Length",
+            Param::CardColour => "Background",
             Param::Brightness => "Brightness",
             Param::Contrast => "Contrast",
             Param::Saturation => "Colour",
@@ -276,9 +473,34 @@ impl Param {
             Param::CropTop => "Top",
             Param::CropRight => "Right",
             Param::CropBottom => "Bottom",
+            Param::ZoomArea | Param::HideArea => "Area",
+            Param::ZoomStart | Param::HideStart | Param::TextStart => "Starts at",
+            Param::ZoomLength | Param::HideLength | Param::TextLength => "Lasts",
+            Param::ZoomRamp => "Glide",
+            Param::HideKind => "How",
             Param::Title => "Text",
+            Param::Template => "Template",
+            Param::Font => "Font",
+            Param::FontStyle => "Style",
+            Param::TextColour => "Colour",
+            Param::TextLook => "Look",
             Param::TitlePosition => "Position",
             Param::TitleSize => "Size",
+            Param::TextFade => "Fade",
+        }
+    }
+
+    /// (min, max, step); times inside the clip go to its length.
+    fn limits(self, c: &Clip) -> (f64, f64, f64) {
+        let len = c.length().max(0.1);
+        match self {
+            Param::ZoomStart
+            | Param::ZoomLength
+            | Param::HideStart
+            | Param::HideLength
+            | Param::TextStart
+            | Param::TextLength => (0.0, (len * 10.0).floor() / 10.0, 0.1),
+            _ => self.range(),
         }
     }
 
@@ -287,13 +509,16 @@ impl Param {
         match self {
             Param::Speed => (0.25, 4.0, 0.25),
             Param::Volume => (0.0, 4.0, 0.1),
+            Param::DesktopVolume => (0.0, 2.0, 0.05),
             Param::MusicVolume => (0.0, 2.0, 0.05),
             Param::Mute | Param::Mirror => (0.0, 1.0, 1.0),
             Param::FadeIn | Param::FadeOut | Param::MusicFadeIn | Param::MusicFadeOut => {
                 (0.0, 5.0, 0.25)
             }
+            Param::Voice => (0.0, 3.0, 1.0),
             Param::Transition => (0.0, Transition::ALL.len() as f64, 1.0),
             Param::TransitionLength => (0.2, 3.0, 0.1),
+            Param::CardColour => (0.0, (CARD_COLOURS.len() - 1) as f64, 1.0),
             Param::Brightness => (-0.5, 0.5, 0.05),
             Param::Contrast => (0.5, 2.0, 0.05),
             Param::Saturation => (0.0, 2.0, 0.1),
@@ -303,9 +528,22 @@ impl Param {
             Param::CropLeft | Param::CropTop | Param::CropRight | Param::CropBottom => {
                 (0.0, 40.0, 1.0)
             }
-            Param::Title => (0.0, 0.0, 0.0),
-            Param::TitlePosition => (0.0, 2.0, 1.0),
+            Param::ZoomRamp => (0.1, 3.0, 0.1),
+            Param::HideKind => (0.0, 3.0, 1.0),
+            Param::Template => (0.0, (TEMPLATES.len() - 1) as f64, 1.0),
+            Param::FontStyle => (0.0, 3.0, 1.0),
+            Param::TextColour => (0.0, (TEXT_COLOURS.len() - 1) as f64, 1.0),
+            Param::TextLook => (0.0, 3.0, 1.0),
+            Param::TitlePosition => (0.0, 8.0, 1.0),
             Param::TitleSize => (2.0, 20.0, 1.0),
+            Param::TextFade => (0.0, 2.0, 0.1),
+            Param::ZoomStart
+            | Param::ZoomLength
+            | Param::HideStart
+            | Param::HideLength
+            | Param::TextStart
+            | Param::TextLength => (0.0, 60.0, 0.1),
+            Param::Title | Param::Font | Param::ZoomArea | Param::HideArea => (0.0, 0.0, 0.0),
         }
     }
 
@@ -314,10 +552,41 @@ impl Param {
             self,
             Param::Mute
                 | Param::Mirror
+                | Param::Voice
                 | Param::Transition
+                | Param::CardColour
                 | Param::Rotate
+                | Param::HideKind
+                | Param::Template
+                | Param::FontStyle
+                | Param::TextColour
+                | Param::TextLook
                 | Param::Title
+                | Param::Font
+                | Param::ZoomArea
+                | Param::HideArea
                 | Param::TitlePosition
+        )
+    }
+
+    /// A row that opens a dialog instead of stepping a value.
+    fn opens(self) -> bool {
+        matches!(
+            self,
+            Param::Title | Param::Font | Param::ZoomArea | Param::HideArea
+        )
+    }
+
+    /// A start or a length: Enter takes it from the playhead.
+    fn is_time(self) -> bool {
+        matches!(
+            self,
+            Param::ZoomStart
+                | Param::ZoomLength
+                | Param::HideStart
+                | Param::HideLength
+                | Param::TextStart
+                | Param::TextLength
         )
     }
 
@@ -329,12 +598,15 @@ impl Param {
             Param::Mute => f64::from(u8::from(c.mute)),
             Param::FadeIn => c.fade_in,
             Param::FadeOut => c.fade_out,
+            Param::Voice => f64::from(c.voice),
+            Param::DesktopVolume => c.desktop_volume,
             Param::Transition => c
                 .transition
                 .and_then(|t| Transition::ALL.iter().position(|x| *x == t))
                 .map(|i| i as f64 + 1.0)
                 .unwrap_or(0.0),
             Param::TransitionLength => c.transition_length,
+            Param::CardColour => palette_index(&CARD_COLOURS, e.card_colour) as f64,
             Param::Brightness => e.brightness,
             Param::Contrast => e.contrast,
             Param::Saturation => e.saturation,
@@ -346,15 +618,27 @@ impl Param {
             Param::CropTop => e.crop[1],
             Param::CropRight => e.crop[2],
             Param::CropBottom => e.crop[3],
-            Param::Title => 0.0,
+            Param::ZoomStart => e.zoom_start,
+            Param::ZoomLength => e.zoom_length,
+            Param::ZoomRamp => e.zoom_ramp,
+            Param::HideKind => f64::from(e.hide),
+            Param::HideStart => e.hide_start,
+            Param::HideLength => e.hide_length,
+            Param::Template => template_of(e) as f64,
+            Param::FontStyle => f64::from(e.font_style),
+            Param::TextColour => palette_index(&TEXT_COLOURS, e.text_colour) as f64,
+            Param::TextLook => f64::from(e.text_look),
             Param::TitlePosition => f64::from(e.text_position),
             Param::TitleSize => e.text_size,
+            Param::TextStart => e.text_start,
+            Param::TextLength => e.text_length,
+            Param::TextFade => e.text_fade,
             _ => 0.0,
         }
     }
 
     fn set(self, c: &mut Clip, v: f64) {
-        let (lo, hi, _) = self.range();
+        let (lo, hi, _) = self.limits(c);
         let v = v.clamp(lo, hi);
         let e = &mut c.effects;
         match self {
@@ -363,6 +647,8 @@ impl Param {
             Param::Mute => c.mute = v >= 0.5,
             Param::FadeIn => c.fade_in = v,
             Param::FadeOut => c.fade_out = v,
+            Param::Voice => c.voice = v.round() as u8,
+            Param::DesktopVolume => c.desktop_volume = v,
             Param::Transition => {
                 let i = v.round() as usize;
                 c.transition = if i == 0 {
@@ -372,6 +658,7 @@ impl Param {
                 };
             }
             Param::TransitionLength => c.transition_length = v,
+            Param::CardColour => e.card_colour = CARD_COLOURS[v.round() as usize].0,
             Param::Brightness => e.brightness = v,
             Param::Contrast => e.contrast = v,
             Param::Saturation => e.saturation = v,
@@ -383,23 +670,64 @@ impl Param {
             Param::CropTop => e.crop[1] = v,
             Param::CropRight => e.crop[2] = v,
             Param::CropBottom => e.crop[3] = v,
+            Param::ZoomStart => e.zoom_start = v,
+            Param::ZoomLength => e.zoom_length = v,
+            Param::ZoomRamp => e.zoom_ramp = v,
+            Param::HideKind => {
+                e.hide = v.round() as u8;
+                if e.hide > 0 && e.hide_area[2] < 0.5 {
+                    // A sensible first area: the middle of the picture.
+                    e.hide_area = [35.0, 35.0, 30.0, 30.0];
+                }
+            }
+            Param::HideStart => e.hide_start = v,
+            Param::HideLength => e.hide_length = v,
+            Param::Template => {
+                if let Some((pos, size, look, style, start, length, fade)) =
+                    template(v.round() as usize)
+                {
+                    e.text_position = pos;
+                    e.text_size = size;
+                    e.text_look = look;
+                    e.font_style = style;
+                    e.text_start = start;
+                    e.text_length = length;
+                    e.text_fade = fade;
+                }
+            }
+            Param::FontStyle => e.font_style = v.round() as u8,
+            Param::TextColour => e.text_colour = TEXT_COLOURS[v.round() as usize].0,
+            Param::TextLook => e.text_look = v.round() as u8,
             Param::TitlePosition => e.text_position = v.round() as u8,
             Param::TitleSize => e.text_size = v,
+            Param::TextStart => e.text_start = v,
+            Param::TextLength => e.text_length = v,
+            Param::TextFade => e.text_fade = v,
             _ => {}
         }
     }
 
     fn show(self, c: &Clip) -> String {
         let v = self.get(c);
+        let e = &c.effects;
+        let seconds = |v: f64, zero: &str| {
+            if v <= 0.0 {
+                zero.to_string()
+            } else {
+                format!("{v:.1} s")
+            }
+        };
         match self {
             Param::Speed => format!("{v:.2}×"),
-            Param::Volume => format!("{:.0} %", v * 100.0),
+            Param::Volume | Param::DesktopVolume => format!("{:.0} %", v * 100.0),
             Param::Mute => if c.mute { "Muted" } else { "On" }.into(),
             Param::FadeIn | Param::FadeOut | Param::TransitionLength => format!("{v:.2} s"),
+            Param::Voice => export::VOICE[c.voice.min(3) as usize].into(),
             Param::Transition => match c.transition {
                 Some(t) => t.label().into(),
                 None => "Cut (none)".into(),
             },
+            Param::CardColour => CARD_COLOURS[v as usize].1.into(),
             Param::Brightness => format!("{:+.0}", v * 100.0),
             Param::Contrast | Param::Saturation => format!("{:.0} %", v * 100.0),
             Param::Blur => {
@@ -417,19 +745,53 @@ impl Param {
                 }
             }
             Param::Rotate => format!("{}°", (v as u32) * 90),
-            Param::Mirror => if c.effects.flip { "On" } else { "Off" }.into(),
+            Param::Mirror => if e.flip { "On" } else { "Off" }.into(),
             Param::CropLeft | Param::CropTop | Param::CropRight | Param::CropBottom => {
                 format!("{v:.0} %")
             }
-            Param::Title => {
-                if c.effects.text.is_empty() {
-                    "None (Enter to write)".into()
+            Param::ZoomArea => {
+                if e.has_zoom() {
+                    format!("{:.0} % of the width (Enter)", e.zoom_area[2])
                 } else {
-                    c.effects.text.clone()
+                    "Off (Enter to choose)".into()
                 }
             }
-            Param::TitlePosition => ["Top", "Middle", "Bottom"][(v as usize).min(2)].into(),
+            Param::HideArea => format!(
+                "{:.0}×{:.0} % at {:.0},{:.0} (Enter)",
+                e.hide_area[2], e.hide_area[3], e.hide_area[0], e.hide_area[1]
+            ),
+            Param::ZoomStart | Param::HideStart | Param::TextStart => seconds(v, "The start"),
+            Param::ZoomLength | Param::HideLength | Param::TextLength => seconds(v, "To the end"),
+            Param::ZoomRamp => format!("{v:.1} s"),
+            Param::HideKind => HIDES[e.hide.min(3) as usize].into(),
+            Param::Title => {
+                if e.text.is_empty() {
+                    "None (Enter to write)".into()
+                } else {
+                    e.text.replace('\n', " ⏎ ")
+                }
+            }
+            Param::Template => TEMPLATES[v as usize].into(),
+            Param::Font => {
+                if e.font.is_empty() {
+                    "Desktop font (Enter)".into()
+                } else {
+                    e.font.clone()
+                }
+            }
+            Param::FontStyle => super::fonts::STYLES[e.font_style.min(3) as usize].into(),
+            Param::TextColour => {
+                let i = palette_index(&TEXT_COLOURS, e.text_colour);
+                if TEXT_COLOURS[i].0 == e.text_colour {
+                    TEXT_COLOURS[i].1.into()
+                } else {
+                    format!("#{:06x}", e.text_colour)
+                }
+            }
+            Param::TextLook => LOOKS[e.text_look.min(3) as usize].into(),
+            Param::TitlePosition => PLACES[(v as usize).min(8)].into(),
             Param::TitleSize => format!("{v:.0} %"),
+            Param::TextFade => seconds(v, "None"),
             _ => String::new(),
         }
     }
@@ -475,19 +837,102 @@ enum Overlay {
         text: String,
         target: TextTarget,
     },
+    /// Settings of the whole film: loudness, music, logo, captions.
+    Film {
+        row: usize,
+    },
+    Pauses(PauseForm),
+    Captions(CaptionForm),
+    Fonts(FontPicker),
+    Area(AreaPicker),
 }
 
 #[derive(Clone, Copy)]
 enum TextTarget {
     Title(usize),
     ExportName,
+    /// A caption, by its place in the film's list.
+    Caption(usize),
 }
 
 struct ExportForm {
     format: usize,
     height: usize,
     name: String,
+    /// Index into export::LIMITS.
+    limit: usize,
+    /// See export::CAPTIONS.
+    captions: usize,
 }
+
+/// Finding pauses: shortest pause, level, air kept around the speech.
+struct PauseForm {
+    row: usize,
+    choice: [usize; 3],
+}
+
+const PAUSE_MIN: [f64; 4] = [0.5, 0.8, 1.2, 2.0];
+const PAUSE_LEVEL: [(&str, f64); 5] = [
+    ("Automatic", 0.0),
+    ("−50 dB", -50.0),
+    ("−45 dB", -45.0),
+    ("−40 dB", -40.0),
+    ("−35 dB", -35.0),
+];
+const PAUSE_KEEP: [f64; 3] = [0.1, 0.2, 0.35];
+
+struct CaptionForm {
+    selected: usize,
+    language: usize,
+}
+
+struct FontPicker {
+    clip: usize,
+    list: Vec<super::fonts::Family>,
+    filter: String,
+    selected: usize,
+}
+
+impl FontPicker {
+    /// Row 0 is the desktop font, then the families under the filter.
+    fn visible(&self) -> Vec<Option<&super::fonts::Family>> {
+        let f = self.filter.to_lowercase();
+        let mut out = vec![None];
+        out.extend(
+            self.list
+                .iter()
+                .filter(|x| f.is_empty() || x.name.to_lowercase().contains(&f))
+                .map(Some),
+        );
+        out
+    }
+}
+
+/// Drawing a rectangle on a still of the clip: the zoom or the hidden part.
+struct AreaPicker {
+    clip: usize,
+    zoom: bool,
+    image: Vec<u32>,
+    iw: i32,
+    ih: i32,
+    /// Percent x, y, w, h.
+    rect: [f64; 4],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum FilmRow {
+    Loudness,
+    Duck,
+    Logo,
+    LogoCorner,
+    LogoSize,
+    LogoOpacity,
+    CaptionSize,
+}
+
+const LOGO_CORNERS: [&str; 4] = ["Top left", "Top right", "Bottom left", "Bottom right"];
+const LOGO_SIZES: [f64; 5] = [6.0, 9.0, 12.0, 16.0, 20.0];
+const LOGO_OPACITY: [f64; 4] = [0.4, 0.6, 0.8, 1.0];
 
 enum Preview {
     /// The live EDL of the timeline.
@@ -538,12 +983,22 @@ struct State {
     last_click: Option<(Hit, Instant)>,
     /// A recording started from the editor; the window hides meanwhile.
     recording: Option<Recording>,
+    /// The film's sound levels, for the project they were measured on.
+    levels: Option<(Project, analyze::Levels)>,
+    levels_task: Option<analyze::Task>,
+    /// Captions being made, from this snapshot of the project.
+    caption_task: Option<(analyze::Task, Project)>,
+    caption_progress: Option<(f64, String)>,
+    /// The voice treatment mpv plays with now (255: not set yet).
+    live_voice: u8,
 }
 
 struct Painter {
     cv: Canvas,
     tx: Text,
     hits: Vec<(Rect, Hit)>,
+    /// Fonts loaded to show their own names in the font list.
+    fonts: std::collections::HashMap<PathBuf, Option<Text>>,
 }
 
 struct Layout {
@@ -715,6 +1170,7 @@ pub fn run(files: Vec<PathBuf>) -> Result<(), String> {
         cv: Canvas::new(&c, w, h),
         tx: Text::new(theme.font.as_deref())?,
         hits: Vec::new(),
+        fonts: std::collections::HashMap::new(),
     };
     let mut st = State {
         theme,
@@ -754,6 +1210,11 @@ pub fn run(files: Vec<PathBuf>) -> Result<(), String> {
         nudge: false,
         last_click: None,
         recording: None,
+        levels: None,
+        levels_task: None,
+        caption_task: None,
+        caption_progress: None,
+        live_voice: 255,
     };
     for f in files {
         if probe::is_project(&f) {
@@ -883,6 +1344,7 @@ pub fn run(files: Vec<PathBuf>) -> Result<(), String> {
                     match Mpv::start(video, &runtime) {
                         Ok(m) => {
                             st.mpv = Some(m);
+                            st.live_voice = 255;
                             st.reload(true);
                         }
                         Err(e) => st.warn(e),
@@ -1179,6 +1641,53 @@ impl State {
                 mpv::Event::Loaded => self.nudge = true,
             }
         }
+        if any {
+            self.sync_voice();
+        }
+        // Listening for pauses.
+        if let Some(task) = &self.levels_task {
+            let mut done = None;
+            while let Ok(msg) = task.rx.try_recv() {
+                match msg {
+                    analyze::Msg::Levels(l) => done = Some(Ok(l)),
+                    analyze::Msg::Failed(e) => done = Some(Err(e)),
+                    _ => {}
+                }
+            }
+            if let Some(result) = done {
+                any = true;
+                self.levels_task = None;
+                match result {
+                    Ok(l) => self.levels = Some((self.project.clone(), l)),
+                    Err(e) => self.warn(format!("Could not listen to the film: {e}")),
+                }
+            }
+        }
+        // Captions.
+        if let Some((task, _)) = &self.caption_task {
+            let mut done = None;
+            while let Ok(msg) = task.rx.try_recv() {
+                any = true;
+                match msg {
+                    analyze::Msg::Progress(f, text) => self.caption_progress = Some((f, text)),
+                    analyze::Msg::Captions(list) => done = Some(Ok(list)),
+                    analyze::Msg::Failed(e) => done = Some(Err(e)),
+                    analyze::Msg::Levels(_) => {}
+                }
+            }
+            if let Some(result) = done {
+                let (_, mut snapshot) = self.caption_task.take().expect("a caption task");
+                self.caption_progress = None;
+                match result {
+                    Ok(list) if list.is_empty() => self.warn("No words were recognised."),
+                    Ok(list) => self.take_captions(&mut snapshot, &list),
+                    Err(e) => {
+                        self.warn(format!("Captions: {e}"));
+                        notify("Captions failed", &e);
+                    }
+                }
+            }
+        }
         // A recording started from here.
         if let Some(r) = &mut self.recording {
             if let Some(done) = r.poll() {
@@ -1201,7 +1710,13 @@ impl State {
                 self.job = None;
                 match result {
                     Ok(()) => {
-                        self.say(format!("Exported {} in {} s", out.display(), took));
+                        let size = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+                        self.say(format!(
+                            "Exported {} ({}) in {} s",
+                            out.display(),
+                            human_size(size),
+                            took
+                        ));
                         notify("Film exported", &out.display().to_string());
                     }
                     Err(e) => {
@@ -1471,6 +1986,21 @@ impl State {
         }
         let dir = b.dir.clone();
         self.overlay = Overlay::None;
+        if purpose == Purpose::Logo {
+            let path = entry.path.clone();
+            self.change(|p| {
+                let mut logo = super::project::Logo::new(path);
+                if let Some(old) = &p.logo {
+                    logo.corner = old.corner;
+                    logo.size = old.size;
+                    logo.opacity = old.opacity;
+                }
+                p.logo = Some(logo);
+            });
+            self.overlay = Overlay::Film { row: 2 };
+            self.say("Logo added over the whole film. P shows it rendered.");
+            return;
+        }
         if purpose != Purpose::Music {
             self.settings.media_folder = Some(dir);
             self.settings.save();
@@ -1529,6 +2059,11 @@ impl State {
 
     /// Put a finished recording on the timeline.
     fn add_recording(&mut self, path: &Path, place: Option<f64>) {
+        let mic = self
+            .settings
+            .record
+            .as_ref()
+            .is_some_and(|c| c.sound == 1 || c.sound == 3);
         let media = match probe::probe(path) {
             Ok(m) => m,
             Err(e) => {
@@ -1552,6 +2087,11 @@ impl State {
                 None => p.clips.len(),
             };
             index = p.append(i, Some(at));
+            // Speech recorded here gets the voice treatment from the start.
+            let m = &p.media[i];
+            if m.has_audio && (m.split_tracks().is_some() || mic) {
+                p.clips[index].voice = 1;
+            }
         });
         self.selected = Some(index);
         self.bin_selected = self.project.media.len().saturating_sub(1);
@@ -1585,10 +2125,26 @@ impl State {
             .and_then(|p| p.file_stem())
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| self.suggested_name());
+        let limit = export::LIMITS
+            .iter()
+            .position(|l| Some(*l) == self.settings.limit_mb)
+            .unwrap_or(0);
+        let captions = self
+            .settings
+            .captions
+            .map(|c| c as usize)
+            .unwrap_or(if self.project.caption_count() > 0 {
+                2
+            } else {
+                0
+            })
+            .min(export::CAPTIONS.len() - 1);
         self.overlay = Overlay::Export(ExportForm {
             format,
             height,
             name,
+            limit,
+            captions,
         });
     }
 
@@ -1602,6 +2158,14 @@ impl State {
         }
         let format = Format::ALL[form.format];
         let height = HEIGHTS[form.height];
+        let (form_limit, form_captions) = (form.limit, form.captions);
+        let form = ExportForm {
+            format: form.format,
+            height: form.height,
+            name: form.name.clone(),
+            limit: form_limit,
+            captions: form_captions,
+        };
         let folder = self.settings.export_folder();
         let _ = std::fs::create_dir_all(&folder);
         let name = form.name.trim();
@@ -1614,15 +2178,19 @@ impl State {
             (Some(a), Some(b)) if (b - a).abs() > 0.1 => Some((a.min(b), a.max(b))),
             _ => None,
         };
-        let settings = export::Settings {
-            format,
-            height,
-            output: output.clone(),
-            font: super::gfx::font_path(self.theme.font.as_deref()).map(PathBuf::from),
-            work: self.work.clone(),
-            range,
-            draft: false,
-        };
+        let limit_mb = export::LIMITS[form.limit];
+        let captions = form.captions as u8;
+        self.settings.limit_mb = Some(limit_mb);
+        if self.project.caption_count() > 0 {
+            self.settings.captions = Some(captions);
+        }
+        self.settings.save();
+        let mut settings = export::Settings::new(format, output.clone(), self.work.clone());
+        settings.height = height;
+        settings.font = super::gfx::font_path(self.theme.font.as_deref()).map(PathBuf::from);
+        settings.range = range;
+        settings.limit_mb = limit_mb;
+        settings.captions = captions;
         match export::plan(&self.project, &settings)
             .and_then(|plan| Job::start(plan, output.clone()))
         {
@@ -1661,15 +2229,13 @@ impl State {
             }
         };
         let output = self.work.join(format!("preview-{}.mp4", now_ms()));
-        let settings = export::Settings {
-            format: Format::Mp4,
-            height: 720.min(self.project.height.max(2)),
-            output: output.clone(),
-            font: super::gfx::font_path(self.theme.font.as_deref()).map(PathBuf::from),
-            work: self.work.clone(),
-            range: Some((a, b)),
-            draft: true,
-        };
+        let mut settings = export::Settings::new(Format::Mp4, output.clone(), self.work.clone());
+        settings.height = 720.min(self.project.height.max(2));
+        settings.font = super::gfx::font_path(self.theme.font.as_deref()).map(PathBuf::from);
+        settings.range = Some((a, b));
+        settings.draft = true;
+        // The preview shows captions as they would be burnt in.
+        settings.captions = u8::from(self.project.caption_count() > 0);
         match export::plan(&self.project, &settings).and_then(|plan| Job::start(plan, output)) {
             Ok(job) => {
                 self.preview_job = Some((job, a));
@@ -1688,6 +2254,17 @@ impl State {
             .or_else(|| self.project.locate(self.playhead).map(|(i, _)| i))
     }
 
+    /// The settings rows of the clip the panel shows.
+    fn params(&self) -> Vec<Param> {
+        match self.target() {
+            Some(i) => {
+                let c = &self.project.clips[i];
+                clip_params(c, &self.project.media[c.media])
+            }
+            None => Vec::new(),
+        }
+    }
+
     fn adjust(&mut self, row: usize, delta: f64) {
         if let Some(j) = self.music_selected {
             let Some(param) = MUSIC_PARAMS.get(row).copied() else {
@@ -1701,14 +2278,14 @@ impl State {
             return;
         }
         let Some(i) = self.target() else { return };
-        let Some(param) = CLIP_PARAMS.get(row).copied() else {
+        let Some(param) = self.params().get(row).copied() else {
             return;
         };
-        if param == Param::Title {
-            self.edit_title(i);
+        if param.opens() {
+            self.open_param(i, param);
             return;
         }
-        let (lo, hi, step) = param.range();
+        let (lo, hi, step) = param.limits(&self.project.clips[i]);
         self.change(|p| {
             let c = &mut p.clips[i];
             let mut v = param.get(c) + delta * step;
@@ -1722,6 +2299,50 @@ impl State {
         if param == Param::Transition && i == 0 && self.project.clips[0].transition.is_some() {
             self.say("The first clip has nothing to blend from: use Fade in instead.");
         }
+        if param == Param::Voice {
+            self.live_voice = 255;
+            self.sync_voice();
+        }
+    }
+
+    /// Enter on a row: open its dialog, take a time from the playhead, or
+    /// step a choice.
+    fn enter_param(&mut self, row: usize) {
+        let Some(i) = self.target() else { return };
+        let Some(param) = self.params().get(row).copied() else {
+            return;
+        };
+        if param.opens() {
+            self.open_param(i, param);
+        } else if param.is_time() {
+            let start = self.project.starts()[i];
+            let local = (self.playhead - start).clamp(0.0, self.project.clips[i].length());
+            let e = &self.project.clips[i].effects;
+            let value = match param {
+                Param::ZoomLength => local - e.zoom_start,
+                Param::HideLength => local - e.hide_start,
+                Param::TextLength => local - e.text_start,
+                _ => local,
+            };
+            if value <= 0.0 {
+                self.warn("Move the playhead past the start first.");
+                return;
+            }
+            self.change(|p| param.set(&mut p.clips[i], value));
+            self.say(format!("{} set from the playhead", param.label()));
+        } else {
+            self.adjust(row, 1.0);
+        }
+    }
+
+    fn open_param(&mut self, i: usize, param: Param) {
+        match param {
+            Param::Title => self.edit_title(i),
+            Param::Font => self.open_fonts(i),
+            Param::ZoomArea => self.open_area(i, true),
+            Param::HideArea => self.open_area(i, false),
+            _ => {}
+        }
     }
 
     fn set_param(&mut self, row: usize, value: f64) {
@@ -1732,18 +2353,488 @@ impl State {
             return;
         }
         let Some(i) = self.target() else { return };
-        if let Some(param) = CLIP_PARAMS.get(row).copied() {
+        if let Some(param) = self.params().get(row).copied() {
             self.change(|p| param.set(&mut p.clips[i], value));
         }
     }
 
     fn edit_title(&mut self, i: usize) {
-        let text = self.project.clips[i].effects.text.clone();
+        let text = self.project.clips[i].effects.text.replace('\n', " | ");
         self.overlay = Overlay::TextInput {
-            title: "Title text over this clip (empty removes it)".into(),
+            title: "Title text (| starts a new line, empty removes it)".into(),
             text,
             target: TextTarget::Title(i),
         };
+    }
+
+    /// A title card after the clip under the playhead.
+    fn add_card(&mut self) {
+        let at = match self.project.locate(self.playhead) {
+            Some((i, _)) => i + 1,
+            None => 0,
+        };
+        let mut index = 0;
+        self.change(|p| {
+            let m = p.card();
+            let mut c = Clip::new(m, 0.0, 4.0);
+            c.effects.text = "Title".into();
+            c.effects.text_position = 4;
+            c.effects.text_size = 10.0;
+            c.effects.text_look = 3;
+            c.effects.font_style = 1;
+            c.fade_in = 0.5;
+            c.fade_out = 0.5;
+            let at = at.min(p.clips.len());
+            p.clips.insert(at, c);
+            index = at;
+        });
+        self.selected = Some(index);
+        self.music_selected = None;
+        self.fitted = false;
+        let start = self.project.starts()[index];
+        self.seek(start);
+        // Typing replaces the placeholder; Esc keeps it.
+        self.overlay = Overlay::TextInput {
+            title: "Text on the card (| starts a new line)".into(),
+            text: String::new(),
+            target: TextTarget::Title(index),
+        };
+    }
+
+    fn open_fonts(&mut self, i: usize) {
+        let list = super::fonts::families();
+        if list.is_empty() {
+            self.warn("No fonts found: fontconfig (fc-list) is missing.");
+            return;
+        }
+        let current = self.project.clips[i].effects.font.clone();
+        let mut f = FontPicker {
+            clip: i,
+            list,
+            filter: String::new(),
+            selected: 0,
+        };
+        if let Some(k) = f
+            .visible()
+            .iter()
+            .position(|x| x.is_some_and(|x| x.name == current))
+        {
+            f.selected = k;
+        }
+        self.overlay = Overlay::Fonts(f);
+    }
+
+    fn accept_font(&mut self) {
+        let Overlay::Fonts(f) = &self.overlay else {
+            return;
+        };
+        let i = f.clip;
+        let name = f
+            .visible()
+            .get(f.selected)
+            .copied()
+            .flatten()
+            .map(|x| x.name.clone())
+            .unwrap_or_default();
+        self.overlay = Overlay::None;
+        if i < self.project.clips.len() {
+            let shown = if name.is_empty() {
+                "the desktop font".to_string()
+            } else {
+                name.clone()
+            };
+            self.change(|p| p.clips[i].effects.font = name);
+            self.say(format!("Font: {shown}. P shows it rendered."));
+        }
+    }
+
+    /// A still of the clip at the playhead (or its start), as the film shows it.
+    fn grab_frame(&self, i: usize) -> Result<(Vec<u32>, i32, i32), String> {
+        let clip = &self.project.clips[i];
+        let media = &self.project.media[clip.media];
+        let (w, h, _) = export::frame(&self.project, 0, Format::Mp4);
+        let dw = w.min(1280);
+        let dh = ((f64::from(h) * f64::from(dw) / f64::from(w)) / 2.0).round() as u32 * 2;
+        if media.is_card() || !media.has_video {
+            let colour = if media.is_card() {
+                clip.effects.card_colour
+            } else {
+                0
+            };
+            return Ok((vec![colour; (dw * dh) as usize], dw as i32, dh as i32));
+        }
+        let start = self.project.starts()[i];
+        let local = (self.playhead - start).clamp(0.0, clip.length());
+        let source = if media.still {
+            0.0
+        } else {
+            clip.source_at(local)
+        };
+        let chain = format!("{},scale={dw}:{dh}", export::frame_chain(clip, w, h));
+        let out = std::process::Command::new("ffmpeg")
+            .args(["-hide_banner", "-nostdin", "-loglevel", "error", "-ss"])
+            .arg(format!("{source:.3}"))
+            .arg("-i")
+            .arg(&media.path)
+            .args(["-frames:v", "1", "-vf", &chain])
+            .args(["-f", "rawvideo", "-pix_fmt", "bgra", "pipe:1"])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .map_err(|e| format!("ffmpeg could not start: {e}"))?;
+        let want = (dw * dh * 4) as usize;
+        if out.stdout.len() < want {
+            return Err("could not read a picture from the clip".into());
+        }
+        let image = out.stdout[..want]
+            .chunks_exact(4)
+            .map(|b| (u32::from(b[2]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[0]))
+            .collect();
+        Ok((image, dw as i32, dh as i32))
+    }
+
+    fn open_area(&mut self, i: usize, zoom: bool) {
+        self.play(false);
+        match self.grab_frame(i) {
+            Ok((image, iw, ih)) => {
+                let e = &self.project.clips[i].effects;
+                let rect = if zoom {
+                    if e.has_zoom() {
+                        e.zoom_area
+                    } else {
+                        [25.0, 25.0, 50.0, 50.0]
+                    }
+                } else {
+                    e.hide_area
+                };
+                self.overlay = Overlay::Area(AreaPicker {
+                    clip: i,
+                    zoom,
+                    image,
+                    iw,
+                    ih,
+                    rect,
+                });
+            }
+            Err(e) => self.warn(e),
+        }
+    }
+
+    fn accept_area(&mut self, clear: bool) {
+        let Overlay::Area(a) = &self.overlay else {
+            return;
+        };
+        let (i, zoom, rect) = (a.clip, a.zoom, a.rect);
+        self.overlay = Overlay::None;
+        if i >= self.project.clips.len() {
+            return;
+        }
+        self.change(|p| {
+            let e = &mut p.clips[i].effects;
+            match (zoom, clear) {
+                (true, true) => e.zoom_area = [0.0; 4],
+                (true, false) => e.zoom_area = rect,
+                (false, true) => e.hide = 0,
+                (false, false) => {
+                    e.hide_area = rect;
+                    if e.hide == 0 {
+                        e.hide = 1;
+                    }
+                }
+            }
+        });
+        self.say(match (zoom, clear) {
+            (true, true) => "Zoom removed",
+            (true, false) => "Zoom set: P shows it rendered",
+            (false, true) => "The picture shows whole again",
+            (false, false) => "Area hidden: P shows it rendered",
+        });
+    }
+
+    // ── Film settings, pauses and captions ──────────────────────────────
+
+    fn film_rows(&self) -> Vec<FilmRow> {
+        let mut rows = vec![FilmRow::Loudness, FilmRow::Duck, FilmRow::Logo];
+        if self.project.logo.is_some() {
+            rows.extend([FilmRow::LogoCorner, FilmRow::LogoSize, FilmRow::LogoOpacity]);
+        }
+        rows.push(FilmRow::CaptionSize);
+        rows
+    }
+
+    fn film_options(&self, row: FilmRow) -> (&'static str, Vec<String>, usize) {
+        let p = &self.project;
+        let list = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let nearest = |list: &[f64], v: f64| {
+            list.iter()
+                .enumerate()
+                .min_by(|a, b| (a.1 - v).abs().total_cmp(&(b.1 - v).abs()))
+                .map(|(i, _)| i)
+                .unwrap_or(0)
+        };
+        match row {
+            FilmRow::Loudness => (
+                "Loudness",
+                export::LOUDNESS
+                    .iter()
+                    .map(|(l, _)| l.to_string())
+                    .collect(),
+                p.loudness as usize,
+            ),
+            FilmRow::Duck => (
+                "Music under speech",
+                list(&["As it is", "A little lower", "Much lower"]),
+                p.duck as usize,
+            ),
+            FilmRow::Logo => match &p.logo {
+                Some(l) => {
+                    let name = l
+                        .path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    (
+                        "Logo",
+                        vec!["None".into(), name, "Choose another…".into()],
+                        1,
+                    )
+                }
+                None => ("Logo", list(&["None", "Choose a picture…"]), 0),
+            },
+            FilmRow::LogoCorner => (
+                "Logo corner",
+                list(&LOGO_CORNERS),
+                p.logo.as_ref().map(|l| l.corner as usize).unwrap_or(1),
+            ),
+            FilmRow::LogoSize => (
+                "Logo size",
+                LOGO_SIZES.iter().map(|v| format!("{v:.0} %")).collect(),
+                nearest(&LOGO_SIZES, p.logo.as_ref().map(|l| l.size).unwrap_or(12.0)),
+            ),
+            FilmRow::LogoOpacity => (
+                "Logo strength",
+                LOGO_OPACITY
+                    .iter()
+                    .map(|v| format!("{:.0} %", v * 100.0))
+                    .collect(),
+                nearest(
+                    &LOGO_OPACITY,
+                    p.logo.as_ref().map(|l| l.opacity).unwrap_or(0.8),
+                ),
+            ),
+            FilmRow::CaptionSize => (
+                "Caption size",
+                list(&["Small", "Medium", "Large"]),
+                p.caption_size as usize,
+            ),
+        }
+    }
+
+    fn film_set(&mut self, row: FilmRow, i: usize) {
+        match row {
+            FilmRow::Loudness => self.change(|p| p.loudness = i as u8),
+            FilmRow::Duck => self.change(|p| p.duck = i as u8),
+            FilmRow::Logo => {
+                let has = self.project.logo.is_some();
+                if i == 0 {
+                    self.change(|p| p.logo = None);
+                } else if !has || i == 2 {
+                    self.browse(Purpose::Logo);
+                }
+            }
+            FilmRow::LogoCorner => self.change(|p| {
+                if let Some(l) = &mut p.logo {
+                    l.corner = i as u8;
+                }
+            }),
+            FilmRow::LogoSize => self.change(|p| {
+                if let Some(l) = &mut p.logo {
+                    l.size = LOGO_SIZES[i];
+                }
+            }),
+            FilmRow::LogoOpacity => self.change(|p| {
+                if let Some(l) = &mut p.logo {
+                    l.opacity = LOGO_OPACITY[i];
+                }
+            }),
+            FilmRow::CaptionSize => self.change(|p| p.caption_size = i as u8),
+        }
+    }
+
+    fn film_step(&mut self, row: FilmRow, delta: isize) {
+        let (_, opts, chosen) = self.film_options(row);
+        if row == FilmRow::Logo {
+            return;
+        }
+        let n = opts.len() as isize;
+        let i = (chosen as isize + delta).rem_euclid(n) as usize;
+        self.film_set(row, i);
+    }
+
+    fn open_pauses(&mut self) {
+        if self.project.clips.is_empty() {
+            return;
+        }
+        self.play(false);
+        let choice = self.settings.pauses.unwrap_or([1, 0, 1]);
+        let choice = [
+            choice[0].min(PAUSE_MIN.len() - 1),
+            choice[1].min(PAUSE_LEVEL.len() - 1),
+            choice[2].min(PAUSE_KEEP.len() - 1),
+        ];
+        self.overlay = Overlay::Pauses(PauseForm { row: 0, choice });
+        let fresh = self
+            .levels
+            .as_ref()
+            .is_some_and(|(p, _)| *p == self.project);
+        if !fresh && self.levels_task.is_none() {
+            self.levels = None;
+            self.levels_task = Some(analyze::levels(self.project.clone(), self.work.clone()));
+        }
+    }
+
+    /// The pauses the dialog's choices find, in film seconds.
+    fn found_pauses(&self) -> Option<Vec<(f64, f64)>> {
+        let Overlay::Pauses(f) = &self.overlay else {
+            return None;
+        };
+        let (_, levels) = self.levels.as_ref()?;
+        let level = PAUSE_LEVEL[f.choice[1]].1;
+        let threshold = if level == 0.0 {
+            levels.auto_threshold()
+        } else {
+            level
+        };
+        Some(analyze::pauses(
+            levels,
+            threshold,
+            PAUSE_MIN[f.choice[0]],
+            PAUSE_KEEP[f.choice[2]],
+        ))
+    }
+
+    fn apply_pauses(&mut self) {
+        let Some(found) = self.found_pauses() else {
+            self.warn("Still listening to the film…");
+            return;
+        };
+        if let Overlay::Pauses(f) = &self.overlay {
+            self.settings.pauses = Some(f.choice);
+            self.settings.save();
+        }
+        self.overlay = Overlay::None;
+        if found.is_empty() {
+            self.say("No pauses to cut");
+            return;
+        }
+        let before = self.project.duration();
+        self.change(|p| {
+            for (a, b) in found.iter().rev() {
+                p.remove_range(*a, *b);
+            }
+        });
+        let saved = before - self.project.duration();
+        self.seek(0.0);
+        self.fitted = false;
+        self.say(format!(
+            "Cut {} pauses, {} shorter. Ctrl+Z brings them back.",
+            found.len(),
+            clock(saved)
+        ));
+    }
+
+    fn open_captions(&mut self) {
+        let language = analyze::LANGUAGES
+            .iter()
+            .position(|(_, code)| Some(*code) == self.settings.caption_language.as_deref())
+            .unwrap_or(0);
+        self.play(false);
+        self.overlay = Overlay::Captions(CaptionForm {
+            selected: 0,
+            language,
+        });
+    }
+
+    fn make_captions(&mut self) {
+        if self.project.clips.is_empty() {
+            return;
+        }
+        if self.caption_task.is_some() {
+            self.warn("Captions are already being made.");
+            return;
+        }
+        if !analyze::have_nirudictate() {
+            self.warn("Captions need NIRUDICTATE: nirux extras install nirudictate");
+            return;
+        }
+        let language = match &self.overlay {
+            Overlay::Captions(f) => f.language,
+            _ => 0,
+        };
+        let (_, code) = analyze::LANGUAGES[language];
+        self.settings.caption_language = Some(code.to_string());
+        self.settings.save();
+        let snapshot = self.project.clone();
+        let task = analyze::captions(snapshot.clone(), self.work.clone(), code);
+        self.caption_task = Some((task, snapshot));
+        self.caption_progress = Some((0.0, "Starting…".into()));
+        self.say("Making captions in the background: keep working meanwhile.");
+    }
+
+    /// Put made captions into the project, by media file: they were made
+    /// on a snapshot, and the film may have changed since.
+    fn take_captions(&mut self, snapshot: &mut Project, list: &[(f64, f64, String)]) {
+        snapshot.set_film_captions(list);
+        let n = list.len();
+        self.change(|p| {
+            for m in &mut p.media {
+                if let Some(src) = snapshot.media.iter().find(|s| s.path == m.path) {
+                    m.captions = src.captions.clone();
+                }
+            }
+        });
+        self.say(format!(
+            "{n} captions made. Edit them in Captions (Ctrl+L)."
+        ));
+        notify("Captions ready", &format!("{n} captions"));
+    }
+
+    fn edit_caption(&mut self, k: usize) {
+        let list = self.project.film_captions();
+        if let Some((a, _, text)) = list.get(k) {
+            let at = *a;
+            self.seek(at);
+            self.overlay = Overlay::TextInput {
+                title: format!("Caption at {}", clock(at)),
+                text: text.clone(),
+                target: TextTarget::Caption(k),
+            };
+        }
+    }
+
+    fn delete_caption(&mut self, k: usize) {
+        let mut list = self.project.film_captions();
+        if k < list.len() {
+            list.remove(k);
+            self.change(|p| p.set_film_captions(&list));
+        }
+    }
+
+    /// Play the voice treatment of the clip under the playhead live.
+    fn sync_voice(&mut self) {
+        let voice = match self.preview {
+            Preview::Timeline => self
+                .project
+                .locate(self.playhead)
+                .map(|(i, _)| self.project.clips[i].voice)
+                .unwrap_or(0),
+            Preview::Rendered { .. } => 0,
+        };
+        if voice != self.live_voice {
+            self.live_voice = voice;
+            if let Some(m) = &mut self.mpv {
+                m.audio_filter(export::voice_chain(voice));
+            }
+        }
     }
 
     fn split(&mut self) {
@@ -1880,7 +2971,13 @@ impl State {
         match &mut self.overlay {
             Overlay::TextInput { text, target, .. } => {
                 match sym {
-                    K_ESCAPE => self.overlay = Overlay::None,
+                    K_ESCAPE => {
+                        let back = matches!(target, TextTarget::Caption(_));
+                        self.overlay = Overlay::None;
+                        if back {
+                            self.open_captions();
+                        }
+                    }
                     K_RETURN | K_KP_ENTER => {
                         let value = text.trim().to_string();
                         let target = *target;
@@ -1888,8 +2985,31 @@ impl State {
                         match target {
                             TextTarget::Title(i) => {
                                 if i < self.project.clips.len() {
+                                    let value = value
+                                        .split('|')
+                                        .map(str::trim)
+                                        .collect::<Vec<_>>()
+                                        .join("\n");
                                     self.change(|p| p.clips[i].effects.text = value);
-                                    self.say("Title set. Press P to see it rendered.");
+                                    self.focus = Focus::Inspector;
+                                    self.say(
+                                        "Title set: style it in the panel, P shows it rendered.",
+                                    );
+                                }
+                            }
+                            TextTarget::Caption(k) => {
+                                let mut list = self.project.film_captions();
+                                if k < list.len() {
+                                    if value.is_empty() {
+                                        list.remove(k);
+                                    } else {
+                                        list[k].2 = value;
+                                    }
+                                    self.change(|p| p.set_film_captions(&list));
+                                }
+                                self.open_captions();
+                                if let Overlay::Captions(f) = &mut self.overlay {
+                                    f.selected = k;
                                 }
                             }
                             TextTarget::ExportName => {
@@ -1981,6 +3101,12 @@ impl State {
                     K_DOWN => f.format = (f.format + 1).min(Format::ALL.len() - 1),
                     K_LEFT => f.height = f.height.saturating_sub(1),
                     K_RIGHT => f.height = (f.height + 1).min(HEIGHTS.len() - 1),
+                    _ if sym_char(sym).map(|c| c.to_ascii_lowercase()) == Some('l') => {
+                        f.limit = (f.limit + 1) % export::LIMITS.len();
+                    }
+                    _ if sym_char(sym).map(|c| c.to_ascii_lowercase()) == Some('u') => {
+                        f.captions = (f.captions + 1) % export::CAPTIONS.len();
+                    }
                     K_F2 => {
                         let name = f.name.clone();
                         self.overlay = Overlay::TextInput {
@@ -2003,6 +3129,122 @@ impl State {
                     K_DOWN | K_TAB => f.row = (f.row + 1).min(rows.len() - 1),
                     K_LEFT => f.step(rows[f.row], -1),
                     K_RIGHT | 0x20 => f.step(rows[f.row], 1),
+                    _ => {}
+                }
+                return false;
+            }
+            Overlay::Film { row } => {
+                let cur = *row;
+                let rows = self.film_rows();
+                let r = cur.min(rows.len() - 1);
+                let mut to = r;
+                match sym {
+                    K_RETURN | K_KP_ENTER if rows[r] == FilmRow::Logo => {
+                        let n = self.film_options(FilmRow::Logo).1.len();
+                        self.film_set(FilmRow::Logo, n - 1);
+                    }
+                    K_ESCAPE | K_RETURN | K_KP_ENTER => self.overlay = Overlay::None,
+                    K_UP => to = r.saturating_sub(1),
+                    K_DOWN | K_TAB => to = (r + 1).min(rows.len() - 1),
+                    K_LEFT => self.film_step(rows[r], -1),
+                    K_RIGHT | 0x20 => self.film_step(rows[r], 1),
+                    _ if ctrl && sym_char(sym) == Some('l') => self.open_captions(),
+                    _ if ctrl && sym_char(sym) == Some('k') => self.open_pauses(),
+                    _ => {}
+                }
+                if let Overlay::Film { row } = &mut self.overlay {
+                    *row = to;
+                }
+                return false;
+            }
+            Overlay::Pauses(f) => {
+                let counts = [PAUSE_MIN.len(), PAUSE_LEVEL.len(), PAUSE_KEEP.len()];
+                match sym {
+                    K_ESCAPE => self.overlay = Overlay::None,
+                    K_RETURN | K_KP_ENTER => self.apply_pauses(),
+                    K_UP => f.row = f.row.saturating_sub(1),
+                    K_DOWN | K_TAB => f.row = (f.row + 1).min(2),
+                    K_LEFT => {
+                        let n = counts[f.row];
+                        f.choice[f.row] = (f.choice[f.row] + n - 1) % n;
+                    }
+                    K_RIGHT | 0x20 => {
+                        f.choice[f.row] = (f.choice[f.row] + 1) % counts[f.row];
+                    }
+                    _ => {}
+                }
+                return false;
+            }
+            Overlay::Captions(f) => {
+                let n = self.project.film_captions().len();
+                match sym {
+                    K_ESCAPE => self.overlay = Overlay::None,
+                    K_UP => f.selected = f.selected.saturating_sub(1),
+                    K_DOWN => f.selected = (f.selected + 1).min(n.saturating_sub(1)),
+                    K_PAGE_UP => f.selected = f.selected.saturating_sub(10),
+                    K_PAGE_DOWN => f.selected = (f.selected + 10).min(n.saturating_sub(1)),
+                    K_TAB | K_LEFT | K_RIGHT => {
+                        f.language = (f.language + 1) % analyze::LANGUAGES.len()
+                    }
+                    K_RETURN | K_KP_ENTER if n > 0 => {
+                        let k = f.selected;
+                        self.edit_caption(k);
+                    }
+                    K_DELETE if n > 0 => {
+                        let k = f.selected;
+                        self.delete_caption(k);
+                        if let Overlay::Captions(f) = &mut self.overlay {
+                            f.selected = k.min(n.saturating_sub(2));
+                        }
+                    }
+                    0x20 if n > 0 => {
+                        let k = f.selected;
+                        if let Some((a, _, _)) = self.project.film_captions().get(k) {
+                            let at = *a;
+                            self.seek(at);
+                            self.say(format!("Playhead at caption {}", k + 1));
+                        }
+                    }
+                    _ if sym_char(sym).map(|c| c.to_ascii_lowercase()) == Some('g') => {
+                        self.make_captions()
+                    }
+                    _ => {}
+                }
+                return false;
+            }
+            Overlay::Fonts(f) => {
+                let n = f.visible().len();
+                match sym {
+                    K_ESCAPE => self.overlay = Overlay::None,
+                    K_RETURN | K_KP_ENTER => self.accept_font(),
+                    K_UP => f.selected = f.selected.saturating_sub(1),
+                    K_DOWN => f.selected = (f.selected + 1).min(n.saturating_sub(1)),
+                    K_PAGE_UP => f.selected = f.selected.saturating_sub(12),
+                    K_PAGE_DOWN => f.selected = (f.selected + 12).min(n.saturating_sub(1)),
+                    K_HOME => f.selected = 0,
+                    K_END => f.selected = n.saturating_sub(1),
+                    K_BACKSPACE => {
+                        if ctrl {
+                            f.filter.clear();
+                        } else {
+                            f.filter.pop();
+                        }
+                        f.selected = 0;
+                    }
+                    _ => {
+                        if let Some(ch) = sym_char(sym).filter(|_| !ctrl) {
+                            f.filter.push(ch);
+                            f.selected = usize::from(f.visible().len() > 1);
+                        }
+                    }
+                }
+                return false;
+            }
+            Overlay::Area(_) => {
+                match sym {
+                    K_ESCAPE => self.overlay = Overlay::None,
+                    K_RETURN | K_KP_ENTER => self.accept_area(false),
+                    K_DELETE => self.accept_area(true),
                     _ => {}
                 }
                 return false;
@@ -2043,6 +3285,10 @@ impl State {
                 }
                 Some('d') => self.duplicate(),
                 Some(',') => self.overlay = Overlay::Settings,
+                Some('t') => self.add_card(),
+                Some('f') => self.overlay = Overlay::Film { row: 0 },
+                Some('k') => self.open_pauses(),
+                Some('l') => self.open_captions(),
                 _ => {}
             }
             return false;
@@ -2089,7 +3335,7 @@ impl State {
                 let n = if self.music_selected.is_some() {
                     MUSIC_PARAMS.len()
                 } else {
-                    CLIP_PARAMS.len()
+                    self.params().len().max(1)
                 };
                 self.param_row = if sym == K_UP {
                     self.param_row.saturating_sub(1)
@@ -2103,13 +3349,7 @@ impl State {
             }
             K_RETURN | K_KP_ENTER if self.focus == Focus::Inspector => {
                 if self.music_selected.is_none() {
-                    if let (Some(i), Some(Param::Title)) =
-                        (self.target(), CLIP_PARAMS.get(self.param_row))
-                    {
-                        self.edit_title(i);
-                    } else {
-                        self.adjust(self.param_row, 1.0);
-                    }
+                    self.enter_param(self.param_row);
                 }
             }
             K_UP | K_DOWN if self.focus == Focus::Bin => {
@@ -2303,6 +3543,32 @@ impl State {
             }
             Action::Record => self.open_record(),
             Action::RecordStart => self.start_record(),
+            Action::Film => self.overlay = Overlay::Film { row: 0 },
+            Action::Pauses => self.open_pauses(),
+            Action::PausesApply => self.apply_pauses(),
+            Action::Captions => self.open_captions(),
+            Action::CaptionsMake => self.make_captions(),
+            Action::CaptionEdit => {
+                if let Overlay::Captions(f) = &self.overlay {
+                    let k = f.selected;
+                    self.edit_caption(k);
+                }
+            }
+            Action::CaptionDelete => {
+                if let Overlay::Captions(f) = &self.overlay {
+                    let k = f.selected;
+                    self.delete_caption(k);
+                }
+            }
+            Action::Card => self.add_card(),
+            Action::AreaAccept => self.accept_area(false),
+            Action::AreaClear => self.accept_area(true),
+            Action::AreaWhole => {
+                if let Overlay::Area(a) = &mut self.overlay {
+                    a.rect = [0.0, 0.0, 100.0, 100.0];
+                }
+            }
+            Action::FontAccept => self.accept_font(),
             Action::Recover => {
                 let path = autosave_path();
                 self.open_project(&path);
@@ -2386,13 +3652,66 @@ impl State {
                     }
                 }
             }
-            Some(Hit::Choice(r, i)) => {
-                if let Overlay::Record(f) = &mut self.overlay {
+            Some(Hit::Choice(r, i)) => match &mut self.overlay {
+                Overlay::Record(f) => {
                     let rows = f.rows();
                     if let Some(row) = rows.get(r).copied() {
                         f.row = r;
                         f.set(row, i);
                     }
+                }
+                Overlay::Film { row } => {
+                    *row = r;
+                    if let Some(fr) = self.film_rows().get(r).copied() {
+                        self.film_set(fr, i);
+                    }
+                }
+                Overlay::Pauses(f) => {
+                    f.row = r.min(2);
+                    f.choice[f.row] = i;
+                }
+                Overlay::Captions(f) => f.language = i.min(analyze::LANGUAGES.len() - 1),
+                _ => {}
+            },
+            Some(Hit::Limit(i)) => {
+                if let Overlay::Export(f) = &mut self.overlay {
+                    f.limit = i;
+                }
+            }
+            Some(Hit::CaptionMode(i)) => {
+                if let Overlay::Export(f) = &mut self.overlay {
+                    f.captions = i;
+                }
+            }
+            Some(Hit::ListRow(k)) => match &mut self.overlay {
+                Overlay::Captions(f) => {
+                    f.selected = k;
+                    if let Some((a, _, _)) = self.project.film_captions().get(k) {
+                        let at = *a;
+                        self.seek(at);
+                    }
+                    if double {
+                        self.edit_caption(k);
+                    }
+                }
+                Overlay::Fonts(f) => {
+                    f.selected = k;
+                    if double {
+                        self.accept_font();
+                    }
+                }
+                _ => {}
+            },
+            Some(Hit::AreaImage) => {
+                let image = hits
+                    .iter()
+                    .find(|(_, h)| *h == Hit::AreaImage)
+                    .map(|(r, _)| *r)
+                    .unwrap_or_default();
+                if image.w > 0 && image.h > 0 {
+                    let fx = (f64::from(x - image.x) / f64::from(image.w)).clamp(0.0, 1.0);
+                    let fy = (f64::from(y - image.y) / f64::from(image.h)).clamp(0.0, 1.0);
+                    self.drag = Some(Drag::Area { fx, fy, image });
                 }
             }
             Some(Hit::Format(i)) => {
@@ -2550,10 +3869,13 @@ impl State {
         let param = if self.music_selected.is_some() {
             MUSIC_PARAMS.get(row).copied()
         } else {
-            CLIP_PARAMS.get(row).copied()
+            self.params().get(row).copied()
         };
         if let Some(param) = param {
-            let (lo, hi, step) = param.range();
+            let (lo, hi, step) = match (self.music_selected, self.target()) {
+                (None, Some(i)) => param.limits(&self.project.clips[i]),
+                _ => param.range(),
+            };
             let v = lo + (hi - lo) * f.clamp(0.0, 1.0);
             let v = (v / step).round() * step;
             self.set_param(row, v);
@@ -2632,6 +3954,17 @@ impl State {
                     .unwrap_or(0.0);
                 if let Some(m) = self.project.music.get_mut(j) {
                     m.end = (end0 + dt).clamp(m.start + 0.1, limit);
+                }
+            }
+            Drag::Area { fx, fy, image } => {
+                let gx = (f64::from(x - image.x) / f64::from(image.w.max(1))).clamp(0.0, 1.0);
+                let gy = (f64::from(y - image.y) / f64::from(image.h.max(1))).clamp(0.0, 1.0);
+                if let Overlay::Area(a) = &mut self.overlay {
+                    let w = (gx - fx).abs() * 100.0;
+                    let h = (gy - fy).abs() * 100.0;
+                    if w > 1.0 && h > 1.0 {
+                        a.rect = [fx.min(gx) * 100.0, fy.min(gy) * 100.0, w, h];
+                    }
                 }
             }
             Drag::Media { i, x0, y0, active } => {
@@ -2785,7 +4118,7 @@ fn draw(p: &mut Painter, st: &mut State, l: &Layout, w: i32, h: i32) {
         let mut y = 0;
         let mut group = "";
         let mut at = 0;
-        for (row, param) in CLIP_PARAMS.iter().enumerate() {
+        for (row, param) in st.params().iter().enumerate() {
             if param.group() != group {
                 group = param.group();
                 y += s / 3 + s * 3 / 2;
@@ -2817,6 +4150,11 @@ fn draw(p: &mut Painter, st: &mut State, l: &Layout, w: i32, h: i32) {
         Overlay::Record(_) => draw_record(p, st, l, &t, s),
         Overlay::Help => draw_help(p, l, &t, s),
         Overlay::TextInput { .. } => draw_text_input(p, st, l, &t, s),
+        Overlay::Film { .. } => draw_film(p, st, l, &t, s),
+        Overlay::Pauses(_) => draw_pauses(p, st, l, &t, s),
+        Overlay::Captions(_) => draw_captions(p, st, l, &t, s),
+        Overlay::Fonts(_) => draw_fonts(p, st, l, &t, s),
+        Overlay::Area(_) => draw_area(p, st, l, &t, s),
     }
     // Dragging media from the bin.
     if let Some(Drag::Media {
@@ -2872,6 +4210,7 @@ fn draw_top(p: &mut Painter, st: &State, l: &Layout, t: &Theme, s: i32) {
         ("Music", Action::Music),
         ("Save", Action::Save),
         ("● Record", Action::Record),
+        ("Film…", Action::Film),
     ] {
         x += button(p, t, x, y, label, a, s, false) + s / 2;
     }
@@ -2891,6 +4230,29 @@ fn draw_top(p: &mut Painter, st: &State, l: &Layout, t: &Theme, s: i32) {
         rx -= bw;
         button(p, t, rx, y, label, a, s, primary);
         rx -= s / 2;
+    }
+    // Captions being made.
+    if let Some((f, text)) = &st.caption_progress {
+        let label = format!("Captions {:.0} %", f * 100.0);
+        let lw = p.tx.width(&label, t.size * 8 / 10);
+        let bx = if st.job.is_some() {
+            rx - s * 30
+        } else {
+            rx - s * 12
+        };
+        p.tx.draw(
+            &mut p.cv,
+            bx - lw,
+            y + s / 5,
+            &label,
+            t.size * 8 / 10,
+            t.warning,
+        );
+        let _ = text;
+        p.hits.push((
+            Rect::new(bx - lw, y, lw, s * 2),
+            Hit::Button(Action::Captions),
+        ));
     }
     // Export progress.
     if let Some(job) = &st.job {
@@ -2983,7 +4345,17 @@ fn draw_bin(p: &mut Painter, st: &State, l: &Layout, t: &Theme, s: i32) {
         let tw = th * 16 / 9;
         let tx = r.x + s / 2 + s / 4;
         let ty = y + s / 4;
-        if let Some(th_set) = st.cache.thumbs.get(&m.path) {
+        if m.is_card() {
+            p.cv.fill(tx, ty, tw, th, 0x101014);
+            p.tx.draw(
+                &mut p.cv,
+                tx + tw / 2 - s / 2,
+                ty + th / 2 - s / 2,
+                "Aa",
+                t.size,
+                0xffffff,
+            );
+        } else if let Some(th_set) = st.cache.thumbs.get(&m.path) {
             let f = &th_set.frames[th_set.frames.len() / 3];
             p.cv.image(tx, ty, tw, th, f, th_set.width as i32, THUMB_H as i32);
         } else {
@@ -3009,7 +4381,9 @@ fn draw_bin(p: &mut Painter, st: &State, l: &Layout, t: &Theme, s: i32) {
             t.foreground,
             avail,
         );
-        let kind = if m.still {
+        let kind = if m.is_card() {
+            "Text on a colour: Ctrl+T".to_string()
+        } else if m.still {
             "Picture".to_string()
         } else if m.has_video {
             format!("{}×{} · {}", m.width, m.height, clock(m.duration))
@@ -3033,7 +4407,7 @@ fn draw_bin(p: &mut Painter, st: &State, l: &Layout, t: &Theme, s: i32) {
     let by = r.y + r.h - s * 5 / 2;
     let bx = r.x + s / 2;
     let w1 = button(p, t, bx, by, "+ Import", Action::Import, s, false);
-    button(
+    let w2 = button(
         p,
         t,
         bx + w1 + s / 2,
@@ -3043,6 +4417,9 @@ fn draw_bin(p: &mut Painter, st: &State, l: &Layout, t: &Theme, s: i32) {
         s,
         false,
     );
+    if bx + w1 + w2 + s * 6 < r.x + r.w {
+        button(p, t, bx + w1 + w2 + s, by, "+ Card", Action::Card, s, false);
+    }
 }
 
 fn draw_inspector(p: &mut Painter, st: &State, l: &Layout, t: &Theme, s: i32) {
@@ -3148,7 +4525,8 @@ fn draw_inspector(p: &mut Painter, st: &State, l: &Layout, t: &Theme, s: i32) {
     // Keep the selected row in view.
     let mut y = top - st.inspector_scroll;
     let mut group = "";
-    for (row, param) in CLIP_PARAMS.iter().enumerate() {
+    let params = st.params();
+    for (row, param) in params.iter().enumerate() {
         if param.group() != group {
             group = param.group();
             y += s / 3;
@@ -3182,6 +4560,24 @@ fn draw_inspector(p: &mut Painter, st: &State, l: &Layout, t: &Theme, s: i32) {
         );
         y += row_h;
     }
+    // What the panel can do beyond its rows.
+    y += s / 2;
+    let hint = if params.get(st.param_row).is_some_and(|p| p.is_time()) && focused {
+        "Enter takes the time from the playhead."
+    } else if c.effects.text.trim().is_empty() {
+        "T writes a title; Ctrl+T adds a title card."
+    } else {
+        "P renders a preview with titles and effects."
+    };
+    p.tx.fit(
+        &mut p.cv,
+        r.x + s,
+        y,
+        hint,
+        small * 9 / 10,
+        t.muted,
+        r.w - 2 * s,
+    );
     p.cv.no_clip();
 }
 
@@ -3274,7 +4670,7 @@ fn param_row(
         );
         p.hits.push((vr, Hit::Param(row, Part::Value)));
     }
-    if param != Param::Title {
+    if !param.opens() {
         p.cv.round(minus.x, minus.y, minus.w, minus.h, s / 3, t.raised);
         p.tx.draw(
             &mut p.cv,
@@ -3580,10 +4976,15 @@ fn draw_timeline(p: &mut Painter, st: &State, l: &Layout, t: &Theme, s: i32) {
                 x += tw;
             }
             p.cv.blend(inner.x, inner.y, inner.w, s * 5 / 4, 0x000000, 140);
+        } else if m.is_card() {
+            p.cv.fill(inner.x, inner.y, inner.w, inner.h, c.effects.card_colour);
         } else {
             p.cv.fill(inner.x, inner.y, inner.w, inner.h, t.raised);
         }
         let mut label = m.name();
+        if m.is_card() && !c.effects.text.is_empty() {
+            label = format!("“{}”", c.effects.text.replace('\n', " "));
+        }
         if (c.speed - 1.0).abs() > 1e-6 {
             label = format!("{:.2}× {label}", c.speed);
         }
@@ -3667,6 +5068,16 @@ fn draw_timeline(p: &mut Painter, st: &State, l: &Layout, t: &Theme, s: i32) {
         p.hits
             .push((Rect::new(x0, la.y, w, la.h), Hit::Clip(i, Edge::Body)));
         let _ = target;
+    }
+    // Captions, as thin bars along the bottom of the sound lane.
+    let cy = la.y + la.h - 6;
+    for (a, b, _) in st.project.film_captions() {
+        let xa = st.time_x(l, a);
+        let xb = st.time_x(l, b);
+        if xb < la.x || xa > la.x + la.w {
+            continue;
+        }
+        p.cv.fill(xa, cy, (xb - xa - 1).max(1), 3, t.accent);
     }
     // Drop marker while dragging.
     let drop_x = match &st.drag {
@@ -3977,7 +5388,7 @@ fn draw_export(p: &mut Painter, st: &State, l: &Layout, t: &Theme, s: i32) {
     let Overlay::Export(f) = &st.overlay else {
         return;
     };
-    let r = dialog(p, l, t, s, s * 44, s * 34, "Export");
+    let r = dialog(p, l, t, s, s * 48, s * 42, "Export");
     let small = t.size * 85 / 100;
     let mut y = r.y + s * 3;
     p.tx.draw(&mut p.cv, r.x + s, y, "FORMAT", small, t.muted);
@@ -4047,6 +5458,51 @@ fn draw_export(p: &mut Painter, st: &State, l: &Layout, t: &Theme, s: i32) {
         }
         y += s * 5 / 2;
     }
+    let chips =
+        |p: &mut Painter, y: i32, labels: &[String], chosen: usize, hit: fn(usize) -> Hit| {
+            let mut x = r.x + s;
+            let size = t.size * 9 / 10;
+            for (i, label) in labels.iter().enumerate() {
+                let bw = p.tx.width(label, size) + s;
+                let rect = Rect::new(x, y, bw, s * 17 / 10);
+                let on = i == chosen;
+                p.cv.round(
+                    rect.x,
+                    rect.y,
+                    rect.w,
+                    rect.h,
+                    s / 3,
+                    if on { t.accent } else { t.raised },
+                );
+                p.tx.draw(
+                    &mut p.cv,
+                    x + s / 2,
+                    y + s / 5,
+                    label,
+                    size,
+                    if on { t.background } else { t.foreground },
+                );
+                p.hits.push((rect, hit(i)));
+                x += bw + s / 3;
+            }
+        };
+    if format.has_video() && format != Format::Gif {
+        p.tx.draw(&mut p.cv, r.x + s, y, "SIZE LIMIT  (L)", small, t.muted);
+        y += s * 3 / 2;
+        let labels: Vec<String> = export::LIMITS
+            .iter()
+            .map(|m| export::limit_label(*m))
+            .collect();
+        chips(p, y, &labels, f.limit, Hit::Limit);
+        y += s * 5 / 2;
+    }
+    if st.project.caption_count() > 0 {
+        p.tx.draw(&mut p.cv, r.x + s, y, "CAPTIONS  (U)", small, t.muted);
+        y += s * 3 / 2;
+        let labels: Vec<String> = export::CAPTIONS.iter().map(|c| c.to_string()).collect();
+        chips(p, y, &labels, f.captions, Hit::CaptionMode);
+        y += s * 5 / 2;
+    }
     // Name and folder.
     let folder = st.settings.export_folder();
     let name = format!("{}.{}", f.name, format.extension());
@@ -4101,7 +5557,22 @@ fn draw_export(p: &mut Painter, st: &State, l: &Layout, t: &Theme, s: i32) {
         }
         _ => format!("The whole film: {}", clock(st.project.duration())),
     };
-    p.tx.draw(&mut p.cv, r.x + s, y, &what, small, t.muted);
+    let mut notes = Vec::new();
+    if st.project.loudness > 0 && format.has_audio() {
+        notes.push(format!(
+            "sound levelled to {}",
+            export::LOUDNESS[st.project.loudness as usize].0
+        ));
+    }
+    if export::LIMITS[f.limit] > 0 && format.has_video() && format != Format::Gif {
+        notes.push("two passes to fit the limit".to_string());
+    }
+    let what = if notes.is_empty() {
+        what
+    } else {
+        format!("{what} · {}", notes.join(", "))
+    };
+    p.tx.fit(&mut p.cv, r.x + s, y, &what, small, t.muted, r.w - 2 * s);
     let by = r.y + r.h - s * 5 / 2;
     let size = (s as u32 * 9 / 10).max(10);
     let aw = p.tx.width("Export  Enter", size) + s;
@@ -4142,77 +5613,14 @@ fn draw_record(p: &mut Painter, st: &State, l: &Layout, t: &Theme, s: i32) {
         s * 6 + rows.len() as i32 * s * 3 + s * 6,
         "Record",
     );
-    let size = t.size * 9 / 10;
-    let mut y = r.y + s * 3;
-    let lx = r.x + s;
-    let cx0 = r.x + s * 10;
-    let max_x = r.x + r.w - s;
-    for (k, row) in rows.iter().enumerate() {
-        let focused = k == f.row.min(rows.len() - 1);
-        if focused {
-            p.cv.round(
-                r.x + s / 3,
-                y - s / 4,
-                r.w - s * 2 / 3,
-                s * 2 + s / 4,
-                s / 3,
-                t.selected,
-            );
-        }
-        p.tx.draw(
-            &mut p.cv,
-            lx,
-            y + s / 5,
-            record::Form::label(*row),
-            size,
-            if focused { t.accent } else { t.muted },
-        );
-        let (opts, chosen) = f.options(*row);
-        let mut x = cx0;
-        let mut cut = false;
-        for (i, label) in opts.iter().enumerate() {
-            let w = p.tx.width(label, size) + s;
-            if x + w > max_x && x > cx0 {
-                cut = i <= chosen;
-                break;
-            }
-            let rect = Rect::new(x, y, w, s * 17 / 10);
-            let on = i == chosen;
-            p.cv.round(
-                rect.x,
-                rect.y,
-                rect.w,
-                rect.h,
-                s / 3,
-                if on { t.accent } else { t.raised },
-            );
-            p.tx.draw(
-                &mut p.cv,
-                x + s / 2,
-                y + s / 5,
-                label,
-                size,
-                if on { t.background } else { t.foreground },
-            );
-            p.hits.push((rect, Hit::Choice(k, i)));
-            x += w + s / 3;
-        }
-        if cut {
-            // A long list (microphones): the chosen one did not fit.
-            let label = format!("▸ {}   (← → to choose)", opts[chosen]);
-            p.tx.fit(
-                &mut p.cv,
-                cx0,
-                y + s * 2,
-                &label,
-                size,
-                t.accent,
-                max_x - cx0,
-            );
-            y += s;
-        }
-        y += s * 3;
-    }
+    let list: Vec<(String, Vec<String>, usize)> = rows
+        .iter()
+        .map(|row| {
+            let (opts, chosen) = f.options(*row);
+            (record::Form::label(*row).to_string(), opts, chosen)
+        })
+        .collect();
+    let y = choice_rows(p, t, s, r, r.y + s * 3, &list, f.row.min(rows.len() - 1));
     let small = t.size * 85 / 100;
     let wait = record::pre_delay(&f.choices);
     let info = match f.choices.what {
@@ -4328,6 +5736,508 @@ fn draw_settings(p: &mut Painter, st: &State, l: &Layout, t: &Theme, s: i32) {
     );
 }
 
+/// Rows of choices, as chips: label, options, the chosen one. Returns
+/// the y below them.
+fn choice_rows(
+    p: &mut Painter,
+    t: &Theme,
+    s: i32,
+    r: Rect,
+    mut y: i32,
+    rows: &[(String, Vec<String>, usize)],
+    focus: usize,
+) -> i32 {
+    let size = t.size * 9 / 10;
+    let lx = r.x + s;
+    let cx0 = r.x + s * 11;
+    let max_x = r.x + r.w - s;
+    for (k, (label, opts, chosen)) in rows.iter().enumerate() {
+        let focused = k == focus;
+        if focused {
+            p.cv.round(
+                r.x + s / 3,
+                y - s / 4,
+                r.w - s * 2 / 3,
+                s * 2 + s / 4,
+                s / 3,
+                t.selected,
+            );
+        }
+        p.tx.fit(
+            &mut p.cv,
+            lx,
+            y + s / 5,
+            label,
+            size,
+            if focused { t.accent } else { t.muted },
+            cx0 - lx - s / 2,
+        );
+        let mut x = cx0;
+        let mut cut = false;
+        for (i, label) in opts.iter().enumerate() {
+            let w = p.tx.width(label, size) + s;
+            if x + w > max_x && x > cx0 {
+                cut = i <= *chosen;
+                break;
+            }
+            let rect = Rect::new(x, y, w, s * 17 / 10);
+            let on = i == *chosen;
+            p.cv.round(
+                rect.x,
+                rect.y,
+                rect.w,
+                rect.h,
+                s / 3,
+                if on { t.accent } else { t.raised },
+            );
+            p.tx.draw(
+                &mut p.cv,
+                x + s / 2,
+                y + s / 5,
+                label,
+                size,
+                if on { t.background } else { t.foreground },
+            );
+            p.hits.push((rect, Hit::Choice(k, i)));
+            x += w + s / 3;
+        }
+        if cut {
+            // A long list: the chosen one did not fit.
+            let label = format!("▸ {}   (← → to choose)", opts[*chosen]);
+            p.tx.fit(
+                &mut p.cv,
+                cx0,
+                y + s * 2,
+                &label,
+                size,
+                t.accent,
+                max_x - cx0,
+            );
+            y += s;
+        }
+        y += s * 3;
+    }
+    y
+}
+
+/// Buttons along the bottom right of a dialog, the first rightmost.
+fn dialog_buttons(p: &mut Painter, t: &Theme, s: i32, r: Rect, items: &[(&str, Action, bool)]) {
+    let by = r.y + r.h - s * 5 / 2;
+    let size = (s as u32 * 9 / 10).max(10);
+    let mut x = r.x + r.w - s;
+    for (label, action, primary) in items {
+        let w = p.tx.width(label, size) + s;
+        x -= w;
+        button(p, t, x, by, label, *action, s, *primary);
+        x -= s / 2;
+    }
+}
+
+fn draw_film(p: &mut Painter, st: &State, l: &Layout, t: &Theme, s: i32) {
+    let Overlay::Film { row } = &st.overlay else {
+        return;
+    };
+    let rows = st.film_rows();
+    let list: Vec<(String, Vec<String>, usize)> = rows
+        .iter()
+        .map(|r| {
+            let (label, opts, chosen) = st.film_options(*r);
+            (label.to_string(), opts, chosen)
+        })
+        .collect();
+    let r = dialog(
+        p,
+        l,
+        t,
+        s,
+        s * 56,
+        s * 9 + rows.len() as i32 * s * 3 + s * 5,
+        "The whole film",
+    );
+    let mut y = choice_rows(p, t, s, r, r.y + s * 3, &list, (*row).min(rows.len() - 1));
+    let small = t.size * 85 / 100;
+    let n = st.project.caption_count();
+    let captions = if n == 0 {
+        "No captions yet: Captions… makes them from the speech.".to_string()
+    } else {
+        format!("{n} captions in the film.")
+    };
+    p.tx.fit(
+        &mut p.cv,
+        r.x + s,
+        y,
+        &captions,
+        small,
+        t.muted,
+        r.w - 2 * s,
+    );
+    y += s * 3 / 2;
+    p.tx.fit(
+        &mut p.cv,
+        r.x + s,
+        y,
+        "Loudness and music are heard in the rendered preview (P) and the export.",
+        small,
+        t.muted,
+        r.w - 2 * s,
+    );
+    dialog_buttons(
+        p,
+        t,
+        s,
+        r,
+        &[
+            ("Close", Action::CloseOverlay, true),
+            ("Cut pauses…  Ctrl+K", Action::Pauses, false),
+            ("Captions…  Ctrl+L", Action::Captions, false),
+        ],
+    );
+}
+
+fn draw_pauses(p: &mut Painter, st: &State, l: &Layout, t: &Theme, s: i32) {
+    let Overlay::Pauses(f) = &st.overlay else {
+        return;
+    };
+    // The timeline shows through so the pauses can be seen.
+    let found = st.found_pauses();
+    let r = Rect::new(
+        (l.top.w - (s * 54).min(l.top.w - 2 * s)) / 2,
+        l.top.h + s,
+        (s * 54).min(l.top.w - 2 * s),
+        (s * 20).min(l.timeline.y - l.top.h - 2 * s),
+    );
+    p.cv.blend(0, l.top.h, l.top.w, l.timeline.y - l.top.h, 0x000000, 120);
+    p.hits.push((
+        Rect::new(0, l.top.h, l.top.w, l.timeline.y + l.timeline.h - l.top.h),
+        Hit::Block,
+    ));
+    p.cv.round(r.x - 1, r.y - 1, r.w + 2, r.h + 2, s / 2, t.border);
+    p.cv.round(r.x, r.y, r.w, r.h, s / 2, t.surface);
+    p.tx.draw(
+        &mut p.cv,
+        r.x + s,
+        r.y + s * 2 / 3,
+        "Cut pauses",
+        t.size * 11 / 10,
+        t.foreground,
+    );
+    let list = vec![
+        (
+            "Shortest pause".to_string(),
+            PAUSE_MIN.iter().map(|v| format!("{v} s")).collect(),
+            f.choice[0],
+        ),
+        (
+            "Silence below".to_string(),
+            PAUSE_LEVEL.iter().map(|(l, _)| l.to_string()).collect(),
+            f.choice[1],
+        ),
+        (
+            "Keep around speech".to_string(),
+            PAUSE_KEEP.iter().map(|v| format!("{v} s")).collect(),
+            f.choice[2],
+        ),
+    ];
+    let y = choice_rows(p, t, s, r, r.y + s * 3, &list, f.row);
+    let summary = match &found {
+        None => "Listening to the film…".to_string(),
+        Some(v) if v.is_empty() => {
+            "No pauses that long: try a shorter pause or another level.".into()
+        }
+        Some(v) => {
+            let d = st.project.duration();
+            let total: f64 = v.iter().map(|(a, b)| b.min(d) - a).sum();
+            format!(
+                "{} pauses, {} in all, marked red on the timeline. Enter cuts them.",
+                v.len(),
+                clock(total)
+            )
+        }
+    };
+    p.tx.fit(
+        &mut p.cv,
+        r.x + s,
+        y,
+        &summary,
+        t.size * 9 / 10,
+        t.foreground,
+        r.w - 2 * s,
+    );
+    dialog_buttons(
+        p,
+        t,
+        s,
+        r,
+        &[
+            ("Cut them  Enter", Action::PausesApply, true),
+            ("Cancel", Action::CloseOverlay, false),
+        ],
+    );
+    // The pauses on the timeline.
+    if let Some(v) = found {
+        let lv = l.lane_video;
+        let la = l.lane_audio;
+        p.cv.set_clip(lv.x, lv.y, lv.w, la.y + la.h - lv.y);
+        for (a, b) in v {
+            let xa = st.time_x(l, a);
+            let xb = st.time_x(l, b.min(st.project.duration()));
+            p.cv.blend(xa, lv.y, (xb - xa).max(1), la.y + la.h - lv.y, t.error, 150);
+        }
+        p.cv.no_clip();
+    }
+}
+
+fn draw_captions(p: &mut Painter, st: &State, l: &Layout, t: &Theme, s: i32) {
+    let Overlay::Captions(f) = &st.overlay else {
+        return;
+    };
+    let r = dialog(p, l, t, s, s * 60, s * 40, "Captions");
+    let small = t.size * 85 / 100;
+    let langs = vec![(
+        "Language".to_string(),
+        analyze::LANGUAGES
+            .iter()
+            .map(|(n, _)| n.to_string())
+            .collect(),
+        f.language,
+    )];
+    let mut y = choice_rows(p, t, s, r, r.y + s * 3, &langs, usize::MAX);
+    let list = st.project.film_captions();
+    let status = match &st.caption_progress {
+        Some((frac, text)) => format!("{text} {:.0} %", frac * 100.0),
+        None if list.is_empty() => {
+            "Make captions from the speech (G). NIRUDICTATE transcribes on this computer.".into()
+        }
+        None => format!(
+            "{} captions. Enter edits, Delete removes, Space moves the playhead there.",
+            list.len()
+        ),
+    };
+    p.tx.fit(&mut p.cv, r.x + s, y, &status, small, t.muted, r.w - 2 * s);
+    y += s * 2;
+    let row_h = s * 2;
+    let bottom = r.y + r.h - s * 3;
+    let rows = ((bottom - y) / row_h).max(1) as usize;
+    let first = f
+        .selected
+        .saturating_sub(rows / 2)
+        .min(list.len().saturating_sub(rows));
+    p.cv.set_clip(r.x, y, r.w, bottom - y);
+    for (k, (a, b, text)) in list.iter().enumerate().skip(first).take(rows) {
+        let rect = Rect::new(r.x + s / 2, y, r.w - s, row_h - 2);
+        if k == f.selected {
+            p.cv.round(rect.x, rect.y, rect.w, rect.h, s / 3, t.selected);
+        }
+        let time = format!("{} – {}", clock(*a), clock(*b));
+        p.tx.draw(&mut p.cv, rect.x + s / 2, y + s / 4, &time, small, t.muted);
+        p.tx.fit(
+            &mut p.cv,
+            rect.x + s * 12,
+            y + s / 5,
+            text,
+            t.size * 9 / 10,
+            t.foreground,
+            rect.w - s * 13,
+        );
+        p.hits.push((rect, Hit::ListRow(k)));
+        y += row_h;
+    }
+    p.cv.no_clip();
+    let make = if list.is_empty() {
+        "Make captions  G"
+    } else {
+        "Make again  G"
+    };
+    let mut items = vec![
+        ("Close", Action::CloseOverlay, false),
+        (make, Action::CaptionsMake, list.is_empty()),
+    ];
+    if !list.is_empty() {
+        items.push(("Remove", Action::CaptionDelete, false));
+        items.push(("Edit  Enter", Action::CaptionEdit, true));
+    }
+    dialog_buttons(p, t, s, r, &items);
+}
+
+fn draw_fonts(p: &mut Painter, st: &State, l: &Layout, t: &Theme, s: i32) {
+    let Overlay::Fonts(f) = &st.overlay else {
+        return;
+    };
+    let r = dialog(p, l, t, s, s * 46, s * 40, "Font for the title");
+    let field = Rect::new(r.x + s, r.y + s * 3, r.w - 2 * s, s * 2);
+    p.cv.round(field.x, field.y, field.w, field.h, s / 3, t.background);
+    let shown = if f.filter.is_empty() {
+        "Type to search…".to_string()
+    } else {
+        format!("{}▏", f.filter)
+    };
+    p.tx.fit(
+        &mut p.cv,
+        field.x + s / 2,
+        field.y + s / 4,
+        &shown,
+        t.size,
+        if f.filter.is_empty() {
+            t.muted
+        } else {
+            t.foreground
+        },
+        field.w - s,
+    );
+    let visible = f.visible();
+    let row_h = s * 5 / 2;
+    let mut y = field.y + field.h + s / 2;
+    let bottom = r.y + r.h - s * 3;
+    let rows = ((bottom - y) / row_h).max(1) as usize;
+    let first = f
+        .selected
+        .saturating_sub(rows / 2)
+        .min(visible.len().saturating_sub(rows));
+    p.cv.set_clip(r.x, y, r.w, bottom - y);
+    for (k, fam) in visible.iter().enumerate().skip(first).take(rows) {
+        let rect = Rect::new(r.x + s / 2, y, r.w - s, row_h - 2);
+        if k == f.selected {
+            p.cv.round(rect.x, rect.y, rect.w, rect.h, s / 3, t.selected);
+        }
+        match fam {
+            None => {
+                p.tx.draw(
+                    &mut p.cv,
+                    rect.x + s / 2,
+                    y + s / 3,
+                    "Desktop font",
+                    t.size,
+                    t.foreground,
+                );
+            }
+            Some(fam) => {
+                let size = t.size * 11 / 10;
+                let own = p
+                    .fonts
+                    .entry(fam.file.clone())
+                    .or_insert_with(|| Text::from_file(&fam.file));
+                let drawn = match own {
+                    Some(tx) if fam.name.chars().all(|c| tx.has(c)) => {
+                        tx.draw(
+                            &mut p.cv,
+                            rect.x + s / 2,
+                            y + s / 4,
+                            &fam.name,
+                            size,
+                            t.foreground,
+                        );
+                        true
+                    }
+                    _ => false,
+                };
+                if !drawn {
+                    p.tx.draw(
+                        &mut p.cv,
+                        rect.x + s / 2,
+                        y + s / 3,
+                        &fam.name,
+                        t.size,
+                        t.foreground,
+                    );
+                }
+            }
+        }
+        p.hits.push((rect, Hit::ListRow(k)));
+        y += row_h;
+    }
+    p.cv.no_clip();
+    let _ = st;
+    dialog_buttons(
+        p,
+        t,
+        s,
+        r,
+        &[
+            ("Use it  Enter", Action::FontAccept, true),
+            ("Cancel", Action::CloseOverlay, false),
+        ],
+    );
+}
+
+fn draw_area(p: &mut Painter, st: &State, l: &Layout, t: &Theme, s: i32) {
+    let Overlay::Area(a) = &st.overlay else {
+        return;
+    };
+    let title = if a.zoom {
+        "Drag the part to zoom into"
+    } else {
+        "Drag the part to hide"
+    };
+    let r = dialog(p, l, t, s, s * 70, s * 46, title);
+    let avail_w = r.w - 2 * s;
+    let avail_h = r.h - s * 9;
+    let scale = (f64::from(avail_w) / f64::from(a.iw)).min(f64::from(avail_h) / f64::from(a.ih));
+    let dw = (f64::from(a.iw) * scale) as i32;
+    let dh = (f64::from(a.ih) * scale) as i32;
+    let img = Rect::new(r.x + (r.w - dw) / 2, r.y + s * 3, dw, dh);
+    p.cv.image(img.x, img.y, img.w, img.h, &a.image, a.iw, a.ih);
+    let [x, y, w, h] = a.rect;
+    let rx = img.x + (f64::from(img.w) * x / 100.0) as i32;
+    let ry = img.y + (f64::from(img.h) * y / 100.0) as i32;
+    let rw = (f64::from(img.w) * w / 100.0) as i32;
+    let rh = (f64::from(img.h) * h / 100.0) as i32;
+    if rw > 0 && rh > 0 {
+        // Dim what is outside the area, frame what is in it.
+        p.cv.blend(img.x, img.y, img.w, ry - img.y, 0x000000, 110);
+        p.cv.blend(
+            img.x,
+            ry + rh,
+            img.w,
+            img.y + img.h - ry - rh,
+            0x000000,
+            110,
+        );
+        p.cv.blend(img.x, ry, rx - img.x, rh, 0x000000, 110);
+        p.cv.blend(rx + rw, ry, img.x + img.w - rx - rw, rh, 0x000000, 110);
+        let c = t.accent;
+        p.cv.fill(rx, ry, rw, 2, c);
+        p.cv.fill(rx, ry + rh - 2, rw, 2, c);
+        p.cv.fill(rx, ry, 2, rh, c);
+        p.cv.fill(rx + rw - 2, ry, 2, rh, c);
+    }
+    p.hits.push((img, Hit::AreaImage));
+    let note = if a.zoom {
+        "The zoom keeps the film's shape: the area grows to fit. Set when and how long in the panel."
+    } else {
+        "Choose blur, pixelate or a black box, and when, in the panel."
+    };
+    p.tx.fit(
+        &mut p.cv,
+        r.x + s,
+        img.y + img.h + s / 2,
+        note,
+        t.size * 85 / 100,
+        t.muted,
+        r.w - 2 * s,
+    );
+    let _ = st;
+    dialog_buttons(
+        p,
+        t,
+        s,
+        r,
+        &[
+            ("Use this area  Enter", Action::AreaAccept, true),
+            ("Cancel", Action::CloseOverlay, false),
+            (
+                if a.zoom {
+                    "No zoom  Delete"
+                } else {
+                    "Show all  Delete"
+                },
+                Action::AreaClear,
+                false,
+            ),
+            ("Whole picture", Action::AreaWhole, false),
+        ],
+    );
+}
+
 const KEYS: &[(&str, &str)] = &[
     ("Space", "Play or pause"),
     ("J  K  L", "Back 2 s, pause, play (L again: faster)"),
@@ -4340,7 +6250,8 @@ const KEYS: &[(&str, &str)] = &[
     ("C", "Keep only the marked part"),
     ("Alt+← →", "Move the clip earlier or later"),
     ("M", "Mute or unmute the clip"),
-    ("T", "Title text over the clip"),
+    ("T", "Title text over the clip (| for a new line)"),
+    ("Ctrl+T", "Title card: text on a colour"),
     ("P", "Preview with effects and transitions"),
     ("Tab", "Timeline, settings panel, media list"),
     ("+  −  Z", "Zoom in, out, whole film"),
@@ -4348,7 +6259,11 @@ const KEYS: &[(&str, &str)] = &[
     ("Ctrl+D", "Duplicate the clip"),
     ("Ctrl+O  Ctrl+I  Ctrl+M", "Open, import, add music"),
     ("Ctrl+S  Ctrl+Shift+S", "Save, save as"),
-    ("Ctrl+E", "Export"),
+    ("Ctrl+E", "Export (L size limit, U captions)"),
+    ("Ctrl+F", "The whole film: loudness, music, logo"),
+    ("Ctrl+K", "Cut pauses"),
+    ("Ctrl+L", "Captions from the speech"),
+    ("Enter", "In the panel: a start or length from the playhead"),
     (
         "Ctrl+R",
         "Record the screen, a window, an area or the camera",
@@ -4431,9 +6346,9 @@ mod tests {
     #[test]
     fn every_parameter_round_trips_its_range() {
         let mut c = Clip::new(0, 0.0, 10.0);
-        for p in CLIP_PARAMS {
-            let (lo, hi, _) = p.range();
-            if p == Param::Title {
+        for p in ALL_CLIP_PARAMS {
+            let (lo, hi, _) = p.limits(&c);
+            if p.opens() || p == Param::Template {
                 continue;
             }
             p.set(&mut c, hi);
@@ -4445,6 +6360,33 @@ mod tests {
         assert_eq!(c.transition, Some(Transition::FadeBlack));
         Param::Transition.set(&mut c, 0.0);
         assert_eq!(c.transition, None);
+    }
+
+    #[test]
+    fn the_panel_shows_only_what_applies() {
+        let media = Media {
+            has_video: true,
+            has_audio: true,
+            duration: 10.0,
+            ..Media::default()
+        };
+        let mut c = Clip::new(0, 0.0, 10.0);
+        let rows = clip_params(&c, &media);
+        assert!(rows.contains(&Param::Voice) && rows.contains(&Param::Title));
+        assert!(!rows.contains(&Param::Font) && !rows.contains(&Param::ZoomStart));
+        assert!(!rows.contains(&Param::DesktopVolume) && !rows.contains(&Param::CardColour));
+        c.effects.text = "Hi".into();
+        c.effects.zoom_area = [10.0, 10.0, 40.0, 40.0];
+        let rows = clip_params(&c, &media);
+        assert!(rows.contains(&Param::Font) && rows.contains(&Param::ZoomStart));
+        let card = Media::card();
+        let rows = clip_params(&c, &card);
+        assert!(rows.contains(&Param::CardColour));
+        assert!(!rows.contains(&Param::Brightness) && !rows.contains(&Param::Voice));
+        // A template sets the look in one go and is recognised again.
+        Param::Template.set(&mut c, 2.0);
+        assert_eq!(template_of(&c.effects), 2);
+        assert_eq!(c.effects.text_position, 6);
     }
 
     #[test]

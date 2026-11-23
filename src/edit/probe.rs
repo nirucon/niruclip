@@ -97,7 +97,15 @@ pub fn parse(path: &Path, json: &str) -> Result<Media, String> {
                     }
                 }
             }
-            Some("audio") => media.has_audio = true,
+            Some("audio") => {
+                media.has_audio = true;
+                let title = s["tags"]["title"]
+                    .as_str()
+                    .or_else(|| s["tags"]["TITLE"].as_str())
+                    .unwrap_or("")
+                    .to_string();
+                media.tracks.push(title);
+            }
             _ => {}
         }
     }
@@ -141,6 +149,19 @@ mod tests {
         assert_eq!((m.width, m.height), (2560, 1080));
         assert!((m.fps - 30.0).abs() < 1e-9);
         assert!((m.duration - 12.5).abs() < 1e-9);
+        assert_eq!(m.split_tracks(), None);
+    }
+
+    #[test]
+    fn a_recording_with_both_sources_has_its_own_tracks() {
+        let json = r#"{"streams":[
+            {"codec_type":"video","width":1920,"height":1080,"avg_frame_rate":"30/1"},
+            {"codec_type":"audio","tags":{"title":"Mix"}},
+            {"codec_type":"audio","tags":{"title":"Mic"}},
+            {"codec_type":"audio","tags":{"title":"Desktop"}}],
+            "format":{"duration":"4"}}"#;
+        let m = parse(Path::new("/v/b.mkv"), json).unwrap();
+        assert_eq!(m.split_tracks(), Some((1, 2)));
     }
 
     #[test]

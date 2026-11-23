@@ -1,14 +1,17 @@
 //! `niruclip edit`: a small, fast video editor.
 //!
-//! Cut, join and trim recordings and other videos, add music, simple
-//! effects, titles and transitions, and export to the usual formats. The
+//! Cut, join and trim recordings and other videos, add music, effects,
+//! styled titles, zooms, hidden areas, captions and transitions, level the
+//! sound for speech and export to the usual formats or a size limit. The
 //! sources are never changed: a project is a list of decisions that one
 //! ffmpeg run turns into a film.
 
 // Drawing calls take a position, a size and colours.
 #![allow(clippy::too_many_arguments)]
+mod analyze;
 mod browser;
 mod export;
+mod fonts;
 mod gfx;
 mod job;
 mod media;
@@ -20,6 +23,19 @@ mod ui;
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+
+/// A helper process (ffmpeg, nirudictate) ends with the editor, even when
+/// the editor is killed: no orphan keeps rendering in the background.
+pub fn die_with_parent(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: prctl is async-signal-safe and touches no memory of ours.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+            Ok(())
+        })
+    }
+}
 
 pub fn home() -> PathBuf {
     std::env::var_os("HOME")
@@ -69,6 +85,18 @@ pub struct Settings {
     /// Last chosen export height, 0 keeps the size.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub height: Option<u32>,
+    /// Last chosen size limit in MB, 0 is none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit_mb: Option<u32>,
+    /// Last chosen captions handling (see export::CAPTIONS).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub captions: Option<u8>,
+    /// Language of generated captions ("sv", "en").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caption_language: Option<String>,
+    /// Pause finding: shortest pause, silence level (0 auto), air kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pauses: Option<[usize; 3]>,
     /// The last choices for recording from the editor.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub record: Option<record::Choices>,
@@ -229,10 +257,13 @@ fn ui_scale() -> f32 {
 const HELP: &str = "\
 niruclip edit [FILE...]      open the editor, with videos or a project
 niruclip edit --export PROJECT [--format F] [--height H] [--output FILE]
+                  [--limit MB] [--captions burn|track]
                              render a saved project without a window
 
 Formats: mp4 (default), mp4-small, webm, mkv, gif, mp3, wav, flac, opus.
-The editor needs mpv for the preview and ffmpeg for everything else.";
+--limit fits the film in a size (two passes, smaller if it must be).
+The editor needs mpv for the preview and ffmpeg for everything else;
+captions need nirudictate.";
 
 pub fn run(args: &[String]) -> Result<(), String> {
     if args.iter().any(|a| a == "-h" || a == "--help") {
@@ -280,16 +311,21 @@ fn export_cli(args: &[String], i: usize) -> Result<(), String> {
             export::free_name(&Settings::load().export_folder(), &base, format.extension())
         }
     };
-    let work = std::env::temp_dir();
-    let settings = export::Settings {
-        format,
-        height,
-        output: output.clone(),
-        font: gfx::font_path(None).map(PathBuf::from),
-        work,
-        range: None,
-        draft: false,
+    let limit_mb = value("--limit")
+        .map(|l| l.parse::<u32>().map_err(|_| format!("bad size limit {l}")))
+        .transpose()?
+        .unwrap_or(0);
+    let captions = match value("--captions").as_deref() {
+        None | Some("off") => 0,
+        Some("burn") => 1,
+        Some("track") | Some("srt") => 2,
+        Some(other) => return Err(format!("--captions takes burn or track, not {other}")),
     };
+    let mut settings = export::Settings::new(format, output.clone(), std::env::temp_dir());
+    settings.height = height;
+    settings.font = gfx::font_path(None).map(PathBuf::from);
+    settings.limit_mb = limit_mb;
+    settings.captions = captions;
     let plan = export::plan(&project, &settings)?;
     let mut job = job::Job::start(plan, output.clone())?;
     let mut last = -1i32;

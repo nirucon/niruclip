@@ -326,6 +326,21 @@ impl Text {
         })
     }
 
+    /// One font file alone (to show a family in its own letters).
+    pub fn from_file(path: &std::path::Path) -> Option<Self> {
+        let font = FontArc::try_from_vec(std::fs::read(path).ok()?).ok()?;
+        Some(Self {
+            font,
+            fallback: None,
+            glyphs: HashMap::new(),
+        })
+    }
+
+    /// The font has a letter for `ch`.
+    pub fn has(&self, ch: char) -> bool {
+        ch.is_whitespace() || self.font.glyph_id(ch).0 != 0
+    }
+
     fn glyph(&mut self, ch: char, size: u32) -> &Glyph {
         let mut font = self.font.clone();
         if font.glyph_id(ch).0 == 0 && !ch.is_whitespace() {

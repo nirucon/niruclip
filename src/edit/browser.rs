@@ -15,6 +15,8 @@ pub enum Purpose {
     MediaFolder,
     /// Choose the folder exports go to.
     ExportFolder,
+    /// A picture over the whole film.
+    Logo,
 }
 
 impl Purpose {
@@ -26,6 +28,7 @@ impl Purpose {
             Purpose::SaveAs => "Save the project as",
             Purpose::MediaFolder => "Folder to open media from",
             Purpose::ExportFolder => "Folder to export to",
+            Purpose::Logo => "A logo or picture over the film",
         }
     }
 
@@ -86,6 +89,9 @@ impl Browser {
                     || super::probe::VIDEO_EXT.contains(&ext.as_str())
             }
             Purpose::SaveAs => super::probe::is_project(path),
+            Purpose::Logo => {
+                super::probe::IMAGE_EXT.contains(&super::probe::extension(path).as_str())
+            }
             Purpose::MediaFolder | Purpose::ExportFolder => false,
         }
     }
