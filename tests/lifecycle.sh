@@ -1008,7 +1008,10 @@ pid=$!
 wait_state recording chan-both.mkv
 common "$BIN" --stop >/dev/null
 wait "$pid"
-grep -q 'pan=stereo|c0=c0|c1=c1\[mic\];\[mic\]\[2:a\]amix' "$TMP/chan-both.log"
+grep -q 'pan=stereo|c0=c0|c1=c1\[mic\];\[mic\]asplit=2\[mixmic\]\[micalone\];\[2:a\]asplit=2\[mixdesk\]\[deskalone\];\[mixmic\]\[mixdesk\]amix' "$TMP/chan-both.log"
+# Both sources are kept alone too, titled for the editor.
+grep -q 'title=Mic' "$TMP/chan-both.log"
+grep -q 'title=Desktop' "$TMP/chan-both.log"
 grep -q '@DEFAULT_MONITOR@' "$TMP/chan-both.log"
 # An input the source does not have: recorded as before, with a notification.
 : > "$FAKE_NOTIFY_LOG"
