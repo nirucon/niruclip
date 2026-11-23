@@ -178,6 +178,7 @@ NIRUX theme and is made for the keyboard; F1 shows every key.
 | Tab | Timeline, settings panel, media list |
 | Ctrl+O, Ctrl+I, Ctrl+M | Open, import, add music |
 | Ctrl+S, Ctrl+E, Ctrl+Z | Save, export, undo (Ctrl+Y redo) |
+| Ctrl+R | Record from the editor |
 
 With the mouse: drag media from the list to the timeline, drag clips to
 reorder them, drag their edges to trim, Shift+drag on the ruler to mark a
@@ -205,6 +206,17 @@ MKV (high quality), GIF, and sound only as MP3, WAV, FLAC or Opus; at the
 original size or 2160p to 480p. With a part marked, only that part is
 exported. The export runs in the background with progress in the top bar
 and a notification when it is done.
+
+**Record from the editor**: Ctrl+R (or Record) chooses full screen (and
+which screen), a window, an area or the camera only; no sound, the
+microphone (and which one), desktop sound or both; the camera in a corner
+with its size; a countdown; and whether the film goes at the end or at the
+playhead. The editor hides while it records, so it is not in the film.
+For a window or an area it waits the countdown first, so you can switch
+workspace before you click. Stop as always, from the bar or with
+`niruclip --stop`: the editor comes back with the recording on the
+timeline. It is NIRUCLIP's own recorder, so the bar, the camera checks and
+recovery work as for any recording. The choices are remembered.
 
 **Folders**: Open and Import start in the Videos folder and exports go
 there too; both can be changed under Settings and are kept in

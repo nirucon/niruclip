@@ -15,6 +15,7 @@ mod media;
 mod mpv;
 mod probe;
 mod project;
+mod record;
 mod ui;
 
 use serde::{Deserialize, Serialize};
@@ -68,6 +69,9 @@ pub struct Settings {
     /// Last chosen export height, 0 keeps the size.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub height: Option<u32>,
+    /// The last choices for recording from the editor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record: Option<record::Choices>,
     /// Recent projects, newest first.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub recent: Vec<PathBuf>,

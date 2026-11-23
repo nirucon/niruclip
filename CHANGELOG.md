@@ -3,6 +3,19 @@
 All notable changes to NIRUCLIP. Earlier releases are described in their
 GitHub release notes and commit messages.
 
+## 0.10.0 (2026-11-23)
+
+### Added
+- **Record from the editor.** Ctrl+R or the Record button: full screen
+  (and which screen), a window, an area or the camera only; sound none,
+  microphone (and which), desktop or both; the camera in a corner with its
+  size; a countdown; and whether the film goes at the end or at the
+  playhead. The editor hides while recording and comes back with the new
+  film on the timeline when the recording is stopped from the bar or with
+  `niruclip --stop`. For a window or an area the countdown comes before the
+  click, so there is time to switch workspace. The choices are kept in
+  `edit.toml`.
+
 ## 0.9.0 (2026-11-23)
 
 ### Added

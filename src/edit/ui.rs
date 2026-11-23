@@ -6,6 +6,7 @@ use super::job::Job;
 use super::media::{Cache, PEAKS_PER_SECOND, THUMB_H};
 use super::mpv::{self, Mpv, Timeline};
 use super::project::{AudioClip, Clip, History, Project, Transition};
+use super::record::{self, Recording};
 use super::{probe, Settings, Theme};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -93,6 +94,8 @@ enum Action {
     CloseOverlay,
     Recent(usize),
     Recover,
+    Record,
+    RecordStart,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -117,6 +120,8 @@ enum Hit {
     Height(usize),
     /// Inside a dialog: nothing, but the click does not fall through.
     Block,
+    /// A choice in the record dialog: row and option.
+    Choice(usize, usize),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -464,6 +469,7 @@ enum Overlay {
     Export(ExportForm),
     Settings,
     Help,
+    Record(record::Form),
     TextInput {
         title: String,
         text: String,
@@ -530,6 +536,8 @@ struct State {
     nudge: bool,
     /// The last left click, for double clicks.
     last_click: Option<(Hit, Instant)>,
+    /// A recording started from the editor; the window hides meanwhile.
+    recording: Option<Recording>,
 }
 
 struct Painter {
@@ -745,6 +753,7 @@ pub fn run(files: Vec<PathBuf>) -> Result<(), String> {
         last_autosave: Instant::now(),
         nudge: false,
         last_click: None,
+        recording: None,
     };
     for f in files {
         if probe::is_project(&f) {
@@ -757,6 +766,7 @@ pub fn run(files: Vec<PathBuf>) -> Result<(), String> {
 
     let keymap = Keymap::load(&c)?;
     let mut video_mapped = false;
+    let mut main_hidden = false;
     let mut video_geometry = Rect::default();
     let mut title = String::new();
     let fd = {
@@ -846,6 +856,18 @@ pub fn run(files: Vec<PathBuf>) -> Result<(), String> {
             st.fit(&l);
             st.fitted = true;
         }
+        // The whole window hides while a recording from here runs.
+        let want_hidden = st.recording.is_some();
+        if want_hidden != main_hidden {
+            if want_hidden {
+                let _ = c.unmap_window(win);
+            } else {
+                let _ = c.map_window(win);
+                st.nudge = true;
+            }
+            main_hidden = want_hidden;
+            let _ = c.flush();
+        }
         // Keep the video window where the layout says, hidden when empty or
         // behind an overlay that covers it.
         let show_video = !st.project.clips.is_empty() && matches!(st.overlay, Overlay::None);
@@ -924,6 +946,8 @@ pub fn run(files: Vec<PathBuf>) -> Result<(), String> {
         }
         let timeout = if dirty {
             16
+        } else if st.recording.is_some() {
+            100
         } else if st.playing || st.job.is_some() || st.preview_job.is_some() {
             // The playhead moves: 30 redraws a second are plenty.
             33
@@ -1153,6 +1177,19 @@ impl State {
                     }
                 }
                 mpv::Event::Loaded => self.nudge = true,
+            }
+        }
+        // A recording started from here.
+        if let Some(r) = &mut self.recording {
+            if let Some(done) = r.poll() {
+                any = true;
+                let place = r.place_at;
+                self.recording = None;
+                match done {
+                    record::Done::File(p) => self.add_recording(&p, place),
+                    record::Done::Cancelled => self.say("Recording cancelled"),
+                    record::Done::Failed(e) => self.warn(format!("Recording failed: {e}")),
+                }
             }
         }
         // Export.
@@ -1451,6 +1488,77 @@ impl State {
             Purpose::Music => self.add_music(&entry.path),
             _ => {}
         }
+    }
+
+    // ── Record ──────────────────────────────────────────────────────────
+
+    fn open_record(&mut self) {
+        if self.recording.is_some() {
+            self.warn("A recording is already running.");
+            return;
+        }
+        self.play(false);
+        let choices = self.settings.record.clone().unwrap_or_default();
+        self.overlay = Overlay::Record(record::Form::new(choices));
+    }
+
+    fn start_record(&mut self) {
+        let Overlay::Record(f) = &self.overlay else {
+            return;
+        };
+        let c = f.choices.clone();
+        self.settings.record = Some(c.clone());
+        self.settings.save();
+        let place = (c.place == 1 && !self.project.clips.is_empty()).then_some(self.playhead);
+        let wait = record::pre_delay(&c);
+        if wait > 0 {
+            let how = if c.what == 1 {
+                "then click the window to record"
+            } else {
+                "then drag the area to record"
+            };
+            notify(
+                &format!("Recording in {wait} s"),
+                &format!("Switch to the right workspace, {how}."),
+            );
+        }
+        self.play(false);
+        self.recording = Some(Recording::new(&c, place, &self.work));
+        self.overlay = Overlay::None;
+    }
+
+    /// Put a finished recording on the timeline.
+    fn add_recording(&mut self, path: &Path, place: Option<f64>) {
+        let media = match probe::probe(path) {
+            Ok(m) => m,
+            Err(e) => {
+                self.warn(e);
+                return;
+            }
+        };
+        self.cache.want(&media);
+        let mut index = 0;
+        self.change(|p| {
+            let i = p.add_media(media);
+            let at = match place {
+                Some(t) => {
+                    p.split(t);
+                    let starts = p.starts();
+                    starts
+                        .iter()
+                        .position(|s| *s >= t - 1e-6)
+                        .unwrap_or(p.clips.len())
+                }
+                None => p.clips.len(),
+            };
+            index = p.append(i, Some(at));
+        });
+        self.selected = Some(index);
+        self.bin_selected = self.project.media.len().saturating_sub(1);
+        self.fitted = false;
+        let start = self.project.starts().get(index).copied().unwrap_or(0.0);
+        self.seek(start);
+        self.say(format!("Recording added: {}", path.display()));
     }
 
     // ── Export ──────────────────────────────────────────────────────────
@@ -1885,6 +1993,20 @@ impl State {
                 }
                 return false;
             }
+            Overlay::Record(f) => {
+                let rows = f.rows();
+                f.row = f.row.min(rows.len() - 1);
+                match sym {
+                    K_ESCAPE => self.overlay = Overlay::None,
+                    K_RETURN | K_KP_ENTER => self.start_record(),
+                    K_UP => f.row = f.row.saturating_sub(1),
+                    K_DOWN | K_TAB => f.row = (f.row + 1).min(rows.len() - 1),
+                    K_LEFT => f.step(rows[f.row], -1),
+                    K_RIGHT | 0x20 => f.step(rows[f.row], 1),
+                    _ => {}
+                }
+                return false;
+            }
             Overlay::Settings | Overlay::Help => {
                 if matches!(sym, K_ESCAPE | K_RETURN | K_KP_ENTER | K_F1) || sym == u32::from(b'?')
                 {
@@ -1898,6 +2020,7 @@ impl State {
             match sym_char(sym).map(|c| c.to_ascii_lowercase()) {
                 Some('q') => return self.request_quit(),
                 Some('o') => self.browse(Purpose::Open),
+                Some('r') => self.open_record(),
                 Some('i') => self.browse(Purpose::Import),
                 Some('m') => self.browse(Purpose::Music),
                 Some('s') => self.save(shift),
@@ -2178,6 +2301,8 @@ impl State {
                 self.settings.save();
                 self.say("Folders reset to Videos");
             }
+            Action::Record => self.open_record(),
+            Action::RecordStart => self.start_record(),
             Action::Recover => {
                 let path = autosave_path();
                 self.open_project(&path);
@@ -2258,6 +2383,15 @@ impl State {
                         b.toggle_mark();
                     } else if double {
                         self.browser_accept(false);
+                    }
+                }
+            }
+            Some(Hit::Choice(r, i)) => {
+                if let Overlay::Record(f) = &mut self.overlay {
+                    let rows = f.rows();
+                    if let Some(row) = rows.get(r).copied() {
+                        f.row = r;
+                        f.set(row, i);
                     }
                 }
             }
@@ -2680,6 +2814,7 @@ fn draw(p: &mut Painter, st: &mut State, l: &Layout, w: i32, h: i32) {
         Overlay::Browser(_) => draw_browser(p, st, l, &t, s),
         Overlay::Export(_) => draw_export(p, st, l, &t, s),
         Overlay::Settings => draw_settings(p, st, l, &t, s),
+        Overlay::Record(_) => draw_record(p, st, l, &t, s),
         Overlay::Help => draw_help(p, l, &t, s),
         Overlay::TextInput { .. } => draw_text_input(p, st, l, &t, s),
     }
@@ -2736,6 +2871,7 @@ fn draw_top(p: &mut Painter, st: &State, l: &Layout, t: &Theme, s: i32) {
         ("Import", Action::Import),
         ("Music", Action::Music),
         ("Save", Action::Save),
+        ("● Record", Action::Record),
     ] {
         x += button(p, t, x, y, label, a, s, false) + s / 2;
     }
@@ -3178,8 +3314,18 @@ fn draw_center(p: &mut Painter, st: &State, l: &Layout, t: &Theme, s: i32) {
     p.tx.draw(&mut p.cv, cx - tw / 2, y, title, big, t.foreground);
     y += s * 3;
     let bw = s * 9;
-    let x0 = cx - (bw * 2 + s) / 2;
+    let x0 = cx - (bw * 3 + s * 2) / 2;
     button(p, t, x0, y, "Open…  Ctrl+O", Action::Open, s, true);
+    button(
+        p,
+        t,
+        x0 + 2 * (bw + s),
+        y,
+        "● Record…  Ctrl+R",
+        Action::Record,
+        s,
+        false,
+    );
     button(
         p,
         t,
@@ -3982,6 +4128,143 @@ fn draw_export(p: &mut Painter, st: &State, l: &Layout, t: &Theme, s: i32) {
     );
 }
 
+fn draw_record(p: &mut Painter, st: &State, l: &Layout, t: &Theme, s: i32) {
+    let Overlay::Record(f) = &st.overlay else {
+        return;
+    };
+    let rows = f.rows();
+    let r = dialog(
+        p,
+        l,
+        t,
+        s,
+        s * 52,
+        s * 6 + rows.len() as i32 * s * 3 + s * 6,
+        "Record",
+    );
+    let size = t.size * 9 / 10;
+    let mut y = r.y + s * 3;
+    let lx = r.x + s;
+    let cx0 = r.x + s * 10;
+    let max_x = r.x + r.w - s;
+    for (k, row) in rows.iter().enumerate() {
+        let focused = k == f.row.min(rows.len() - 1);
+        if focused {
+            p.cv.round(
+                r.x + s / 3,
+                y - s / 4,
+                r.w - s * 2 / 3,
+                s * 2 + s / 4,
+                s / 3,
+                t.selected,
+            );
+        }
+        p.tx.draw(
+            &mut p.cv,
+            lx,
+            y + s / 5,
+            record::Form::label(*row),
+            size,
+            if focused { t.accent } else { t.muted },
+        );
+        let (opts, chosen) = f.options(*row);
+        let mut x = cx0;
+        let mut cut = false;
+        for (i, label) in opts.iter().enumerate() {
+            let w = p.tx.width(label, size) + s;
+            if x + w > max_x && x > cx0 {
+                cut = i <= chosen;
+                break;
+            }
+            let rect = Rect::new(x, y, w, s * 17 / 10);
+            let on = i == chosen;
+            p.cv.round(
+                rect.x,
+                rect.y,
+                rect.w,
+                rect.h,
+                s / 3,
+                if on { t.accent } else { t.raised },
+            );
+            p.tx.draw(
+                &mut p.cv,
+                x + s / 2,
+                y + s / 5,
+                label,
+                size,
+                if on { t.background } else { t.foreground },
+            );
+            p.hits.push((rect, Hit::Choice(k, i)));
+            x += w + s / 3;
+        }
+        if cut {
+            // A long list (microphones): the chosen one did not fit.
+            let label = format!("▸ {}   (← → to choose)", opts[chosen]);
+            p.tx.fit(
+                &mut p.cv,
+                cx0,
+                y + s * 2,
+                &label,
+                size,
+                t.accent,
+                max_x - cx0,
+            );
+            y += s;
+        }
+        y += s * 3;
+    }
+    let small = t.size * 85 / 100;
+    let wait = record::pre_delay(&f.choices);
+    let info = match f.choices.what {
+        1 | 2 if wait > 0 => format!(
+            "The editor hides and waits {wait} s so you can switch workspace, then you {}.",
+            if f.choices.what == 1 {
+                "click the window"
+            } else {
+                "drag the area"
+            }
+        ),
+        1 => "The editor hides, then you click the window.".to_string(),
+        2 => "The editor hides, then you drag the area.".to_string(),
+        _ => "The editor hides during the countdown and the recording.".to_string(),
+    };
+    p.tx.fit(&mut p.cv, r.x + s, y, &info, small, t.muted, r.w - 2 * s);
+    p.tx.fit(
+        &mut p.cv,
+        r.x + s,
+        y + s * 3 / 2,
+        "Stop it from the bar or with niruclip --stop: the film lands on the timeline.",
+        small,
+        t.muted,
+        r.w - 2 * s,
+    );
+    let by = r.y + r.h - s * 5 / 2;
+    let label = "● Start recording  Enter";
+    let size9 = (s as u32 * 9 / 10).max(10);
+    let aw = p.tx.width(label, size9) + s;
+    button(
+        p,
+        t,
+        r.x + r.w - s - aw,
+        by,
+        label,
+        Action::RecordStart,
+        s,
+        true,
+    );
+    let cw = p.tx.width("Cancel", size9) + s;
+    button(
+        p,
+        t,
+        r.x + r.w - s - aw - s / 2 - cw,
+        by,
+        "Cancel",
+        Action::CloseOverlay,
+        s,
+        false,
+    );
+}
+
 fn draw_settings(p: &mut Painter, st: &State, l: &Layout, t: &Theme, s: i32) {
     let r = dialog(p, l, t, s, s * 44, s * 20, "Settings");
     let small = t.size * 85 / 100;
@@ -4066,6 +4349,10 @@ const KEYS: &[(&str, &str)] = &[
     ("Ctrl+O  Ctrl+I  Ctrl+M", "Open, import, add music"),
     ("Ctrl+S  Ctrl+Shift+S", "Save, save as"),
     ("Ctrl+E", "Export"),
+    (
+        "Ctrl+R",
+        "Record the screen, a window, an area or the camera",
+    ),
     ("Ctrl+Q", "Quit"),
     (
         "Mouse",
