@@ -1,4 +1,5 @@
 mod camera;
+mod edit;
 mod mic;
 mod sound;
 
@@ -13,7 +14,7 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const VERSION: &str = "0.8.1";
+const VERSION: &str = "0.9.0";
 const SCHEMA: u32 = 1;
 const ACTIVE_STATES: &[&str] = &[
     "countdown",
@@ -2507,7 +2508,8 @@ Usage: niruclip --full|--region|--window|--webcam-only [options]\n\
        niruclip --stop | --pause | --resume | --status [--json] | --recover\n\
        niruclip --list-profiles | --save-profile NAME | --list-mics [--json]\n\
        niruclip --check-camera | --preview\n\
-       niruclip --export mp4|gif [--input FILE] [--from S] [--to S] | --share [--input FILE]\n\n\
+       niruclip --export mp4|gif [--input FILE] [--from S] [--to S] | --share [--input FILE]\n\
+       niruclip edit [FILE...]          the video editor (see niruclip edit --help)\n\n\
 Options:\n\
   --audio none|mic|desktop|both\n\
   --mic SOURCE|default              microphone: source name or part of its description\n\
@@ -5766,6 +5768,9 @@ fn list_profiles(config: &Config) {
 fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let result = (|| -> Result<(), String> {
+        if argv.first().map(String::as_str) == Some("edit") {
+            return edit::run(&argv[1..]);
+        }
         if argv.iter().any(|arg| arg == "--version") {
             println!("NIRUCLIP {VERSION}");
             return Ok(());

@@ -18,6 +18,11 @@ process that lives exactly as long as the recording.
 In NIRUX you normally start it from the recording view of NIRU Launcher, and
 NIRUBAR shows the running, paused, interrupted or failed recording.
 
+`niruclip edit` is the editor that goes with it: cut, join and trim
+recordings and other videos, add music, titles, simple effects and
+transitions, and export to the usual formats, without another program. The
+sources are never changed. See [Editing](#editing).
+
 ## Features
 
 - Full screen, region, window rectangle or camera-only recording.
@@ -62,6 +67,7 @@ NIRUBAR shows the running, paused, interrupted or failed recording.
 - X11 (Debian, Arch and Void glibc, x86_64). The released binary is a static
   x86_64 musl build.
 - `ffmpeg` (with `ffprobe`), `slop` for region capture, `xrandr`.
+- For the editor: `mpv` (the preview) and a TrueType font (DejaVu or Noto).
 - For camera and microphone: a V4L2 camera, `v4l2-ctl` (`v4l-utils`) and
   PipeWire's PulseAudio interface.
 - Optional: `notify-send`, a VAAPI driver for hardware encoding.
@@ -143,6 +149,71 @@ overwritten.
 
 The details of encoding, pause/resume, recovery, the state file, audio mixing,
 disk-space checks and exit codes are in [docs/REFERENCE.md](docs/REFERENCE.md).
+
+## Editing
+
+```sh
+niruclip edit                      # start empty: open or import from the Videos folder
+niruclip edit recording.mkv b.mp4  # these videos on the timeline
+niruclip edit film.niruclip        # a saved project
+niruclip edit --export film.niruclip --format mp4 --height 1080   # render without a window
+```
+
+The window has the media you imported on the left, the preview in the
+middle, the settings of the selected clip on the right and the timeline at
+the bottom, with lanes for the picture, its sound and music. It follows the
+NIRUX theme and is made for the keyboard; F1 shows every key.
+
+| Keys | What |
+|---|---|
+| Space, J K L | Play or pause; back 2 s, pause, play (L again: faster) |
+| ← →, Shift+← → | One frame, one second |
+| ↑ ↓, Home End | Previous or next cut, start or end |
+| S | Split the clip at the playhead |
+| I, O, X, C | Mark the start and end of a part, cut it out, or keep only it |
+| Delete | Remove the clip (or the marked part) |
+| Alt+← → | Move the clip earlier or later |
+| M, T | Mute the clip, write a title over it |
+| P | Preview with effects and transitions |
+| Tab | Timeline, settings panel, media list |
+| Ctrl+O, Ctrl+I, Ctrl+M | Open, import, add music |
+| Ctrl+S, Ctrl+E, Ctrl+Z | Save, export, undo (Ctrl+Y redo) |
+
+With the mouse: drag media from the list to the timeline, drag clips to
+reorder them, drag their edges to trim, Shift+drag on the ruler to mark a
+part, the wheel scrolls the timeline (Ctrl+wheel zooms).
+
+**What a clip can do**: speed (0.25 to 4 times, the sound follows),
+volume and mute, fade in and out, a transition from the clip before (cross
+fade, dissolve, through black or white, wipes, slides, circle, pixelize),
+brightness, contrast, colour (0 is black and white), blur, sharpen,
+rotate, mirror, crop and a title with position and size. Music sits under
+the film with its own volume and fades.
+
+**Preview**: the timeline plays live in mpv, on the graphics card, with
+every cut. Speed changes, effects and transitions are shown as they will be
+exported when you press P, which renders a few seconds around the playhead
+(or the marked part) in the background.
+
+**Import**: anything ffmpeg reads. Video: mkv, mp4, m4v, mov, webm, avi,
+wmv, flv, mpg, ts, m2ts, 3gp, ogv, gif. Sound: mp3, wav, flac, ogg, opus,
+m4a, aac, wma, aiff. Pictures (shown for 5 s, changeable by trimming): png,
+jpg, webp, bmp, tif.
+
+**Export**: MP4 (H.264 and AAC), a small MP4 to share, WebM (VP9 and Opus),
+MKV (high quality), GIF, and sound only as MP3, WAV, FLAC or Opus; at the
+original size or 2160p to 480p. With a part marked, only that part is
+exported. The export runs in the background with progress in the top bar
+and a notification when it is done.
+
+**Folders**: Open and Import start in the Videos folder and exports go
+there too; both can be changed under Settings and are kept in
+`~/.config/niruclip/edit.toml`. A project is a small `.niruclip` file (JSON)
+that lists the media and what was done with it.
+
+**Safety**: the sources are only read. Every edit can be undone, an
+unsaved project is kept every 20 seconds and offered on the next start, and
+an export never overwrites a file (`film-2.mp4`, `film-3.mp4`).
 
 ## Configuration
 
@@ -259,6 +330,9 @@ the [reference](docs/REFERENCE.md#environment-overrides).
 | `~/.local/state/niruclip/vaapi-probe.json` | Cached VAAPI probe result per boot |
 | `~/.local/state/niruclip/camera-cache.json` | Cached camera capabilities per device node and boot |
 | `~/Videos/NIRUCLIP-*.mkv` | Recordings (`*.part.mkv` while recording); `--export` writes `.mp4`/`.gif` next to them |
+| `~/.config/niruclip/edit.toml` | Editor folders, last export format, recent projects |
+| `~/.local/state/niruclip/autosave.niruclip` | The editor's unsaved project, offered on the next start |
+| `~/.cache/niruclip/` | Editor thumbnails and sound waves (safe to delete) |
 | `$XDG_RUNTIME_DIR/niruclip-PID.pgm` | A 128x96 grey copy of the current camera frame while recording (tmpfs, removed at the end) |
 
 Recordings, partials and profiles are user data. NIRUCLIP never deletes a

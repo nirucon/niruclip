@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=NIRUCLIP Editor
+GenericName=Video Editor
+Comment=Cut, join and export videos: titles, effects, transitions and music
+Exec=niruclip edit %F
+Icon=niruclip
+Terminal=false
+Categories=AudioVideo;Video;AudioVideoEditing;
+MimeType=video/mp4;video/x-matroska;video/webm;video/quicktime;video/x-msvideo;video/mpeg;video/ogg;video/x-flv;video/3gpp;application/x-niruclip;
+Keywords=video;editor;cut;trim;clip;film;export;
+StartupWMClass=niruclip-edit

@@ -34,13 +34,15 @@ jobs:
         run: |
           mkdir dist
           cp target/x86_64-unknown-linux-musl/release/niruclip dist/
-          cp install.sh dist/
-          (cd dist && sha256sum niruclip install.sh > SHA256SUMS)
+          cp install.sh assets/niruclip-edit.desktop assets/niruclip.svg dist/
+          (cd dist && sha256sum niruclip install.sh niruclip-edit.desktop niruclip.svg > SHA256SUMS)
       - uses: softprops/action-gh-release@v2
         with:
           files: |
             dist/niruclip
             dist/install.sh
+            dist/niruclip-edit.desktop
+            dist/niruclip.svg
             dist/SHA256SUMS
           make_latest: true
           generate_release_notes: true

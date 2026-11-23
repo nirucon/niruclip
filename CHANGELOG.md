@@ -3,6 +3,25 @@
 All notable changes to NIRUCLIP. Earlier releases are described in their
 GitHub release notes and commit messages.
 
+## 0.9.0 (2026-11-23)
+
+### Added
+- **`niruclip edit`, a video editor.** Import videos, sound and pictures in
+  the usual formats, cut, split, trim and reorder them on a timeline, add
+  music under the film, titles, speed, volume, fades, transitions (cross
+  fade, dissolve, through black or white, wipes, slides, circle, pixelize)
+  and picture effects (brightness, contrast, colour, blur, sharpen, rotate,
+  mirror, crop). The preview is mpv in the window, on the graphics card;
+  P renders a stretch with every effect. Export to MP4, a small MP4, WebM,
+  MKV, GIF, MP3, WAV, FLAC or Opus, at the original size or 2160p to 480p,
+  the whole film or a marked part, in the background. Projects are small
+  `.niruclip` files; the sources are never changed. Undo and redo, autosave,
+  keyboard first (F1 lists the keys). Open, import and export use the
+  Videos folder unless changed under Settings. `niruclip edit --export`
+  renders a project without a window. Needs `mpv`.
+- The release carries `niruclip-edit.desktop` and `niruclip.svg`, so the
+  editor shows in the launcher and under "Open with" for videos.
+
 ## 0.8.1 (2026-11-22)
 
 ### Changed
