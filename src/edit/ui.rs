@@ -5,7 +5,7 @@ use super::gfx::{Canvas, Text};
 use super::job::Job;
 use super::media::{Cache, PEAKS_PER_SECOND, THUMB_H};
 use super::mpv::{self, Mpv, Timeline};
-use super::project::{AudioClip, Clip, History, Media, Project, Transition};
+use super::project::{AudioClip, Clip, History, Media, Project, Transition, PIP_BORDERS};
 use super::record::{self, Recording};
 use super::{analyze, probe, Settings, Theme};
 use std::path::{Path, PathBuf};
@@ -108,6 +108,7 @@ enum Action {
     AreaClear,
     AreaWhole,
     FontAccept,
+    PlaceReset,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -141,6 +142,8 @@ enum Hit {
     ListRow(usize),
     /// The still in the area picker.
     AreaImage,
+    /// The rendered picture in the placing view.
+    PlaceImage,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -159,6 +162,14 @@ enum Focus {
 
 #[derive(Clone, Debug)]
 enum Drag {
+    /// Moving the title (0) or the picture-in-picture (1) in the placing
+    /// view: the picture's rect and where it was taken hold of, in frame
+    /// pixels from the thing's centre.
+    Place {
+        image: Rect,
+        what: u8,
+        grab: (f64, f64),
+    },
     Scrub,
     Range(f64),
     Clip {
@@ -252,13 +263,24 @@ enum Param {
     TextStart,
     TextLength,
     TextFade,
+    TextEffect,
+    TextAccent,
+    PlaceText,
+    Pip,
+    PipShape,
+    PipBorder,
+    PipShadow,
+    PipEffect,
+    PipStart,
+    PipLength,
+    PlacePip,
     MusicVolume,
     MusicFadeIn,
     MusicFadeOut,
 }
 
 /// Every clip setting, in the order the panel shows them.
-const ALL_CLIP_PARAMS: [Param; 40] = [
+const ALL_CLIP_PARAMS: [Param; 51] = [
     Param::Speed,
     Param::Volume,
     Param::Mute,
@@ -288,14 +310,25 @@ const ALL_CLIP_PARAMS: [Param; 40] = [
     Param::HideArea,
     Param::HideStart,
     Param::HideLength,
+    Param::Pip,
+    Param::PlacePip,
+    Param::PipShape,
+    Param::PipBorder,
+    Param::PipShadow,
+    Param::PipEffect,
+    Param::PipStart,
+    Param::PipLength,
     Param::Title,
     Param::Template,
+    Param::PlaceText,
     Param::Font,
     Param::FontStyle,
     Param::TextColour,
     Param::TextLook,
+    Param::TextAccent,
     Param::TitlePosition,
     Param::TitleSize,
+    Param::TextEffect,
     Param::TextStart,
     Param::TextLength,
     Param::TextFade,
@@ -332,6 +365,15 @@ fn clip_params(c: &Clip, m: &Media) -> Vec<Param> {
             | Param::HideKind => !card && m.has_video,
             Param::ZoomStart | Param::ZoomLength | Param::ZoomRamp => !card && e.has_zoom(),
             Param::HideArea | Param::HideStart | Param::HideLength => !card && e.hide > 0,
+            Param::Pip => m.has_video,
+            Param::PlacePip
+            | Param::PipShape
+            | Param::PipBorder
+            | Param::PipShadow
+            | Param::PipEffect
+            | Param::PipStart
+            | Param::PipLength => pip_on(c, m),
+            Param::TextAccent => !e.text.trim().is_empty() && e.text_look >= 4,
             Param::Template
             | Param::Font
             | Param::FontStyle
@@ -341,10 +383,41 @@ fn clip_params(c: &Clip, m: &Media) -> Vec<Param> {
             | Param::TitleSize
             | Param::TextStart
             | Param::TextLength
-            | Param::TextFade => !e.text.trim().is_empty(),
+            | Param::TextFade
+            | Param::TextEffect
+            | Param::PlaceText => !e.text.trim().is_empty(),
             _ => true,
         })
         .collect()
+}
+
+/// Whether a clip shows a picture-in-picture: its own camera track or a
+/// chosen picture or film.
+fn pip_on(c: &Clip, m: &Media) -> bool {
+    match c.pip.mode {
+        1 => false,
+        2 => c.pip.media.is_some(),
+        _ => !m.still && !m.is_card() && m.own_camera().is_some(),
+    }
+}
+
+const PIP_SHAPES: [&str; 4] = ["As recorded", "Rounded", "Circle", "Rectangle"];
+const PIP_EFFECTS: [&str; 3] = ["None", "Fade", "Slide in"];
+
+/// What a clip's picture-in-picture shows, for the panel.
+fn pip_label(project: &Project, c: &Clip) -> String {
+    let m = &project.media[c.media];
+    match c.pip.mode {
+        1 => "Off".into(),
+        2 => c
+            .pip
+            .media
+            .and_then(|k| project.media.get(k))
+            .map(|x| x.name())
+            .unwrap_or_else(|| "Off".into()),
+        _ if m.own_camera().is_some() && !m.still => "Camera (its own track)".into(),
+        _ => "Off (←→ picks a picture or film)".into(),
+    }
 }
 
 /// Text colours to choose from.
@@ -371,7 +444,7 @@ const CARD_COLOURS: [(u32, &str); 8] = [
     (0xf4ecd8, "Cream"),
 ];
 
-const PLACES: [&str; 9] = [
+const PLACES: [&str; 10] = [
     "Top left",
     "Top",
     "Top right",
@@ -381,17 +454,34 @@ const PLACES: [&str; 9] = [
     "Bottom left",
     "Bottom",
     "Bottom right",
+    "Free (placed with E)",
 ];
-const LOOKS: [&str; 4] = ["Box behind", "Outline", "Shadow", "Plain"];
 const HIDES: [&str; 4] = ["Off", "Blur", "Pixelate", "Black box"];
-const TEMPLATES: [&str; 4] = ["Custom", "Heading", "Name tag", "Subtitle bar"];
+const TEMPLATES: [&str; 9] = [
+    "Custom",
+    "Heading",
+    "Name tag",
+    "Subtitle bar",
+    "Lower third",
+    "Neon heading",
+    "Marker",
+    "Pop heading",
+    "Typewriter",
+];
 
-/// (position, size, look, style, start, length, fade) of each template.
-fn template(i: usize) -> Option<(u8, f64, u8, u8, f64, f64, f64)> {
+/// (position, size, look, style, start, length, fade, effect) of each
+/// template.
+type Template = (u8, f64, u8, u8, f64, f64, f64, u8);
+fn template(i: usize) -> Option<Template> {
     match i {
-        1 => Some((4, 10.0, 2, 1, 0.0, 0.0, 0.5)),
-        2 => Some((6, 5.0, 0, 1, 0.5, 5.0, 0.4)),
-        3 => Some((7, 5.0, 0, 0, 0.0, 0.0, 0.0)),
+        1 => Some((4, 10.0, 2, 1, 0.0, 0.0, 0.5, 0)),
+        2 => Some((6, 5.0, 0, 1, 0.5, 5.0, 0.4, 0)),
+        3 => Some((7, 5.0, 0, 0, 0.0, 0.0, 0.0, 0)),
+        4 => Some((6, 5.5, 4, 1, 0.5, 6.0, 0.5, 2)),
+        5 => Some((4, 11.0, 5, 1, 0.0, 0.0, 0.6, 3)),
+        6 => Some((7, 6.0, 6, 1, 0.0, 0.0, 0.4, 1)),
+        7 => Some((4, 12.0, 2, 1, 0.0, 0.0, 0.5, 3)),
+        8 => Some((7, 6.0, 0, 0, 0.0, 0.0, 0.0, 4)),
         _ => None,
     }
 }
@@ -399,7 +489,7 @@ fn template(i: usize) -> Option<(u8, f64, u8, u8, f64, f64, f64)> {
 fn template_of(e: &super::project::Effects) -> usize {
     (1..TEMPLATES.len())
         .find(|i| {
-            template(*i).is_some_and(|(pos, size, look, style, start, length, fade)| {
+            template(*i).is_some_and(|(pos, size, look, style, start, length, fade, anim)| {
                 e.text_position == pos
                     && (e.text_size - size).abs() < 1e-6
                     && e.text_look == look
@@ -407,6 +497,7 @@ fn template_of(e: &super::project::Effects) -> usize {
                     && (e.text_start - start).abs() < 1e-6
                     && (e.text_length - length).abs() < 1e-6
                     && (e.text_fade - fade).abs() < 1e-6
+                    && e.text_anim == anim
             })
         })
         .unwrap_or(0)
@@ -445,7 +536,18 @@ impl Param {
             | Param::TitleSize
             | Param::TextStart
             | Param::TextLength
-            | Param::TextFade => "Title",
+            | Param::TextFade
+            | Param::TextEffect
+            | Param::TextAccent
+            | Param::PlaceText => "Title",
+            Param::Pip
+            | Param::PipShape
+            | Param::PipBorder
+            | Param::PipShadow
+            | Param::PipEffect
+            | Param::PipStart
+            | Param::PipLength
+            | Param::PlacePip => "Picture in picture",
             Param::MusicVolume | Param::MusicFadeIn | Param::MusicFadeOut => "Music",
         }
     }
@@ -474,8 +576,15 @@ impl Param {
             Param::CropRight => "Right",
             Param::CropBottom => "Bottom",
             Param::ZoomArea | Param::HideArea => "Area",
-            Param::ZoomStart | Param::HideStart | Param::TextStart => "Starts at",
-            Param::ZoomLength | Param::HideLength | Param::TextLength => "Lasts",
+            Param::ZoomStart | Param::HideStart | Param::TextStart | Param::PipStart => "Starts at",
+            Param::ZoomLength | Param::HideLength | Param::TextLength | Param::PipLength => "Lasts",
+            Param::TextEffect | Param::PipEffect => "Effect",
+            Param::TextAccent => "Accent",
+            Param::PlaceText | Param::PlacePip => "On the picture",
+            Param::Pip => "Shows",
+            Param::PipShape => "Shape",
+            Param::PipBorder => "Border",
+            Param::PipShadow => "Shadow",
             Param::ZoomRamp => "Glide",
             Param::HideKind => "How",
             Param::Title => "Text",
@@ -499,7 +608,9 @@ impl Param {
             | Param::HideStart
             | Param::HideLength
             | Param::TextStart
-            | Param::TextLength => (0.0, (len * 10.0).floor() / 10.0, 0.1),
+            | Param::TextLength
+            | Param::PipStart
+            | Param::PipLength => (0.0, (len * 10.0).floor() / 10.0, 0.1),
             _ => self.range(),
         }
     }
@@ -533,8 +644,14 @@ impl Param {
             Param::Template => (0.0, (TEMPLATES.len() - 1) as f64, 1.0),
             Param::FontStyle => (0.0, 3.0, 1.0),
             Param::TextColour => (0.0, (TEXT_COLOURS.len() - 1) as f64, 1.0),
-            Param::TextLook => (0.0, 3.0, 1.0),
-            Param::TitlePosition => (0.0, 8.0, 1.0),
+            Param::TextLook => (0.0, 6.0, 1.0),
+            Param::TitlePosition => (0.0, 9.0, 1.0),
+            Param::TextEffect => (0.0, 4.0, 1.0),
+            Param::TextAccent => (0.0, (TEXT_COLOURS.len() - 1) as f64, 1.0),
+            Param::PipShape => (0.0, 3.0, 1.0),
+            Param::PipBorder => (0.0, (PIP_BORDERS.len() - 1) as f64, 1.0),
+            Param::PipShadow => (0.0, 1.0, 1.0),
+            Param::PipEffect => (0.0, 2.0, 1.0),
             Param::TitleSize => (2.0, 20.0, 1.0),
             Param::TextFade => (0.0, 2.0, 0.1),
             Param::ZoomStart
@@ -542,8 +659,16 @@ impl Param {
             | Param::HideStart
             | Param::HideLength
             | Param::TextStart
-            | Param::TextLength => (0.0, 60.0, 0.1),
-            Param::Title | Param::Font | Param::ZoomArea | Param::HideArea => (0.0, 0.0, 0.0),
+            | Param::TextLength
+            | Param::PipStart
+            | Param::PipLength => (0.0, 60.0, 0.1),
+            Param::Title
+            | Param::Font
+            | Param::ZoomArea
+            | Param::HideArea
+            | Param::Pip
+            | Param::PlaceText
+            | Param::PlacePip => (0.0, 0.0, 0.0),
         }
     }
 
@@ -566,6 +691,15 @@ impl Param {
                 | Param::ZoomArea
                 | Param::HideArea
                 | Param::TitlePosition
+                | Param::TextEffect
+                | Param::TextAccent
+                | Param::PlaceText
+                | Param::Pip
+                | Param::PipShape
+                | Param::PipBorder
+                | Param::PipShadow
+                | Param::PipEffect
+                | Param::PlacePip
         )
     }
 
@@ -573,7 +707,12 @@ impl Param {
     fn opens(self) -> bool {
         matches!(
             self,
-            Param::Title | Param::Font | Param::ZoomArea | Param::HideArea
+            Param::Title
+                | Param::Font
+                | Param::ZoomArea
+                | Param::HideArea
+                | Param::PlaceText
+                | Param::PlacePip
         )
     }
 
@@ -587,6 +726,8 @@ impl Param {
                 | Param::HideLength
                 | Param::TextStart
                 | Param::TextLength
+                | Param::PipStart
+                | Param::PipLength
         )
     }
 
@@ -633,6 +774,14 @@ impl Param {
             Param::TextStart => e.text_start,
             Param::TextLength => e.text_length,
             Param::TextFade => e.text_fade,
+            Param::TextEffect => f64::from(e.text_anim),
+            Param::TextAccent => palette_index(&TEXT_COLOURS, e.text_accent) as f64,
+            Param::PipShape => f64::from(c.pip.shape),
+            Param::PipBorder => f64::from(c.pip.border),
+            Param::PipShadow => f64::from(u8::from(c.pip.shadow)),
+            Param::PipEffect => f64::from(c.pip.effect),
+            Param::PipStart => c.pip.start,
+            Param::PipLength => c.pip.length,
             _ => 0.0,
         }
     }
@@ -683,7 +832,7 @@ impl Param {
             Param::HideStart => e.hide_start = v,
             Param::HideLength => e.hide_length = v,
             Param::Template => {
-                if let Some((pos, size, look, style, start, length, fade)) =
+                if let Some((pos, size, look, style, start, length, fade, anim)) =
                     template(v.round() as usize)
                 {
                     e.text_position = pos;
@@ -693,6 +842,7 @@ impl Param {
                     e.text_start = start;
                     e.text_length = length;
                     e.text_fade = fade;
+                    e.text_anim = anim;
                 }
             }
             Param::FontStyle => e.font_style = v.round() as u8,
@@ -703,6 +853,14 @@ impl Param {
             Param::TextStart => e.text_start = v,
             Param::TextLength => e.text_length = v,
             Param::TextFade => e.text_fade = v,
+            Param::TextEffect => e.text_anim = v.round() as u8,
+            Param::TextAccent => e.text_accent = TEXT_COLOURS[v.round() as usize].0,
+            Param::PipShape => c.pip.shape = v.round() as u8,
+            Param::PipBorder => c.pip.border = v.round() as u8,
+            Param::PipShadow => c.pip.shadow = v >= 0.5,
+            Param::PipEffect => c.pip.effect = v.round() as u8,
+            Param::PipStart => c.pip.start = v,
+            Param::PipLength => c.pip.length = v,
             _ => {}
         }
     }
@@ -760,8 +918,12 @@ impl Param {
                 "{:.0}×{:.0} % at {:.0},{:.0} (Enter)",
                 e.hide_area[2], e.hide_area[3], e.hide_area[0], e.hide_area[1]
             ),
-            Param::ZoomStart | Param::HideStart | Param::TextStart => seconds(v, "The start"),
-            Param::ZoomLength | Param::HideLength | Param::TextLength => seconds(v, "To the end"),
+            Param::ZoomStart | Param::HideStart | Param::TextStart | Param::PipStart => {
+                seconds(v, "The start")
+            }
+            Param::ZoomLength | Param::HideLength | Param::TextLength | Param::PipLength => {
+                seconds(v, "To the end")
+            }
             Param::ZoomRamp => format!("{v:.1} s"),
             Param::HideKind => HIDES[e.hide.min(3) as usize].into(),
             Param::Title => {
@@ -788,8 +950,24 @@ impl Param {
                     format!("#{:06x}", e.text_colour)
                 }
             }
-            Param::TextLook => LOOKS[e.text_look.min(3) as usize].into(),
-            Param::TitlePosition => PLACES[(v as usize).min(8)].into(),
+            Param::TextLook => export::LOOK_NAMES[e.text_look.min(6) as usize].into(),
+            Param::TitlePosition => PLACES[(v as usize).min(9)].into(),
+            Param::TextEffect => export::TEXT_EFFECTS[e.text_anim.min(4) as usize].into(),
+            Param::TextAccent => {
+                let i = palette_index(&TEXT_COLOURS, e.text_accent);
+                if TEXT_COLOURS[i].0 == e.text_accent {
+                    TEXT_COLOURS[i].1.into()
+                } else {
+                    format!("#{:06x}", e.text_accent)
+                }
+            }
+            Param::PlaceText | Param::PlacePip => "Drag it there (Enter or E)".into(),
+            Param::PipShape => PIP_SHAPES[c.pip.shape.min(3) as usize].into(),
+            Param::PipBorder => PIP_BORDERS[(c.pip.border as usize).min(PIP_BORDERS.len() - 1)]
+                .1
+                .into(),
+            Param::PipShadow => if c.pip.shadow { "On" } else { "Off" }.into(),
+            Param::PipEffect => PIP_EFFECTS[c.pip.effect.min(2) as usize].into(),
             Param::TitleSize => format!("{v:.0} %"),
             Param::TextFade => seconds(v, "None"),
             _ => String::new(),
@@ -845,6 +1023,22 @@ enum Overlay {
     Captions(CaptionForm),
     Fonts(FontPicker),
     Area(AreaPicker),
+    Place(Placer),
+}
+
+/// The placing view: one rendered picture of the clip (every effect, the
+/// picture-in-picture and the title as exported) to drag the title and the
+/// picture-in-picture into place and give them a look.
+struct Placer {
+    clip: usize,
+    image: Vec<u32>,
+    iw: i32,
+    ih: i32,
+    /// The frame the boxes are measured in.
+    fw: u32,
+    fh: u32,
+    /// 0 the title, 1 the picture-in-picture.
+    selected: u8,
 }
 
 #[derive(Clone, Copy)]
@@ -2285,6 +2479,10 @@ impl State {
             self.open_param(i, param);
             return;
         }
+        if param == Param::Pip {
+            self.cycle_pip(i, delta);
+            return;
+        }
         let (lo, hi, step) = param.limits(&self.project.clips[i]);
         self.change(|p| {
             let c = &mut p.clips[i];
@@ -2335,8 +2533,49 @@ impl State {
         }
     }
 
+    /// The picture-in-picture shows the clip's camera, nothing, or one of
+    /// the project's pictures and films, in turn.
+    fn cycle_pip(&mut self, i: usize, delta: f64) {
+        let c = &self.project.clips[i];
+        let m = &self.project.media[c.media];
+        let mut choices: Vec<(u8, Option<usize>)> = Vec::new();
+        if m.own_camera().is_some() && !m.still {
+            choices.push((0, None));
+        }
+        choices.push((1, None));
+        for (k, x) in self.project.media.iter().enumerate() {
+            if k != c.media && x.has_video && !x.is_card() {
+                choices.push((2, Some(k)));
+            }
+        }
+        if choices.len() == 1 {
+            self.warn("Import a picture or a film first (Ctrl+I): it can then show in the corner.");
+            return;
+        }
+        let now = if pip_on(c, m) {
+            choices
+                .iter()
+                .position(|(mode, media)| {
+                    *mode == c.pip.mode && (*mode != 2 || *media == c.pip.media)
+                })
+                .unwrap_or(0)
+        } else {
+            choices.iter().position(|(mode, _)| *mode == 1).unwrap_or(0)
+        };
+        let n = choices.len() as i64;
+        let next = (now as i64 + if delta < 0.0 { -1 } else { 1 }).rem_euclid(n) as usize;
+        let (mode, media) = choices[next];
+        self.change(|p| {
+            let pip = &mut p.clips[i].pip;
+            pip.mode = mode;
+            pip.media = media;
+        });
+    }
+
     fn open_param(&mut self, i: usize, param: Param) {
         match param {
+            Param::PlaceText => self.open_place(i, 0),
+            Param::PlacePip => self.open_place(i, 1),
             Param::Title => self.edit_title(i),
             Param::Font => self.open_fonts(i),
             Param::ZoomArea => self.open_area(i, true),
@@ -2490,6 +2729,292 @@ impl State {
             .map(|b| (u32::from(b[2]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[0]))
             .collect();
         Ok((image, dw as i32, dh as i32))
+    }
+
+    /// One picture of clip `i` at the playhead, rendered as the export
+    /// draws it.
+    fn render_still(&self, i: usize) -> Result<(Vec<u32>, i32, i32, u32, u32), String> {
+        let (fw, fh, _) = export::frame(&self.project, 0, Format::Mp4);
+        let height = fh.min(540);
+        let start = self.project.starts()[i];
+        let local = (self.playhead - start).clamp(0.0, self.project.clips[i].length());
+        // Show the title and the picture fully in, even when the playhead
+        // is where they are still coming in or already gone.
+        let (from, to) = export::settled_window(&self.project.clips[i]);
+        let local = if local + 0.02 < from || local > to {
+            from + 0.05
+        } else {
+            local
+        };
+        let mut settings =
+            export::Settings::new(Format::Mp4, PathBuf::from("/dev/null"), self.work.clone());
+        settings.font = super::gfx::font_path(self.theme.font.as_deref()).map(PathBuf::from);
+        let mut temp = Vec::new();
+        let (args, w, h) = export::still(&self.project, i, local, height, &settings, &mut temp)?;
+        let out = std::process::Command::new("ffmpeg")
+            .args(&args)
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .map_err(|e| format!("ffmpeg could not start: {e}"));
+        for f in temp {
+            let _ = std::fs::remove_file(f);
+        }
+        let out = out?;
+        let want = (w * h * 4) as usize;
+        if out.stdout.len() < want {
+            let err = String::from_utf8_lossy(&out.stderr);
+            return Err(format!(
+                "could not draw the picture: {}",
+                err.lines().last().unwrap_or("ffmpeg gave no picture")
+            ));
+        }
+        let image = out.stdout[..want]
+            .chunks_exact(4)
+            .map(|b| (u32::from(b[2]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[0]))
+            .collect();
+        Ok((image, w as i32, h as i32, fw, fh))
+    }
+
+    /// The placing view for clip `i`, the title (0) or the
+    /// picture-in-picture (1) taken first.
+    fn open_place(&mut self, i: usize, what: u8) {
+        self.play(false);
+        let c = &self.project.clips[i];
+        let has_text = !c.effects.text.trim().is_empty();
+        let has_pip = export::pip_source(&self.project, c).is_some();
+        if !has_text && !has_pip {
+            self.warn("Nothing to place: write a title (T) or show a camera or picture (Picture in picture).");
+            return;
+        }
+        let selected = match what {
+            1 if has_pip => 1,
+            0 if has_text => 0,
+            _ => u8::from(!has_text),
+        };
+        match self.render_still(i) {
+            Ok((image, iw, ih, fw, fh)) => {
+                self.overlay = Overlay::Place(Placer {
+                    clip: i,
+                    image,
+                    iw,
+                    ih,
+                    fw,
+                    fh,
+                    selected,
+                });
+            }
+            Err(e) => self.warn(e),
+        }
+    }
+
+    /// Draw the placing view's picture again after a change.
+    fn refresh_place(&mut self) {
+        let Overlay::Place(pl) = &self.overlay else {
+            return;
+        };
+        let i = pl.clip;
+        if i >= self.project.clips.len() {
+            self.overlay = Overlay::None;
+            return;
+        }
+        match self.render_still(i) {
+            Ok((image, iw, ih, fw, fh)) => {
+                if let Overlay::Place(pl) = &mut self.overlay {
+                    pl.image = image;
+                    pl.iw = iw;
+                    pl.ih = ih;
+                    pl.fw = fw;
+                    pl.fh = fh;
+                }
+            }
+            Err(e) => self.warn(e),
+        }
+    }
+
+    /// The title's and the picture-in-picture's boxes in frame pixels.
+    fn place_boxes(&self, pl: &Placer) -> [Option<(f64, f64, f64, f64)>; 2] {
+        let Some(c) = self.project.clips.get(pl.clip) else {
+            return [None, None];
+        };
+        let text = export::text_rect(&c.effects, pl.fw, pl.fh);
+        let pip = export::pip_source(&self.project, c).map(|src| {
+            let (b, _) = export::pip_box(&self.project, c, &src, pl.fw, pl.fh);
+            (
+                f64::from(b.x),
+                f64::from(b.y),
+                f64::from(b.width),
+                f64::from(b.height),
+            )
+        });
+        [text, pip]
+    }
+
+    /// Move the selected thing so its centre is at (cx, cy) frame pixels.
+    fn place_move(&mut self, what: u8, cx: f64, cy: f64) {
+        let Overlay::Place(pl) = &self.overlay else {
+            return;
+        };
+        let (i, fw, fh) = (pl.clip, f64::from(pl.fw), f64::from(pl.fh));
+        let boxes = self.place_boxes(pl);
+        let Some((_, _, bw, bh)) = boxes[what as usize] else {
+            return;
+        };
+        let c = &mut self.project.clips[i];
+        if what == 0 {
+            let e = &mut c.effects;
+            e.text_position = 9;
+            e.text_xy = [
+                (cx / fw * 100.0).clamp(0.0, 100.0),
+                ((cy - bh / 2.0) / fh * 100.0).clamp(0.0, 100.0),
+            ];
+        } else {
+            let pip = &mut c.pip;
+            if pip.area[2] < 0.5 {
+                pip.area[2] = bw / fw * 100.0;
+            }
+            pip.area[0] = (cx / fw * 100.0).clamp(0.0, 100.0);
+            pip.area[1] = (cy / fh * 100.0).clamp(0.0, 100.0);
+        }
+    }
+
+    /// Larger or smaller: the title's size or the picture's width.
+    fn place_resize(&mut self, up: bool) {
+        let Overlay::Place(pl) = &self.overlay else {
+            return;
+        };
+        let (i, what, fw, fh) = (pl.clip, pl.selected, f64::from(pl.fw), f64::from(pl.fh));
+        let pip_box = self.place_boxes(pl)[1];
+        self.change(|p| {
+            let c = &mut p.clips[i];
+            if what == 0 {
+                let e = &mut c.effects;
+                e.text_size = (e.text_size + if up { 0.5 } else { -0.5 }).clamp(2.0, 20.0);
+            } else {
+                let pip = &mut c.pip;
+                if pip.area[2] < 0.5 {
+                    // From "as recorded": keep where it is, then change it.
+                    if let Some((x, y, bw, bh)) = pip_box {
+                        pip.area = [
+                            (x + bw / 2.0) / fw * 100.0,
+                            (y + bh / 2.0) / fh * 100.0,
+                            bw / fw * 100.0,
+                        ];
+                    }
+                }
+                pip.area[2] = (pip.area[2] + if up { 2.0 } else { -2.0 }).clamp(5.0, 90.0);
+            }
+        });
+        self.refresh_place();
+    }
+
+    /// A key in the placing view; true when it was taken.
+    fn place_key(&mut self, sym: u32, shift: bool) -> bool {
+        let Overlay::Place(pl) = &self.overlay else {
+            return false;
+        };
+        let (i, what) = (pl.clip, pl.selected);
+        let boxes = self.place_boxes(pl);
+        let (fw, fh) = (f64::from(pl.fw), f64::from(pl.fh));
+        let ch = sym_char(sym).map(|c| c.to_ascii_lowercase());
+        let step = if shift { 5.0 } else { 1.0 };
+        let nudge = |dx: f64, dy: f64| {
+            boxes[what as usize]
+                .map(|(x, y, w, h)| (x + w / 2.0 + dx * fw / 100.0, y + h / 2.0 + dy * fh / 100.0))
+        };
+        let moved = match sym {
+            K_LEFT => nudge(-step, 0.0),
+            K_RIGHT => nudge(step, 0.0),
+            K_UP => nudge(0.0, -step),
+            K_DOWN => nudge(0.0, step),
+            _ => None,
+        };
+        if let Some((cx, cy)) = moved {
+            let before = self.project.clone();
+            self.place_move(what, cx, cy);
+            if self.project != before {
+                self.history.record(&before);
+                self.after_change();
+            }
+            self.refresh_place();
+            return true;
+        }
+        match (sym, ch) {
+            (K_TAB, _) => {
+                let other = 1 - what;
+                if boxes[other as usize].is_some() {
+                    if let Overlay::Place(pl) = &mut self.overlay {
+                        pl.selected = other;
+                    }
+                }
+                return true;
+            }
+            (K_DELETE, _) => {
+                self.change(|p| {
+                    let c = &mut p.clips[i];
+                    if what == 0 {
+                        c.effects.text.clear();
+                    } else {
+                        c.pip.mode = 1;
+                    }
+                });
+                self.say(if what == 0 {
+                    "Title removed"
+                } else {
+                    "Picture in picture off for this clip"
+                });
+                if self.place_boxes_now().iter().all(Option::is_none) {
+                    self.overlay = Overlay::None;
+                    return true;
+                }
+                if let Overlay::Place(pl) = &mut self.overlay {
+                    pl.selected = 1 - what;
+                }
+            }
+            (_, Some('+')) | (_, Some('=')) => {
+                self.place_resize(true);
+                return true;
+            }
+            (_, Some('-')) => {
+                self.place_resize(false);
+                return true;
+            }
+            (_, Some(k)) if "sbdelcr".contains(k) => {
+                self.change(|p| {
+                    let c = &mut p.clips[i];
+                    let e = &mut c.effects;
+                    match (what, k) {
+                        (1, 's') => c.pip.shape = (c.pip.shape + 1) % 4,
+                        (1, 'b') => c.pip.border = (c.pip.border + 1) % PIP_BORDERS.len() as u8,
+                        (1, 'd') => c.pip.shadow = !c.pip.shadow,
+                        (1, 'e') => c.pip.effect = (c.pip.effect + 1) % 3,
+                        (1, 'r') => c.pip.area = [0.0; 3],
+                        (0, 'e') => e.text_anim = (e.text_anim + 1) % 5,
+                        (0, 'l') => e.text_look = (e.text_look + 1) % 7,
+                        (0, 'c') => {
+                            let k = palette_index(&TEXT_COLOURS, e.text_colour);
+                            e.text_colour = TEXT_COLOURS[(k + 1) % TEXT_COLOURS.len()].0;
+                        }
+                        (0, 'b') => {
+                            let k = palette_index(&TEXT_COLOURS, e.text_accent);
+                            e.text_accent = TEXT_COLOURS[(k + 1) % TEXT_COLOURS.len()].0;
+                        }
+                        (0, 'r') => e.text_position = 7,
+                        _ => {}
+                    }
+                });
+            }
+            _ => return false,
+        }
+        self.refresh_place();
+        true
+    }
+
+    fn place_boxes_now(&self) -> [Option<(f64, f64, f64, f64)>; 2] {
+        match &self.overlay {
+            Overlay::Place(pl) => self.place_boxes(pl),
+            _ => [None, None],
+        }
     }
 
     fn open_area(&mut self, i: usize, zoom: bool) {
@@ -3249,6 +3774,20 @@ impl State {
                 }
                 return false;
             }
+            Overlay::Place(_) => {
+                if matches!(sym, K_ESCAPE | K_RETURN | K_KP_ENTER) {
+                    self.overlay = Overlay::None;
+                    self.say("Placed: P shows the film rendered.");
+                } else if ctrl && sym_char(sym).map(|c| c.to_ascii_lowercase()) == Some('z') {
+                    if self.history.undo(&mut self.project) {
+                        self.after_change();
+                    }
+                    self.refresh_place();
+                } else {
+                    self.place_key(sym, shift);
+                }
+                return false;
+            }
             Overlay::Settings | Overlay::Help => {
                 if matches!(sym, K_ESCAPE | K_RETURN | K_KP_ENTER | K_F1) || sym == u32::from(b'?')
                 {
@@ -3455,6 +3994,11 @@ impl State {
                         self.edit_title(i);
                     }
                 }
+                Some('e') | Some('E') => {
+                    if let Some(i) = self.target() {
+                        self.open_place(i, 0);
+                    }
+                }
                 Some('+') | Some('=') => self.zoom *= 1.5,
                 Some('-') => self.zoom = (self.zoom / 1.5).max(0.5),
                 Some('z') | Some('Z') => self.fitted = false,
@@ -3563,6 +4107,20 @@ impl State {
             Action::Card => self.add_card(),
             Action::AreaAccept => self.accept_area(false),
             Action::AreaClear => self.accept_area(true),
+            Action::PlaceReset => {
+                if let Overlay::Place(pl) = &self.overlay {
+                    let (i, what) = (pl.clip, pl.selected);
+                    self.change(|p| {
+                        let c = &mut p.clips[i];
+                        if what == 0 {
+                            c.effects.text_position = 7;
+                        } else {
+                            c.pip.area = [0.0; 3];
+                        }
+                    });
+                    self.refresh_place();
+                }
+            }
             Action::AreaWhole => {
                 if let Overlay::Area(a) = &mut self.overlay {
                     a.rect = [0.0, 0.0, 100.0, 100.0];
@@ -3603,6 +4161,10 @@ impl State {
         // Wheel.
         if matches!(button, 4..=7) {
             let up = button == 4 || button == 6;
+            if matches!(self.overlay, Overlay::Place(_)) {
+                self.place_resize(up);
+                return;
+            }
             if l.timeline.has(x, y) {
                 if ctrl {
                     self.zoom_by(if up { 1.25 } else { 0.8 }, l, Some(x));
@@ -3702,6 +4264,50 @@ impl State {
                 }
                 _ => {}
             },
+            Some(Hit::PlaceImage) => {
+                let image = hits
+                    .iter()
+                    .find(|(_, h)| *h == Hit::PlaceImage)
+                    .map(|(r, _)| *r)
+                    .unwrap_or_default();
+                if let Overlay::Place(pl) = &self.overlay {
+                    if image.w > 0 && image.h > 0 {
+                        let fx = f64::from(x - image.x) / f64::from(image.w) * f64::from(pl.fw);
+                        let fy = f64::from(y - image.y) / f64::from(image.h) * f64::from(pl.fh);
+                        let boxes = self.place_boxes(pl);
+                        // What was clicked; else the nearer one.
+                        let inside = |b: &Option<(f64, f64, f64, f64)>| {
+                            b.is_some_and(|(bx, by, bw, bh)| {
+                                fx >= bx && fx <= bx + bw && fy >= by && fy <= by + bh
+                            })
+                        };
+                        let dist = |b: &Option<(f64, f64, f64, f64)>| {
+                            b.map(|(bx, by, bw, bh)| (bx + bw / 2.0 - fx).hypot(by + bh / 2.0 - fy))
+                                .unwrap_or(f64::MAX)
+                        };
+                        let what = if inside(&boxes[pl.selected as usize]) {
+                            pl.selected
+                        } else if inside(&boxes[0]) {
+                            0
+                        } else if inside(&boxes[1]) {
+                            1
+                        } else if dist(&boxes[0]) <= dist(&boxes[1]) {
+                            0
+                        } else {
+                            1
+                        };
+                        if let Some((bx, by, bw, bh)) = boxes[what as usize] {
+                            let grab = (fx - (bx + bw / 2.0), fy - (by + bh / 2.0));
+                            let before = self.project.clone();
+                            self.history.record(&before);
+                            if let Overlay::Place(pl) = &mut self.overlay {
+                                pl.selected = what;
+                            }
+                            self.drag = Some(Drag::Place { image, what, grab });
+                        }
+                    }
+                }
+            }
             Some(Hit::AreaImage) => {
                 let image = hits
                     .iter()
@@ -3889,6 +4495,13 @@ impl State {
         };
         let t = self.x_time(l, x);
         match drag {
+            Drag::Place { image, what, grab } => {
+                if let Overlay::Place(pl) = &self.overlay {
+                    let fx = f64::from(x - image.x) / f64::from(image.w.max(1)) * f64::from(pl.fw);
+                    let fy = f64::from(y - image.y) / f64::from(image.h.max(1)) * f64::from(pl.fh);
+                    self.place_move(what, fx - grab.0, fy - grab.1);
+                }
+            }
             Drag::Scrub => {
                 self.seek(t);
             }
@@ -4017,6 +4630,10 @@ impl State {
         }
         let Some(drag) = self.drag.take() else { return };
         match drag {
+            Drag::Place { .. } => {
+                self.after_change();
+                self.refresh_place();
+            }
             Drag::TrimLeft { .. }
             | Drag::TrimRight { .. }
             | Drag::Music { .. }
@@ -4155,6 +4772,7 @@ fn draw(p: &mut Painter, st: &mut State, l: &Layout, w: i32, h: i32) {
         Overlay::Captions(_) => draw_captions(p, st, l, &t, s),
         Overlay::Fonts(_) => draw_fonts(p, st, l, &t, s),
         Overlay::Area(_) => draw_area(p, st, l, &t, s),
+        Overlay::Place(_) => draw_place(p, st, l, &t, s),
     }
     // Dragging media from the bin.
     if let Some(Drag::Media {
@@ -4553,7 +5171,11 @@ fn draw_inspector(p: &mut Painter, st: &State, l: &Layout, t: &Theme, s: i32) {
             y,
             row,
             param.label(),
-            &param.show(c),
+            &if *param == Param::Pip {
+                pip_label(&st.project, c)
+            } else {
+                param.show(c)
+            },
             v,
             *param,
             focused && row == st.param_row,
@@ -6159,6 +6781,114 @@ fn draw_fonts(p: &mut Painter, st: &State, l: &Layout, t: &Theme, s: i32) {
     );
 }
 
+fn draw_place(p: &mut Painter, st: &State, l: &Layout, t: &Theme, s: i32) {
+    let Overlay::Place(pl) = &st.overlay else {
+        return;
+    };
+    let r = dialog(
+        p,
+        l,
+        t,
+        s,
+        s * 74,
+        s * 50,
+        "Place the title and the picture-in-picture",
+    );
+    let avail_w = r.w - 2 * s;
+    let avail_h = r.h - s * 12;
+    let scale = (f64::from(avail_w) / f64::from(pl.iw)).min(f64::from(avail_h) / f64::from(pl.ih));
+    let dw = (f64::from(pl.iw) * scale) as i32;
+    let dh = (f64::from(pl.ih) * scale) as i32;
+    let img = Rect::new(r.x + (r.w - dw) / 2, r.y + s * 3, dw, dh);
+    p.cv.image(img.x, img.y, img.w, img.h, &pl.image, pl.iw, pl.ih);
+    let boxes = st.place_boxes(pl);
+    let to_screen = |(bx, by, bw, bh): (f64, f64, f64, f64)| {
+        let kx = f64::from(img.w) / f64::from(pl.fw.max(1));
+        let ky = f64::from(img.h) / f64::from(pl.fh.max(1));
+        Rect::new(
+            img.x + (bx * kx) as i32,
+            img.y + (by * ky) as i32,
+            (bw * kx).max(4.0) as i32,
+            (bh * ky).max(4.0) as i32,
+        )
+    };
+    for (k, b) in boxes.iter().enumerate() {
+        let Some(b) = b else { continue };
+        let q = to_screen(*b);
+        let selected = k as u8 == pl.selected;
+        let (c, w) = if selected {
+            (t.accent, 2)
+        } else {
+            (t.muted, 1)
+        };
+        p.cv.fill(q.x, q.y, q.w, w, c);
+        p.cv.fill(q.x, q.y + q.h - w, q.w, w, c);
+        p.cv.fill(q.x, q.y, w, q.h, c);
+        p.cv.fill(q.x + q.w - w, q.y, w, q.h, c);
+        let name = if k == 0 { "Title" } else { "Picture" };
+        let tw = p.tx.width(name, t.size * 8 / 10) + s / 2;
+        p.cv.fill(q.x, q.y - s, tw, s, c);
+        p.tx.draw(
+            &mut p.cv,
+            q.x + s / 4,
+            q.y - s,
+            name,
+            t.size * 8 / 10,
+            t.background,
+        );
+    }
+    p.hits.push((img, Hit::PlaceImage));
+    let help = if pl.selected == 0 {
+        "Title: drag it, wheel or + − size, arrows nudge (Shift: more). L look, E effect, C colour, B accent, R back to the bottom, Delete removes it. Tab: the picture."
+    } else {
+        "Picture: drag it, wheel or + − size, arrows nudge. S shape, B border, D shadow, E effect, R as recorded, Delete hides it in this clip. Tab: the title."
+    };
+    let c = &st.project.clips[pl.clip.min(st.project.clips.len().saturating_sub(1))];
+    let state = if pl.selected == 0 {
+        format!(
+            "{} · {} · {:.1} %",
+            export::LOOK_NAMES[c.effects.text_look.min(6) as usize],
+            export::TEXT_EFFECTS[c.effects.text_anim.min(4) as usize],
+            c.effects.text_size
+        )
+    } else {
+        format!(
+            "{} · {} border · shadow {} · {}",
+            PIP_SHAPES[c.pip.shape.min(3) as usize],
+            PIP_BORDERS[(c.pip.border as usize).min(PIP_BORDERS.len() - 1)].1,
+            if c.pip.shadow { "on" } else { "off" },
+            PIP_EFFECTS[c.pip.effect.min(2) as usize]
+        )
+    };
+    p.tx.fit(
+        &mut p.cv,
+        r.x + s,
+        img.y + img.h + s / 3,
+        &state,
+        t.size,
+        t.foreground,
+        r.w - 2 * s,
+    );
+    let mut y = img.y + img.h + s * 3 / 2;
+    for line in export::wrap(
+        help,
+        ((r.w - 2 * s) / (t.size as i32 * 42 / 100).max(1)) as usize,
+    ) {
+        p.tx.draw(&mut p.cv, r.x + s, y, &line, t.size * 85 / 100, t.muted);
+        y += t.size as i32;
+    }
+    dialog_buttons(
+        p,
+        t,
+        s,
+        r,
+        &[
+            ("Done  Enter", Action::CloseOverlay, true),
+            ("Reset  R", Action::PlaceReset, false),
+        ],
+    );
+}
+
 fn draw_area(p: &mut Painter, st: &State, l: &Layout, t: &Theme, s: i32) {
     let Overlay::Area(a) = &st.overlay else {
         return;
@@ -6252,6 +6982,7 @@ const KEYS: &[(&str, &str)] = &[
     ("M", "Mute or unmute the clip"),
     ("T", "Title text over the clip (| for a new line)"),
     ("Ctrl+T", "Title card: text on a colour"),
+    ("E", "Place the title and the camera on the picture"),
     ("P", "Preview with effects and transitions"),
     ("Tab", "Timeline, settings panel, media list"),
     ("+  −  Z", "Zoom in, out, whole film"),

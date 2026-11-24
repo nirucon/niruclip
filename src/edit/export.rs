@@ -8,7 +8,8 @@
 //! An export is one to three steps: the loudness is measured first when
 //! the film is levelled (two-pass `loudnorm` is exact, one pass guesses),
 //! and a size limit encodes twice so the file lands just under it.
-use super::project::{window, Clip, Effects, Project};
+use super::project::{window, Clip, Effects, Media, Project, PIP_BORDERS};
+use crate::camera::{self, OverlayBox, Shape};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -196,6 +197,9 @@ pub enum Purpose {
     /// The film's own sound (no music, no levelling) through `tail` into
     /// `out` (output arguments), for pause finding and captions.
     Sound { tail: String, out: Vec<String> },
+    /// One picture of the film at `at` seconds, raw BGRA on stdout: what
+    /// the placing view shows.
+    Still { at: f64 },
 }
 
 fn even(n: f64) -> u32 {
@@ -527,11 +531,12 @@ fn build(
     temp: &mut Vec<PathBuf>,
     extra: &mut Vec<PathBuf>,
 ) -> Result<(Vec<String>, f64), String> {
-    let film_only = *purpose == Purpose::Film;
+    let still = matches!(purpose, Purpose::Still { .. });
+    let film_only = *purpose == Purpose::Film || still;
     let format = settings.format;
     let want_video = film_only && format.has_video();
-    let want_audio = !film_only || format.has_audio();
-    let music = film_only || *purpose == Purpose::Measure;
+    let want_audio = !still && (!film_only || format.has_audio());
+    let music = !still && (film_only || *purpose == Purpose::Measure);
     let (w, h, fps) = frame(project, settings.height, format);
     let loglevel = if *purpose == Purpose::Measure {
         "info"
@@ -622,6 +627,52 @@ fn build(
                     chain,
                     ",tpad=stop_mode=clone:stop_duration=1,trim=duration={length:.6},setpts=PTS-STARTPTS"
                 );
+                if let Some(src) = pip_source(project, clip) {
+                    // The picture-in-picture comes from this clip's own file
+                    // (the camera track) or an input of its own.
+                    let label = match &src {
+                        PipSource::Camera { stream, .. } => format!("{index}:v:{stream}"),
+                        PipSource::File { media } => {
+                            let m = &project.media[*media];
+                            if m.still {
+                                args.extend([
+                                    "-loop".into(),
+                                    "1".into(),
+                                    "-framerate".into(),
+                                    format!("{fps}"),
+                                    "-t".into(),
+                                    format!("{length:.6}"),
+                                    "-i".into(),
+                                    m.path.display().to_string(),
+                                ]);
+                            } else {
+                                args.extend([
+                                    "-t".into(),
+                                    format!("{:.6}", length.min(m.duration)),
+                                    "-i".into(),
+                                    m.path.display().to_string(),
+                                ]);
+                            }
+                            input += 1;
+                            format!("{}:v", input - 1)
+                        }
+                    };
+                    let _ = write!(chain, "[pb{i}];");
+                    chain.push_str(&pip_graph_in(
+                        project,
+                        clip,
+                        &src,
+                        &label,
+                        &format!("pb{i}"),
+                        &format!("po{i}"),
+                        i,
+                        w,
+                        h,
+                        fps,
+                        length,
+                    ));
+                    let _ = write!(chain, ";[po{i}]null");
+                }
                 chain.push_str(&title(&clip.effects, settings, lift, temp, w, h, length)?);
                 fades(&mut chain, clip, length, "fade");
                 // setpts leaves the rate unknown; xfade needs it constant.
@@ -908,6 +959,19 @@ fn build(
             args.extend(["-t".into(), format!("{total:.6}")]);
             args.extend(out.iter().cloned());
         }
+        Purpose::Still { at } => {
+            args.extend([
+                "-ss".into(),
+                format!("{:.3}", at.clamp(0.0, (total - 0.04).max(0.0))),
+                "-frames:v".into(),
+                "1".into(),
+                "-f".into(),
+                "rawvideo".into(),
+                "-pix_fmt".into(),
+                "bgra".into(),
+                "pipe:1".into(),
+            ]);
+        }
     }
     Ok((args, total))
 }
@@ -1048,8 +1112,223 @@ fn zoom(chain: &mut String, e: &Effects, w: u32, h: u32, fps: f64, length: f64) 
     );
 }
 
-/// Positions of a block of lines in one of nine places.
-fn place(position: u8, w: u32, h: u32, lines: usize, line_h: f64) -> (String, f64) {
+/// Where a clip's picture-in-picture comes from.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PipSource {
+    Camera {
+        stream: usize,
+        layout: camera::TrackLayout,
+    },
+    File {
+        media: usize,
+    },
+}
+
+pub fn pip_source(project: &Project, clip: &Clip) -> Option<PipSource> {
+    let media = &project.media[clip.media];
+    match clip.pip.mode {
+        1 => None,
+        2 => clip
+            .pip
+            .media
+            .filter(|m| {
+                project
+                    .media
+                    .get(*m)
+                    .is_some_and(|x| x.has_video && !x.is_card())
+            })
+            .map(|media| PipSource::File { media }),
+        _ => {
+            if media.is_card() || media.still {
+                return None;
+            }
+            media.own_camera().map(|c| PipSource::Camera {
+                stream: c.stream,
+                layout: c.layout(),
+            })
+        }
+    }
+}
+
+/// The size of the source picture (the camera inside its track).
+fn pip_content(project: &Project, src: &PipSource) -> (u32, u32) {
+    match src {
+        PipSource::Camera { layout, .. } => layout.content,
+        PipSource::File { media } => {
+            let m: &Media = &project.media[*media];
+            (m.width.max(2), m.height.max(2))
+        }
+    }
+}
+
+/// The box, shape and border of a picture-in-picture in a `w` x `h` frame.
+pub fn pip_box(
+    project: &Project,
+    clip: &Clip,
+    src: &PipSource,
+    w: u32,
+    h: u32,
+) -> (OverlayBox, Option<(u8, u8, u8)>) {
+    let pip = &clip.pip;
+    let recorded = match src {
+        PipSource::Camera { layout, .. } => layout.clone(),
+        PipSource::File { .. } => camera::TrackLayout {
+            border: None,
+            shape: Shape::Rounded,
+            ..camera::TrackLayout::default()
+        },
+    };
+    let shape = match pip.shape {
+        1 => Shape::Rounded,
+        2 => Shape::Circle,
+        3 => Shape::Rect,
+        _ => recorded.shape,
+    };
+    let border = match pip.border {
+        0 => recorded.border,
+        k => PIP_BORDERS
+            .get(k as usize)
+            .and_then(|b| b.0)
+            .map(|c| ((c >> 16) as u8, (c >> 8) as u8, c as u8)),
+    };
+    let content = pip_content(project, src);
+    let mut b = camera::overlay_box(
+        (w, h),
+        content,
+        recorded.share,
+        shape,
+        recorded.corner,
+        border.is_some(),
+    );
+    if pip.area[2] > 0.5 {
+        let even = |v: f64| ((v / 2.0).round() as u32 * 2).max(16);
+        let bw = even(f64::from(w) * pip.area[2] / 100.0).min(w);
+        let bh = if shape == Shape::Circle {
+            bw
+        } else {
+            even(f64::from(bw) * f64::from(content.1) / f64::from(content.0.max(1))).min(h)
+        };
+        let cx = f64::from(w) * pip.area[0] / 100.0;
+        let cy = f64::from(h) * pip.area[1] / 100.0;
+        b.width = bw;
+        b.height = bh;
+        b.x = (cx - f64::from(bw) / 2.0).clamp(0.0, f64::from(w - bw)) as u32;
+        b.y = (cy - f64::from(bh) / 2.0).clamp(0.0, f64::from(h.saturating_sub(bh))) as u32;
+        b.radius = match shape {
+            Shape::Rect => 0,
+            Shape::Rounded => ((f64::from(bh) * 0.12).round() as u32).max(4),
+            Shape::Circle => bw / 2,
+        };
+        b.border = if border.is_some() {
+            ((f64::from(bh) / 110.0).round() as u32).max(2)
+        } else {
+            0
+        };
+    }
+    (b, border)
+}
+
+/// The filters that put the picture-in-picture `src` (input label `label`)
+/// over `base`, giving `out`: scaled into its box, shaped, with its border,
+/// shadow and effect, shown for its window of the clip.
+#[allow(clippy::too_many_arguments)]
+pub fn pip_graph_in(
+    project: &Project,
+    clip: &Clip,
+    src: &PipSource,
+    label: &str,
+    base: &str,
+    out: &str,
+    i: usize,
+    w: u32,
+    h: u32,
+    fps: f64,
+    length: f64,
+) -> String {
+    let pip = &clip.pip;
+    let (b, border) = pip_box(project, clip, src, w, h);
+    let (bw, bh) = (b.width, b.height);
+    let mut g = format!("[{label}]setpts=PTS-STARTPTS");
+    if let PipSource::Camera { layout, .. } = src {
+        if (clip.speed - 1.0).abs() > 1e-6 {
+            let _ = write!(g, ",setpts=PTS/{:.6}", clip.speed);
+        }
+        let (cw, ch) = layout.content;
+        let _ = write!(g, ",crop={cw}:{ch}:(iw-{cw})/2:(ih-{ch})/2");
+    }
+    let _ = write!(
+        g,
+        ",scale={bw}:{bh}:force_original_aspect_ratio=increase:flags=bicubic,crop={bw}:{bh},setsar=1,fps={fps},\
+         tpad=stop_mode=clone:stop_duration={length:.3},trim=duration={length:.6},setpts=PTS-STARTPTS[pq{i}r];"
+    );
+    let shaped = camera::shape_filters_tagged(
+        &format!("pq{i}r"),
+        &format!("pq{i}s"),
+        &b,
+        border.unwrap_or((0, 0, 0)),
+        &format!("pq{i}"),
+    );
+    g.push_str(&shaped.join(";"));
+    let (a, z) = window(pip.start, pip.length, length);
+    let d = 0.45f64.min((z - a) / 2.0).max(0.01);
+    let mut top = format!("pq{i}s");
+    if pip.effect == 1 {
+        let _ = write!(
+            g,
+            ";[{top}]format=yuva420p,fade=t=in:st={a:.3}:d={d:.3}:alpha=1,fade=t=out:st={:.3}:d={d:.3}:alpha=1[pq{i}f]",
+            (z - d).max(a)
+        );
+        top = format!("pq{i}f");
+    }
+    // x moves in from the nearer side with a slide.
+    let x0 = f64::from(b.x);
+    let y0 = f64::from(b.y);
+    let x = if pip.effect == 2 {
+        let from = if x0 + f64::from(bw) / 2.0 < f64::from(w) / 2.0 {
+            -f64::from(bw) - 8.0
+        } else {
+            f64::from(w) + 8.0
+        };
+        let e = format!(
+            "min(1-pow(1-clip((t-{a:.3})/{d:.3},0,1),3),1-pow(1-clip(({z:.3}-t)/{d:.3},0,1),3))"
+        );
+        format!("'{from:.0}+({x0:.0}-({from:.0}))*{e}'")
+    } else {
+        format!("{x0:.0}")
+    };
+    let enable = format!("enable='between(t,{a:.3},{z:.3})'");
+    let mut current = base.to_string();
+    if pip.shadow {
+        let pad = ((f64::from(bh) * 0.08).round() as u32).clamp(6, 40);
+        let off = (f64::from(bh) * 0.03).round().max(2.0);
+        let _ = write!(
+            g,
+            ";[{top}]split[pq{i}a][pq{i}b];[pq{i}b]format=rgba,colorchannelmixer=rr=0:gg=0:bb=0:aa=0.55,\
+             pad=iw+{p2}:ih+{p2}:{pad}:{pad}:color=black@0,boxblur=luma_radius=0:chroma_radius=0:alpha_radius={r}:alpha_power=2[pq{i}sh];\
+             [{current}][pq{i}sh]overlay=x='{x}-{pad}+{off}':y={sy:.0}:format=auto:{enable}[pq{i}bs]",
+            p2 = pad * 2,
+            r = (pad / 2).max(2),
+            x = x.trim_matches('\''),
+            sy = y0 - f64::from(pad) + off,
+        );
+        current = format!("pq{i}bs");
+        top = format!("pq{i}a");
+    }
+    let _ = write!(
+        g,
+        ";[{current}][{top}]overlay=x={x}:y={y0:.0}:format=auto:{enable},format=yuv420p[{out}]"
+    );
+    g
+}
+
+/// Positions of a block of lines in one of nine places, or (9) where the
+/// text was put by hand: centre x and top y in percent of the frame.
+fn place(position: u8, xy: [f64; 2], w: u32, h: u32, lines: usize, line_h: f64) -> (String, f64) {
+    if position == 9 {
+        let y = (f64::from(h) * xy[1] / 100.0)
+            .clamp(0.0, (f64::from(h) - lines as f64 * line_h).max(0.0));
+        return (format!("w*{:.4}-text_w/2", xy[0] / 100.0), y);
+    }
     let (col, row) = (position % 3, position / 3);
     let mx = (f64::from(w) * 0.05).round();
     let my = f64::from(h) * 0.07;
@@ -1067,21 +1346,93 @@ fn place(position: u8, w: u32, h: u32, lines: usize, line_h: f64) -> (String, f6
     (x, y0)
 }
 
-fn look(look: u8, size: f64) -> String {
+/// The looks: 0 box behind, 1 outline, 2 shadow, 3 plain, 4 lower third
+/// (a bar in the accent colour beside a dark box), 5 neon (a glow in the
+/// accent colour), 6 marker (the accent colour behind the text).
+pub const LOOK_NAMES: [&str; 7] = [
+    "Box behind",
+    "Outline",
+    "Shadow",
+    "Plain",
+    "Lower third",
+    "Neon",
+    "Marker",
+];
+
+/// How text comes and goes.
+pub const TEXT_EFFECTS: [&str; 5] = ["Appear (or fade)", "Slide up", "Slide in", "Pop", "Type"];
+
+/// The drawtext layers of one look, bottom first: (font colour, style).
+fn layers(look: u8, size: f64, colour: u32, accent: u32) -> Vec<(String, String)> {
+    let col = format!("0x{:06x}", colour & 0xffffff);
+    let acc = format!("0x{:06x}", accent & 0xffffff);
+    let pad = (size * 0.28).round().max(2.0);
     match look {
-        0 => format!(
-            ":box=1:boxcolor=black@0.5:boxborderw={}",
-            (size * 0.28).round().max(2.0)
-        ),
-        1 => format!(
-            ":borderw={}:bordercolor=black@0.9",
-            (size / 14.0).round().max(1.0)
-        ),
+        0 => vec![(col, format!(":box=1:boxcolor=black@0.5:boxborderw={pad}"))],
+        1 => vec![(
+            col,
+            format!(
+                ":borderw={}:bordercolor=black@0.9",
+                (size / 14.0).round().max(1.0)
+            ),
+        )],
         2 => {
             let d = (size / 16.0).round().max(1.0);
-            format!(":shadowx={d}:shadowy={d}:shadowcolor=black@0.7")
+            vec![(
+                col,
+                format!(":shadowx={d}:shadowy={d}:shadowcolor=black@0.7"),
+            )]
         }
-        _ => String::new(),
+        4 => {
+            let bar = (size * 0.22).round().max(3.0);
+            vec![
+                (
+                    "black@0".to_string(),
+                    format!(
+                        ":box=1:boxcolor={acc}:boxborderw={pad}|{pad}|{pad}|{}",
+                        pad + bar
+                    ),
+                ),
+                (col, format!(":box=1:boxcolor=0x15151a:boxborderw={pad}")),
+            ]
+        }
+        5 => vec![
+            (
+                format!("{acc}@0.35"),
+                format!(
+                    ":borderw={}:bordercolor={acc}@0.30",
+                    (size / 7.0).round().max(2.0)
+                ),
+            ),
+            (
+                col,
+                format!(
+                    ":borderw={}:bordercolor={acc}",
+                    (size / 24.0).round().max(1.0)
+                ),
+            ),
+        ],
+        6 => {
+            // Light text on a light marker cannot be read: take it dark.
+            let lum = |c: u32| {
+                0.2126 * f64::from((c >> 16) & 0xff)
+                    + 0.7152 * f64::from((c >> 8) & 0xff)
+                    + 0.0722 * f64::from(c & 0xff)
+            };
+            let text = if lum(colour) > 160.0 && lum(accent) > 160.0 {
+                "0x111111".to_string()
+            } else {
+                col
+            };
+            vec![(
+                text,
+                format!(
+                    ":box=1:boxcolor={acc}:boxborderw={}",
+                    (size * 0.2).round().max(2.0)
+                ),
+            )]
+        }
+        _ => vec![(col, String::new())],
     }
 }
 
@@ -1106,8 +1457,8 @@ fn font_for(e: &Effects, settings: &Settings) -> String {
         .unwrap_or_default()
 }
 
-/// The title over a clip: one drawtext a line, in its place, font, colour
-/// and look, shown for its window and faded.
+/// The title over a clip: drawtext layers per line, in its place, font,
+/// colours and look, shown for its window, with its effect.
 fn title(
     e: &Effects,
     settings: &Settings,
@@ -1124,39 +1475,204 @@ fn title(
     let lines: Vec<&str> = text.lines().collect();
     let size = (f64::from(h) * e.text_size.clamp(2.0, 30.0) / 100.0).round();
     let line_h = (size * 1.3).round();
-    let (x, mut y0) = place(e.text_position.min(8), w, h, lines.len(), line_h);
-    if e.text_position >= 6 {
+    let position = e.text_position.min(9);
+    let (x0, mut y0) = place(position, e.text_xy, w, h, lines.len(), line_h);
+    if (6..9).contains(&position) {
         y0 -= lift;
     }
     let (a, b) = window(e.text_start, e.text_length, length);
     let font = font_for(e, settings);
-    let style = look(e.text_look, size);
-    let mut timing = String::new();
+    let anim = e.text_anim.min(4);
+    // The effect takes the fade time, or a short default.
+    let d = if e.text_fade > 0.01 {
+        e.text_fade
+    } else {
+        0.45
+    }
+    .min((b - a) / 2.0)
+    .max(0.01);
+    let ease_in = format!("(1-pow(1-clip((t-{a:.3})/{d:.3},0,1),3))");
+    let ease_out = format!("(1-pow(1-clip(({b:.3}-t)/{d:.3},0,1),3))");
+    let ease = format!("min({ease_in},{ease_out})");
+    let mut enable = String::new();
     if a > 0.001 || b < length - 0.001 {
-        let _ = write!(timing, ":enable='between(t,{a:.3},{b:.3})'");
+        let _ = write!(enable, ":enable='between(t,{a:.3},{b:.3})'");
     }
     let fade = e.text_fade.min((b - a) / 2.0);
-    if fade > 0.01 {
-        let _ = write!(
-            timing,
-            ":alpha='clip(min((t-{a:.3})/{fade:.3},({b:.3}-t)/{fade:.3}),0,1)'"
-        );
-    }
+    let alpha = match anim {
+        0 if fade > 0.01 => {
+            format!(":alpha='clip(min((t-{a:.3})/{fade:.3},({b:.3}-t)/{fade:.3}),0,1)'")
+        }
+        1..=3 => format!(":alpha='{ease}'"),
+        _ => String::new(),
+    };
+    let size_expr = if anim == 3 {
+        // Grows past its size and settles (an ease with overshoot), shrinks
+        // away at the end.
+        let p = format!("clip((t-{a:.3})/{d:.3},0,1)");
+        format!("'{size}*max(0.05,min(1+2.70158*pow({p}-1,3)+1.70158*pow({p}-1,2),{ease_out}))'")
+    } else {
+        format!("{size}")
+    };
+    let layers = layers(e.text_look.min(6), size, e.text_colour, e.text_accent);
     let mut out = String::new();
+    // Typing: the characters appear one group at a time, about 22 a second.
+    let total: usize = lines.iter().map(|l| l.chars().count()).sum();
+    let typing = (total as f64 / 22.0).min((b - a) * 0.6).max(0.05);
+    let mut typed_before = 0usize;
     for (k, line) in lines.iter().enumerate() {
+        let n = line.chars().count();
         if line.trim().is_empty() {
+            typed_before += n;
             continue;
         }
-        let file = text_file(&settings.work, temp, line)?;
-        let _ = write!(
-            out,
-            ",drawtext=textfile={}{font}:expansion=none:fontsize={size}:fontcolor=0x{:06x}{style}:x={x}:y={:.0}{timing}",
-            quote(&file),
-            e.text_colour & 0xffffff,
-            y0 + k as f64 * line_h
-        );
+        let y = y0 + k as f64 * line_h;
+        let (x, y) = match anim {
+            1 => (x0.clone(), format!("'{y:.0}+(1-{ease})*{:.0}'", size * 0.9)),
+            2 => (format!("'{x0}-(1-{ease})*w*0.3'"), format!("{y:.0}")),
+            _ => (x0.clone(), format!("{y:.0}")),
+        };
+        // Pieces of the line with the window each shows in.
+        let mut pieces: Vec<(String, String)> = Vec::new();
+        if anim == 4 {
+            let steps = n.clamp(1, 30);
+            for j in 1..=steps {
+                let shown = (n * j).div_ceil(steps);
+                let start =
+                    a + typing * (typed_before + n * (j - 1) / steps) as f64 / total.max(1) as f64;
+                let end = if j == steps {
+                    b
+                } else {
+                    a + typing * (typed_before + n * j / steps) as f64 / total.max(1) as f64
+                };
+                if end - start < 0.001 && j != steps {
+                    continue;
+                }
+                let part: String = line.chars().take(shown).collect();
+                pieces.push((part, format!(":enable='between(t,{start:.3},{end:.3})'")));
+            }
+        } else {
+            pieces.push((line.to_string(), enable.clone()));
+        }
+        typed_before += n;
+        for (part, when) in pieces {
+            let file = text_file(&settings.work, temp, &part)?;
+            for (colour, style) in &layers {
+                let _ = write!(
+                    out,
+                    ",drawtext=textfile={}{font}:expansion=none:fontsize={size_expr}:fontcolor={colour}{style}:x={x}:y={y}{when}{alpha}",
+                    quote(&file),
+                );
+            }
+        }
     }
     Ok(out)
+}
+
+/// ffmpeg arguments for one picture of clip `i` at `local` seconds into
+/// it, with every effect, picture-in-picture and title as exported, at
+/// `height` lines; and the picture's size. Only that clip is rendered and
+/// it is cut short after `local`, so its titles keep their timing.
+pub fn still(
+    project: &Project,
+    i: usize,
+    local: f64,
+    height: u32,
+    settings: &Settings,
+    temp: &mut Vec<PathBuf>,
+) -> Result<(Vec<String>, u32, u32), String> {
+    let mut film = project.clone();
+    let mut clip = film.clips.get(i).cloned().ok_or("no such clip")?;
+    let (w, h, fps) = frame(project, height, Format::Mp4);
+    let local = local.clamp(0.0, (clip.length() - 1.0 / fps).max(0.0));
+    clip.end = clip
+        .end
+        .min(clip.source_at(local) + (3.0 / fps) * clip.speed + 0.05);
+    clip.transition = None;
+    clip.fade_out = 0.0;
+    film.clips = vec![clip];
+    film.music.clear();
+    film.loudness = 0;
+    let mut s = settings.clone();
+    s.format = Format::Mp4;
+    s.height = height;
+    s.captions = 0;
+    s.range = None;
+    let mut extra = Vec::new();
+    let (args, _) = build(&film, &s, &Purpose::Still { at: local }, temp, &mut extra)?;
+    Ok((args, w, h))
+}
+
+/// The first moment in a clip (its own seconds) when its title and its
+/// picture-in-picture have both come in completely: what the placing view
+/// shows when the playhead is before that, or after they have gone.
+pub fn settled_window(clip: &Clip) -> (f64, f64) {
+    let length = clip.length();
+    let mut from: f64 = 0.0;
+    let mut to = length;
+    let e = &clip.effects;
+    if !e.text.trim().is_empty() {
+        let (a, b) = window(e.text_start, e.text_length, length);
+        let d = if e.text_fade > 0.01 {
+            e.text_fade
+        } else {
+            0.45
+        }
+        .min((b - a) / 2.0)
+        .max(0.0);
+        let chars = e.text.chars().filter(|c| *c != '\n').count() as f64;
+        let settle = match e.text_anim {
+            4 => (chars / 22.0).min((b - a) * 0.6),
+            1..=3 => d,
+            _ if e.text_fade > 0.01 => d,
+            _ => 0.0,
+        };
+        from = from.max(a + settle);
+        to = to.min(
+            b - if e.text_anim > 0 || e.text_fade > 0.01 {
+                d
+            } else {
+                0.0
+            },
+        );
+    }
+    if clip.pip.mode != 1 {
+        let (a, b) = window(clip.pip.start, clip.pip.length, length);
+        let d = if clip.pip.effect > 0 {
+            0.45f64.min((b - a) / 2.0)
+        } else {
+            0.0
+        };
+        from = from.max(a + d);
+        to = to.min(b - d);
+    }
+    (from.min(length), to.max(from.min(length)))
+}
+
+/// Where a clip's title sits in a `w` x `h` frame (x, y, width, height in
+/// pixels), estimated from its size and longest line: what the placing
+/// view lets you take hold of.
+pub fn text_rect(e: &Effects, w: u32, h: u32) -> Option<(f64, f64, f64, f64)> {
+    let text = e.text.trim_end();
+    if text.trim().is_empty() {
+        return None;
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    let size = (f64::from(h) * e.text_size.clamp(2.0, 30.0) / 100.0).round();
+    let line_h = (size * 1.3).round();
+    let chars = lines.iter().map(|l| l.chars().count()).max().unwrap_or(1) as f64;
+    let tw = (chars * size * 0.56).min(f64::from(w));
+    let th = lines.len() as f64 * line_h;
+    let (_, y) = place(e.text_position.min(9), e.text_xy, w, h, lines.len(), line_h);
+    let fw = f64::from(w);
+    let mx = (fw * 0.05).round();
+    let x = match e.text_position.min(9) {
+        9 => fw * e.text_xy[0] / 100.0 - tw / 2.0,
+        p if p % 3 == 0 => mx,
+        p if p % 3 == 1 => (fw - tw) / 2.0,
+        _ => fw - tw - mx,
+    };
+    Some((x, y, tw, th))
 }
 
 /// Lines of at most `width` characters, broken at spaces.
@@ -1192,7 +1708,7 @@ fn caption_filters(
         .as_ref()
         .map(|f| format!(":fontfile={}", quote(f)))
         .unwrap_or_default();
-    let style = look(0, size);
+    let style = layers(0, size, 0xffffff, 0).remove(0).1;
     let mut out = String::new();
     for (a, b, text) in project.film_captions() {
         let lines = wrap(&text, 42);
@@ -1666,5 +2182,170 @@ mod tests {
         let g = graph(plan.main());
         assert!(g.ends_with("[j1a]silencedetect=n=-35dB:d=0.5[snd]"));
         assert!(!g.contains("loudnorm"));
+    }
+    /// Picture-in-picture and every text look and effect through a real
+    /// ffmpeg: `cargo test -- --ignored real_ffmpeg_pip`. With
+    /// NIRUCLIP_TEST_SHOTS=DIR a frame of each clip is kept there.
+    #[test]
+    #[ignore = "needs ffmpeg and ffprobe"]
+    fn real_ffmpeg_pip_and_text_effects() {
+        use super::super::project::{Clip, Pip};
+        let dir = std::env::temp_dir().join(format!("niruclip-pip-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rec = dir.join("rec.mkv");
+        let ok = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-f", "lavfi", "-i", "testsrc2=s=1280x720:r=30:d=8", "-f", "lavfi", "-i",
+                   "smptebars=s=960x720:r=30:d=8,pad=1280:720:160:0", "-f", "lavfi", "-i", "sine=f=440:d=8",
+                   "-map", "0:v", "-map", "1:v", "-map", "2:a", "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac",
+                   "-metadata:s:v:1", "title=Camera", "-metadata:s:v:1",
+                   "NIRUCLIP_CAMERA=corner=bottom-right;size=medium;shape=rounded;border=ffffff;burned=0;content=960x720"])
+            .arg(&rec)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok);
+        let png = dir.join("logo.png");
+        assert!(std::process::Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=orange:s=400x300",
+                "-frames:v",
+                "1"
+            ])
+            .arg(&png)
+            .status()
+            .unwrap()
+            .success());
+        let mut project = Project::default();
+        let media = super::super::probe::probe(&rec).unwrap();
+        assert!(media.own_camera().is_some(), "the camera track is found");
+        let m = project.add_media(media);
+        let still = project.add_media(super::super::probe::probe(&png).unwrap());
+        let pips = [
+            Pip::default(),
+            Pip {
+                shape: 2,
+                border: 4,
+                effect: 1,
+                shadow: true,
+                area: [25.0, 30.0, 22.0],
+                ..Pip::default()
+            },
+            Pip {
+                shape: 3,
+                border: 1,
+                effect: 2,
+                ..Pip::default()
+            },
+            Pip {
+                mode: 1,
+                ..Pip::default()
+            },
+            Pip {
+                mode: 2,
+                media: Some(still),
+                area: [80.0, 25.0, 25.0],
+                shadow: true,
+                effect: 2,
+                ..Pip::default()
+            },
+            Pip {
+                shape: 1,
+                border: 5,
+                shadow: true,
+                start: 0.3,
+                length: 0.8,
+                ..Pip::default()
+            },
+            Pip::default(),
+        ];
+        for look in 0..7u8 {
+            let mut c = Clip::new(m, f64::from(look), f64::from(look) + 1.2);
+            c.effects.text = format!("Look {look}\nSecond line");
+            c.effects.text_look = look;
+            c.effects.text_anim = look % 5;
+            c.effects.text_size = 8.0;
+            c.effects.text_position = if look == 6 { 9 } else { look % 9 };
+            c.effects.text_xy = [40.0, 20.0];
+            c.pip = pips[look as usize].clone();
+            if look == 2 {
+                c.speed = 2.0;
+            }
+            project.clips.push(c);
+        }
+        project.loudness = 0;
+        let out = dir.join("film.mp4");
+        let mut settings = Settings::new(Format::Mp4, out.clone(), dir.clone());
+        settings.height = 360;
+        settings.draft = true;
+        let plan = plan(&project, &settings).unwrap();
+        for step in &plan.steps {
+            let o = std::process::Command::new("ffmpeg")
+                .args(&step.args)
+                .output()
+                .unwrap();
+            assert!(
+                o.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&o.stderr),
+                step.args.join(" ")
+            );
+        }
+        let probe = std::process::Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "csv=p=0",
+            ])
+            .arg(&out)
+            .output()
+            .unwrap();
+        let d: f64 = String::from_utf8_lossy(&probe.stdout)
+            .trim()
+            .parse()
+            .unwrap();
+        assert!((d - plan.duration).abs() < 0.2, "{d} vs {}", plan.duration);
+        if let Some(shots) = std::env::var_os("NIRUCLIP_TEST_SHOTS") {
+            let starts = project.starts();
+            for (k, t) in starts.iter().enumerate() {
+                let at = t + project.clips[k].length() * 0.6;
+                let _ = std::process::Command::new("ffmpeg")
+                    .args(["-v", "error", "-y", "-ss", &format!("{at:.2}"), "-i"])
+                    .arg(&out)
+                    .args(["-frames:v", "1"])
+                    .arg(PathBuf::from(&shots).join(format!("clip{k}.png")))
+                    .status();
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn the_placing_view_waits_until_title_and_picture_are_in() {
+        let mut c = Clip::new(0, 0.0, 10.0);
+        assert_eq!(settled_window(&c), (0.0, 10.0));
+        c.effects.text = "Hej".into();
+        c.effects.text_anim = 1;
+        c.effects.text_start = 1.0;
+        let (a, b) = settled_window(&c);
+        assert!(
+            (a - 1.45).abs() < 1e-9 && (b - 9.55).abs() < 1e-9,
+            "{a} {b}"
+        );
+        c.pip.effect = 2;
+        c.pip.start = 2.0;
+        assert!((settled_window(&c).0 - 2.45).abs() < 1e-9);
+        c.effects.text_anim = 4;
+        c.effects.text = "x".repeat(44);
+        assert!(
+            (settled_window(&c).0 - 3.0).abs() < 1e-9,
+            "two seconds of typing after 1.0"
+        );
     }
 }

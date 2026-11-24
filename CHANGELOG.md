@@ -3,6 +3,26 @@
 All notable changes to NIRUCLIP. Earlier releases are described in their
 GitHub release notes and commit messages.
 
+## 0.12.0 (2026-11-24)
+
+### Added
+- **The camera on its own track**: `--camera-track separate` (config and
+  profile key `camera_track`) records the screen clean and the camera as a
+  second video track with its placement; `both` keeps the overlay too.
+  Recording from the editor uses its own track by default (a new choice in
+  the record dialog). `--export mp4|gif` puts the camera back in its corner.
+- **Picture in picture in the editor**: the camera track (or any picture or
+  film of the project) over a clip, moved, sized, shaped (rounded, circle,
+  rectangle), with a border, a soft shadow, fade or slide in, for part of
+  the clip, or off.
+- **The placing view (E)**: one picture of the clip as it will be exported;
+  drag the camera and the title into place, the wheel sizes them, single
+  keys change shape, border, shadow, look, colour and effect.
+- **Titles**: three new looks (lower third, neon, marker) with an accent
+  colour, effects (slide up, slide in, pop, type itself), a free position,
+  and templates for a lower third, neon heading, marker, pop heading and
+  typewriter.
+
 ## 0.11.0 (2026-11-23)
 
 ### Added

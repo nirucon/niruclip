@@ -134,6 +134,7 @@ niruclip --share
 | Camera shape | `--camera-shape rounded` (default), `circle`, `rect` |
 | Camera border | `--camera-border theme` (default), `none`, or a hex colour such as `8aa87e` |
 | Mirroring | `--mirror`, `--no-mirror` (default: not mirrored, so text reads correctly) |
+| Camera track | `--camera-track burned` (default: in the picture), `separate` (its own video track; the screen stays clean and the editor places it), `both` |
 | Export | `--export mp4\|gif`, `--input FILE`, `--from SECONDS`, `--to SECONDS`; `--share` |
 | Preset | `--preset share` (up to 1080p), `small` (up to 720p), `quality` |
 | Encoder | `--encoder auto` (default), `software`, `vaapi` |
@@ -178,6 +179,7 @@ NIRUX theme and is made for the keyboard; F1 shows every key.
 | Delete | Remove the clip (or the marked part) |
 | Alt+← → | Move the clip earlier or later |
 | M, T | Mute the clip, write a title over it (`|` starts a new line) |
+| E | Place the title and the camera on the picture (drag, wheel to size) |
 | Ctrl+T | A title card: text on a colour |
 | P | Preview with effects and transitions |
 | Tab | Timeline, settings panel, media list |
@@ -198,6 +200,23 @@ fade, dissolve, through black or white, wipes, slides, circle, pixelize),
 brightness, contrast, colour (0 is black and white), blur, sharpen,
 rotate, mirror and crop. The panel shows only what applies: the rest of a
 group appears once its first setting is in use.
+
+**Picture in picture.** A recording made with `--camera-track separate`
+(the default when you record from the editor) keeps the camera on a video
+track of its own: every clip shows it where it was recorded, and per clip
+you can move it, size it, give it another shape (rounded, circle,
+rectangle), border and a soft shadow, let it fade or slide in, show it only
+for part of the clip, or turn it off. Any picture or film of the project
+can be shown the same way. E opens the placing view: one picture of the
+clip as it will be exported, where you drag the camera and the title into
+place and change their look with single keys.
+
+**Titles with a look.** Seven looks (a box behind, outline, shadow, plain,
+lower third with a bar in an accent colour, neon glow, marker) and five
+effects (appear or fade, slide up, slide in, pop, type itself). Templates
+set them in one step: heading, name tag, subtitle bar, lower third, neon
+heading, marker, pop heading and typewriter. A title can sit in one of
+nine places or anywhere you drag it.
 
 **Titles**: any font installed on the computer (the list shows each name
 in its own letters; a font without the letters of the text falls back to

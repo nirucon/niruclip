@@ -55,6 +55,18 @@ is a thin ring (about 1 % of the overlay height) in the NIRUX theme accent
 the ring are generated once per recording, so a shaped overlay costs no more
 than a plain one. `--mirror` flips the camera horizontally.
 
+### The camera on its own track
+
+`--camera-track separate` (config `camera_track`, also in profiles) keeps
+the screen picture clean and records the camera whole, unshaped and
+letterboxed to 1280x720, as a second video track titled `Camera`, in the
+same ffmpeg run, so it shares the screen's clock. `both` records the overlay
+as well. The track carries a `NIRUCLIP_CAMERA` tag with the corner, size,
+shape, border and the camera picture's size inside the track, so an export
+and the editor put it back as recorded. When the camera is lost the track
+goes on in black, made from the screen stream, so every segment has the same
+tracks and they join.
+
 ### Camera health
 
 - **Before recording:** a camera that another program is streaming from is
@@ -341,7 +353,9 @@ so it is instant and plays in browsers and chat apps. `--from` and `--to`
 makes a 12 fps GIF up to 720 pixels wide with an optimised palette, at most
 the first 30 seconds unless `--to` says otherwise. The MKV is never changed
 and existing files are never overwritten. `--share` exports the MP4 and opens
-NIRU Share (`nirulauncher --share`) with it.
+NIRU Share (`nirulauncher --share`) with it. A recording with the camera on
+its own track is exported with the camera put back in its corner, as it was
+recorded.
 
 ## Exit codes
 

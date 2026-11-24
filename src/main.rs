@@ -14,7 +14,7 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const VERSION: &str = "0.11.0";
+const VERSION: &str = "0.12.0";
 const SCHEMA: u32 = 1;
 const ACTIVE_STATES: &[&str] = &[
     "countdown",
@@ -125,6 +125,52 @@ impl Webcam {
         }
     }
 }
+
+/// Where the camera goes in a screen recording with the camera on:
+/// burnt into the screen picture (one video track, as before), on a video
+/// track of its own (the screen stays clean; the editor and export put it
+/// back as picture-in-picture where you want it), or both.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CameraTrack {
+    Burned,
+    Separate,
+    Both,
+}
+
+impl CameraTrack {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "burned" | "burnt" | "off" => Ok(Self::Burned),
+            "separate" | "own" => Ok(Self::Separate),
+            "both" => Ok(Self::Both),
+            _ => Err(format!(
+                "camera-track must be burned, separate or both: {value}"
+            )),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Burned => "burned",
+            Self::Separate => "separate",
+            Self::Both => "both",
+        }
+    }
+
+    /// A video track of the camera alone is recorded.
+    fn track(self) -> bool {
+        self != Self::Burned
+    }
+
+    /// The camera is drawn into the screen picture.
+    fn burned(self) -> bool {
+        self != Self::Separate
+    }
+}
+
+/// The camera track's size: the same in every segment of a recording, so
+/// the segments join, whatever mode the camera opens in.
+const CAMERA_TRACK_SIZE: (u32, u32) = (1280, 720);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Corner {
@@ -304,6 +350,7 @@ struct Options {
     camera_mirror: bool,
     /// `theme` (NIRUX accent), `none` or a hex colour.
     camera_border: String,
+    camera_track: CameraTrack,
     /// Microphone setting (--mic / `mic =`); None is the system default.
     mic: Option<String>,
     /// The source the recording opens, resolved at start; None is
@@ -356,6 +403,7 @@ impl Default for Options {
             camera_shape: camera::Shape::Rounded,
             camera_mirror: false,
             camera_border: "theme".into(),
+            camera_track: CameraTrack::Burned,
             mic: None,
             mic_source: None,
             mic_channels: None,
@@ -489,6 +537,9 @@ struct Profile {
     camera_mirror: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     camera_border: Option<String>,
+    /// `burned`, `separate` or `both`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    camera_track: Option<String>,
 }
 
 impl Profile {
@@ -512,6 +563,7 @@ impl Profile {
             camera_shape: self.camera_shape.or(base.camera_shape),
             camera_mirror: self.camera_mirror.or(base.camera_mirror),
             camera_border: self.camera_border.or(base.camera_border),
+            camera_track: self.camera_track.or(base.camera_track),
         }
     }
 }
@@ -542,6 +594,10 @@ struct Config {
     camera_mirror: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     camera_border: Option<String>,
+    /// `burned` (default), `separate` or `both`: the camera on a video
+    /// track of its own for editing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    camera_track: Option<String>,
     /// Camera recovery (see Recovery); absent keys use the defaults.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     camera_reconnect_seconds: Option<f64>,
@@ -591,6 +647,7 @@ impl Config {
             camera_shape: None,
             camera_mirror: None,
             camera_border: None,
+            camera_track: None,
             camera_reconnect_seconds: None,
             camera_stall_seconds: None,
             camera_reopen_attempts: None,
@@ -610,6 +667,7 @@ impl Config {
             config.camera_shape = loaded.camera_shape;
             config.camera_mirror = loaded.camera_mirror;
             config.camera_border = loaded.camera_border;
+            config.camera_track = loaded.camera_track;
             config.camera_reconnect_seconds = loaded.camera_reconnect_seconds;
             config.camera_stall_seconds = loaded.camera_stall_seconds;
             config.camera_reopen_attempts = loaded.camera_reopen_attempts;
@@ -646,6 +704,7 @@ impl Config {
             camera_shape: Some(options.camera_shape.as_str().into()),
             camera_mirror: Some(options.camera_mirror),
             camera_border: Some(options.camera_border.clone()),
+            camera_track: Some(options.camera_track.as_str().into()),
         };
         self.profiles.insert(name.to_string(), profile);
         self.schema = 1;
@@ -802,6 +861,9 @@ fn apply_profile(options: &mut Options, profile: &Profile) -> Result<(), String>
         profile.camera_mirror,
         profile.camera_border.as_deref(),
     )?;
+    if let Some(value) = &profile.camera_track {
+        options.camera_track = CameraTrack::parse(value)?;
+    }
     if options.mode == Mode::WebcamOnly {
         options.webcam = Webcam::Only;
     }
@@ -1986,7 +2048,6 @@ fn build_plan(
         let (width, height) = scaled_screen(geometry.width, geometry.height, resolved.preset);
         (geometry, width, height)
     });
-    let audio_index = capture.audio_index;
     if resolved.audio == Audio::Mic
         || resolved.audio == Audio::Desktop
         || resolved.audio == Audio::Both
@@ -2078,7 +2139,35 @@ fn build_plan(
             screen.ok_or_else(|| "screen geometry is missing".to_string())?;
         width = out_width;
         height = out_height;
+        let (tw, th) = CAMERA_TRACK_SIZE;
+        let track_out = if vaapi { "camsrcv" } else { "cam" };
         if let (Webcam::Corner, Some(camera_index)) = (resolved.webcam, capture.camera_index) {
+            let source = camera_source(&mut filters, camera_index);
+            // The camera picture for the overlay and for its own track.
+            let (overlay_source, track_source) = match resolved.camera_track {
+                CameraTrack::Burned => (Some(source), None),
+                CameraTrack::Separate => (None, Some(source)),
+                CameraTrack::Both => {
+                    filters.push(format!("[{source}]split=2[camov][camtr]"));
+                    (Some("camov".to_string()), Some("camtr".to_string()))
+                }
+            };
+            if let Some(track_source) = track_source {
+                // Whole and unshaped, letterboxed to one size: the editor
+                // crops, shapes and places it.
+                filters.push(format!(
+                    "[{track_source}]{mirror}scale={tw}:{th}:force_original_aspect_ratio=decrease:flags=bicubic,\
+                     pad={tw}:{th}:(ow-iw)/2:(oh-ih)/2,setsar=1[{track_out}]"
+                ));
+            }
+            let Some(source) = overlay_source else {
+                filters.push(format!(
+                    "[{screen_index}:v]scale={out_width}:{out_height}:flags=bicubic,setsar=1[{vout}]"
+                ));
+                return finish_plan(
+                    resolved, capture, partial, probe, encoder, argv, filters, width, height,
+                );
+            };
             let camera_size = capture
                 .camera_mode
                 .as_ref()
@@ -2097,7 +2186,6 @@ fn build_plan(
             filters.push(format!(
                 "[{screen_index}:v]scale={out_width}:{out_height}:flags=bicubic,setsar=1[base]"
             ));
-            let source = camera_source(&mut filters, camera_index);
             // Fill the box and crop the rest: correct for any camera aspect,
             // and a centre crop for the circle.
             filters.push(format!(
@@ -2113,14 +2201,75 @@ fn build_plan(
                 "[base][wco]overlay={}:{}:format=auto[{vout}]",
                 overlay.x, overlay.y
             ));
+        } else if resolved.webcam == Webcam::Corner && resolved.camera_track.track() {
+            // The camera is gone for this segment: its track goes on in
+            // black, made from the screen so it keeps the screen's clock and
+            // every segment of the recording has the same tracks.
+            filters.push(format!(
+                "[{screen_index}:v]scale={out_width}:{out_height}:flags=bicubic,setsar=1,split=2[{vout}][ph];\
+                 [ph]scale=64:36:flags=neighbor,drawbox=x=0:y=0:w=iw:h=ih:color=black:t=fill,\
+                 scale={tw}:{th}:flags=neighbor,setsar=1[{track_out}]"
+            ));
         } else {
             filters.push(format!(
                 "[{screen_index}:v]scale={out_width}:{out_height}:flags=bicubic,setsar=1[{vout}]"
             ));
         }
     }
+    finish_plan(
+        resolved, capture, partial, probe, encoder, argv, filters, width, height,
+    )
+}
+
+/// Whether this recording has the camera on a track of its own.
+fn has_camera_track(resolved: &Options) -> bool {
+    resolved.mode != Mode::WebcamOnly
+        && resolved.webcam == Webcam::Corner
+        && resolved.camera_track.track()
+}
+
+/// How the camera was placed when it was recorded, kept with its track so
+/// an export or the editor can put it back the same way.
+fn camera_layout_tag(resolved: &Options, capture: &CaptureInputs) -> String {
+    let border = border_rgb(&resolved.camera_border)
+        .map(|(r, g, b)| format!("{r:02x}{g:02x}{b:02x}"))
+        .unwrap_or_else(|| "none".into());
+    let camera = capture
+        .camera_mode
+        .as_ref()
+        .map(|mode| (mode.width, mode.height))
+        .unwrap_or(CAMERA_TRACK_SIZE);
+    let (cw, ch) = camera::track_content(camera, CAMERA_TRACK_SIZE);
+    format!(
+        "corner={};size={};shape={};border={};burned={};content={cw}x{ch}",
+        resolved.corner.as_str(),
+        resolved.webcam_size.as_str(),
+        resolved.camera_shape.as_str(),
+        border,
+        u8::from(resolved.camera_track.burned())
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_plan(
+    resolved: &Options,
+    capture: &CaptureInputs,
+    partial: &Path,
+    probe: Option<&Path>,
+    encoder: &Encoder,
+    mut argv: Vec<String>,
+    mut filters: Vec<String>,
+    width: u32,
+    height: u32,
+) -> Result<Plan, String> {
+    let vaapi = matches!(encoder, Encoder::Vaapi(_));
+    let track = has_camera_track(resolved);
+    let audio_index = capture.audio_index;
     if vaapi {
         filters.push("[vsrc]format=nv12,hwupload[v]".to_string());
+        if track {
+            filters.push("[camsrcv]format=nv12,hwupload[cam]".to_string());
+        }
     }
     let has_audio = resolved.audio != Audio::None;
     let mut env = Vec::new();
@@ -2172,6 +2321,20 @@ fn build_plan(
         argv.extend(["-filter_complex".into(), audio_filters.join(";")]);
     }
     argv.extend(["-map".into(), "[v]".into()]);
+    if track {
+        argv.extend([
+            "-map".into(),
+            "[cam]".into(),
+            "-metadata:s:v:1".into(),
+            "title=Camera".into(),
+            "-metadata:s:v:1".into(),
+            format!("NIRUCLIP_CAMERA={}", camera_layout_tag(resolved, capture)),
+            "-disposition:v:0".into(),
+            "default".into(),
+            "-disposition:v:1".into(),
+            "0".into(),
+        ]);
+    }
     if !audio_filters.is_empty() {
         argv.extend(["-map".into(), "[a]".into()]);
     } else if has_audio {
@@ -2356,6 +2519,9 @@ fn parse_args(argv: &[String], config: &Config) -> Result<Options, String> {
         config.camera_mirror,
         config.camera_border.as_deref(),
     )?;
+    if let Some(value) = &config.camera_track {
+        options.camera_track = CameraTrack::parse(value)?;
+    }
     let profile_name = argv
         .windows(2)
         .find(|pair| pair[0] == "--profile")
@@ -2455,6 +2621,10 @@ fn parse_args(argv: &[String], config: &Config) -> Result<Options, String> {
                 options.camera_border = valid_border(&next()?)?;
                 index += 1;
             }
+            "--camera-track" => {
+                options.camera_track = CameraTrack::parse(&next()?)?;
+                index += 1;
+            }
             "--check-camera" => options.check_camera = true,
             "--preview" => options.preview = true,
             "--export" => {
@@ -2545,6 +2715,9 @@ Options:\n\
   --camera DEVICE|auto              camera device (auto skips IR sensors)\n\
   --camera-shape rounded|circle|rect\n\
   --camera-border theme|none|RRGGBB thin border around the camera\n\
+  --camera-track burned|separate|both  the camera in the picture, on a video\n\
+                                    track of its own (to move or hide it when\n\
+                                    editing), or both\n\
   --mirror | --no-mirror            mirror the camera picture\n\
   --preset share|small|quality\n\
   --encoder auto|software|vaapi     auto uses VAAPI when a probe succeeds\n\
@@ -5560,9 +5733,50 @@ const GIF_MAX_SECONDS: f64 = 30.0;
 /// `--export mp4|gif`: a share-friendly copy of a recording next to it. MP4
 /// without trimming is a lossless remux (instant); trimming re-encodes so
 /// the cut is frame-accurate. The MKV is never changed.
+/// A recording's camera track (the second video track, tagged by the
+/// recorder), its placement and the screen size; None when the camera is in
+/// the picture already or there is no track.
+fn camera_track_of(input: &Path) -> Option<(camera::TrackLayout, (u32, u32))> {
+    let out = Command::new(command_path("ffprobe", "NIRUCLIP_FFPROBE"))
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v",
+            "-show_entries",
+            "stream=width,height:stream_tags=title,NIRUCLIP_CAMERA",
+            "-of",
+            "json",
+        ])
+        .arg(input)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    let streams = v.get("streams")?.as_array()?;
+    let screen = streams.first()?;
+    let size = (
+        screen.get("width")?.as_u64()? as u32,
+        screen.get("height")?.as_u64()? as u32,
+    );
+    let tag = streams.get(1)?.get("tags").and_then(|t| {
+        t.as_object()?
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("NIRUCLIP_CAMERA"))
+            .and_then(|(_, v)| v.as_str().map(str::to_string))
+    })?;
+    let layout = camera::TrackLayout::parse(&tag);
+    (!layout.burned).then_some((layout, size))
+}
+
 fn export(options: &Options, format: &str) -> Result<PathBuf, String> {
     let input = last_recording(options)?;
     let target = export_target(&input, format);
+    // A camera on its own track goes back into its corner, as recorded.
+    let composite = camera_track_of(&input).map(|(layout, size)| {
+        camera::composite_filters(&layout, size, "0:v:0", "0:v:1", "vc", "ex").join(";")
+    });
     let ffmpeg = command_path("ffmpeg", "NIRUCLIP_FFMPEG");
     let mut trim: Vec<String> = Vec::new();
     if let Some(from) = options.trim_from {
@@ -5593,14 +5807,44 @@ fn export(options: &Options, format: &str) -> Result<PathBuf, String> {
     };
     let strings =
         |items: &[&str]| -> Vec<String> { items.iter().map(|v| (*v).to_string()).collect() };
+    let gif_chain = "fps=12,scale='min(720,iw)':-2:flags=lanczos,split[a][b];[a]palettegen=stats_mode=diff[p];[b][p]paletteuse=dither=bayer:bayer_scale=4";
     let attempts: Vec<Vec<String>> = if format == "gif" {
-        vec![base(&strings(&[
-            "-an",
-            "-vf",
-            "fps=12,scale='min(720,iw)':-2:flags=lanczos,split[a][b];[a]palettegen=stats_mode=diff[p];[b][p]paletteuse=dither=bayer:bayer_scale=4",
-            "-loop",
-            "0",
-        ]))]
+        let graph = match &composite {
+            Some(c) => format!("{c};[vc]{gif_chain}[g]"),
+            None => format!("[0:v:0]{gif_chain}[g]"),
+        };
+        vec![base(&[
+            "-an".into(),
+            "-filter_complex".into(),
+            graph,
+            "-map".into(),
+            "[g]".into(),
+            "-loop".into(),
+            "0".into(),
+        ])]
+    } else if let Some(c) = &composite {
+        vec![base(&[
+            "-filter_complex".into(),
+            c.clone(),
+            "-map".into(),
+            "[vc]".into(),
+            "-map".into(),
+            "0:a?".into(),
+            "-c:v".into(),
+            "libx264".into(),
+            "-preset".into(),
+            "veryfast".into(),
+            "-crf".into(),
+            "20".into(),
+            "-pix_fmt".into(),
+            "yuv420p".into(),
+            "-c:a".into(),
+            "aac".into(),
+            "-b:a".into(),
+            "160k".into(),
+            "-movflags".into(),
+            "+faststart".into(),
+        ])]
     } else {
         let encode = base(&strings(&[
             "-map",
@@ -6065,6 +6309,259 @@ mod tests {
         .unwrap();
         assert_eq!((plan.width, plan.height), (1920, 1080));
         assert!(plan.argv.iter().any(|arg| arg == "1:a:0"));
+    }
+
+    #[test]
+    fn the_camera_can_have_a_track_of_its_own() {
+        let geometry = Some(Geometry {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        });
+        let found = camera::Camera {
+            device: "/dev/video0".into(),
+            ..camera::Camera::default()
+        };
+        let plan_for = |track: CameraTrack, camera: bool| {
+            let options = Options {
+                webcam: Webcam::Corner,
+                audio: Audio::Mic,
+                camera_track: track,
+                ..Options::default()
+            };
+            let inputs = assemble_inputs(
+                &options,
+                ":0",
+                geometry,
+                camera.then(|| found.clone()),
+                None,
+                None,
+            )
+            .unwrap();
+            build_plan(
+                &options,
+                &inputs,
+                Path::new("/tmp/x.part.mkv"),
+                Path::new("/tmp/p"),
+                &Encoder::Software,
+                None,
+            )
+            .unwrap()
+            .argv
+            .join(" ")
+        };
+        // Burned: one video track, the camera drawn in (as before).
+        let burned = plan_for(CameraTrack::Burned, true);
+        assert!(burned.contains("overlay=") && !burned.contains("[cam]"));
+        // Separate: a clean screen and the camera whole on v:1, with its layout.
+        let separate = plan_for(CameraTrack::Separate, true);
+        assert!(!separate.contains("overlay="), "{separate}");
+        assert!(separate.contains("-map [v] -map [cam]"));
+        assert!(separate.contains("scale=1280:720:force_original_aspect_ratio=decrease"));
+        assert!(separate.contains("-metadata:s:v:1 title=Camera"));
+        assert!(separate.contains("NIRUCLIP_CAMERA=corner=bottom-right;size=medium;shape=rounded"));
+        assert!(separate.contains("burned=0"));
+        assert!(
+            separate.contains("-map 2:a:0"),
+            "camera, screen, then the microphone"
+        );
+        // Both: the overlay and the track, from one split camera.
+        let both = plan_for(CameraTrack::Both, true);
+        assert!(
+            both.contains("split=2[camov][camtr]")
+                && both.contains("overlay=")
+                && both.contains("-map [cam]")
+        );
+        assert!(both.contains("burned=1"));
+        // The camera is lost: the track goes on in black from the screen.
+        let lost = plan_for(CameraTrack::Separate, false);
+        assert!(
+            lost.contains("drawbox") && lost.contains("-map [cam]") && !lost.contains("v4l2"),
+            "{lost}"
+        );
+        // VAAPI: both tracks are uploaded.
+        let options = Options {
+            webcam: Webcam::Corner,
+            camera_track: CameraTrack::Separate,
+            ..Options::default()
+        };
+        let inputs =
+            assemble_inputs(&options, ":0", geometry, Some(found.clone()), None, None).unwrap();
+        let vaapi = build_plan(
+            &options,
+            &inputs,
+            Path::new("/tmp/x.part.mkv"),
+            Path::new("/tmp/p"),
+            &Encoder::Vaapi("/dev/dri/renderD128".into()),
+            None,
+        )
+        .unwrap()
+        .argv
+        .join(" ");
+        assert!(
+            vaapi.contains("[vsrc]format=nv12,hwupload[v]")
+                && vaapi.contains("[camsrcv]format=nv12,hwupload[cam]"),
+            "{vaapi}"
+        );
+    }
+
+    /// The real graph through a real ffmpeg, with test pictures in place of
+    /// the camera and the screen: `cargo test -- --ignored real_ffmpeg`.
+    #[test]
+    #[ignore = "needs ffmpeg and ffprobe"]
+    fn real_ffmpeg_records_the_camera_track() {
+        let geometry = Some(Geometry {
+            x: 0,
+            y: 0,
+            width: 1280,
+            height: 720,
+        });
+        let found = camera::Camera {
+            device: "/dev/video0".into(),
+            ..camera::Camera::default()
+        };
+        let dir = std::env::temp_dir().join(format!("niruclip-track-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        for (track, camera, streams) in [
+            (CameraTrack::Separate, true, 2),
+            (CameraTrack::Both, true, 2),
+            (CameraTrack::Separate, false, 2),
+            (CameraTrack::Burned, true, 1),
+        ] {
+            let options = Options {
+                webcam: Webcam::Corner,
+                audio: Audio::None,
+                camera_track: track,
+                ..Options::default()
+            };
+            let mode = camera::Mode {
+                format: "YUYV".into(),
+                width: 640,
+                height: 480,
+                fps: 30.0,
+            };
+            let inputs = assemble_inputs(
+                &options,
+                ":0",
+                geometry,
+                camera.then(|| found.clone()),
+                camera.then_some(mode),
+                None,
+            )
+            .unwrap();
+            let out = dir.join(format!("{}-{camera}.mkv", track.as_str()));
+            let plan = build_plan(
+                &options,
+                &inputs,
+                &out,
+                &dir.join("progress"),
+                &Encoder::Software,
+                None,
+            )
+            .unwrap();
+            // Swap the live inputs for test sources of the same kind.
+            let mut argv: Vec<String> = Vec::new();
+            let mut i = 0;
+            while i < plan.argv.len() {
+                let a = &plan.argv[i];
+                if a == "-thread_queue_size" {
+                    let end = plan.argv[i..].iter().position(|x| x == "-i").unwrap() + i;
+                    let dev = &plan.argv[end + 1];
+                    let src = if dev.starts_with("/dev/video") {
+                        "testsrc=s=640x480:r=30"
+                    } else {
+                        "testsrc2=s=1280x720:r=30"
+                    };
+                    argv.extend([
+                        "-f".into(),
+                        "lavfi".into(),
+                        "-t".into(),
+                        "2".into(),
+                        "-i".into(),
+                        src.into(),
+                    ]);
+                    i = end + 2;
+                    continue;
+                }
+                argv.push(a.clone());
+                i += 1;
+            }
+            let status = std::process::Command::new("ffmpeg")
+                .args(&argv)
+                .status()
+                .unwrap();
+            assert!(
+                status.success(),
+                "ffmpeg failed for {track:?}: {}",
+                argv.join(" ")
+            );
+            let probe = std::process::Command::new("ffprobe")
+                .args([
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v",
+                    "-show_entries",
+                    "stream=index,width,height:stream_tags=title,NIRUCLIP_CAMERA",
+                    "-of",
+                    "compact",
+                    out.to_str().unwrap(),
+                ])
+                .output()
+                .unwrap();
+            let text = String::from_utf8_lossy(&probe.stdout);
+            assert_eq!(
+                text.lines().count(),
+                streams,
+                "{track:?} camera={camera}: {text}"
+            );
+            if streams == 2 {
+                assert!(
+                    text.contains("width=1280|height=720|tag:title=Camera"),
+                    "{text}"
+                );
+                assert!(
+                    text.contains("NIRUCLIP_CAMERA=corner=bottom-right"),
+                    "{text}"
+                );
+            }
+        }
+        // Export puts the camera back in its corner: one picture.
+        let rec = dir.join("separate-true.mkv");
+        let opts = Options {
+            input: Some(rec.clone()),
+            no_notify: true,
+            ..Options::default()
+        };
+        let (layout, size) = camera_track_of(&rec).expect("the camera track is found");
+        assert_eq!(size, (1280, 720));
+        assert_eq!(layout.content, (960, 720), "a 4:3 camera in the 16:9 track");
+        for format in ["mp4", "gif"] {
+            let out = export(&opts, format).unwrap();
+            let probe = std::process::Command::new("ffprobe")
+                .args([
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v",
+                    "-show_entries",
+                    "stream=width,height",
+                    "-of",
+                    "csv=p=0",
+                ])
+                .arg(&out)
+                .output()
+                .unwrap();
+            let text = String::from_utf8_lossy(&probe.stdout);
+            assert_eq!(text.lines().count(), 1, "{format}: {text}");
+            fs::remove_file(out).unwrap();
+        }
+        assert!(
+            camera_track_of(&dir.join("both-true.mkv")).is_none(),
+            "both: the screen has it already"
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

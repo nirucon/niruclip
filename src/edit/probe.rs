@@ -77,8 +77,30 @@ pub fn parse(path: &Path, json: &str) -> Result<Media, String> {
     };
     let image = IMAGE_EXT.contains(&extension(path).as_str());
     let streams = v["streams"].as_array().cloned().unwrap_or_default();
+    let mut video_index = 0usize;
     for s in &streams {
         match s["codec_type"].as_str() {
+            Some("video") if media.has_video => {
+                // A second picture: NIRUCLIP's camera on a track of its own.
+                if s["disposition"]["attached_pic"].as_i64() == Some(1) {
+                    continue;
+                }
+                video_index += 1;
+                let tag = |name: &str| {
+                    s["tags"].as_object().and_then(|t| {
+                        t.iter()
+                            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                            .and_then(|(_, v)| v.as_str().map(str::to_string))
+                    })
+                };
+                let camera = tag("title").is_some_and(|t| t.eq_ignore_ascii_case("camera"));
+                if camera && media.camera.is_none() {
+                    media.camera = Some(super::project::CameraTrack {
+                        stream: video_index,
+                        layout: tag("NIRUCLIP_CAMERA").unwrap_or_default(),
+                    });
+                }
+            }
             Some("video") if !media.has_video => {
                 // Cover art in a music file is a picture, not a film.
                 let attached = s["disposition"]["attached_pic"].as_i64() == Some(1);
@@ -176,6 +198,32 @@ mod tests {
         let m = parse(Path::new("/p/a.png"), png).unwrap();
         assert!(m.still && m.has_video);
         assert!((m.duration - 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_recording_with_the_camera_on_its_own_track() {
+        let json = r#"{"streams":[
+            {"codec_type":"video","width":1920,"height":1080,"avg_frame_rate":"30/1"},
+            {"codec_type":"video","width":1280,"height":720,"tags":{"title":"Camera",
+             "NIRUCLIP_CAMERA":"corner=top-left;size=small;shape=circle;border=none;burned=0;content=960x720"}},
+            {"codec_type":"audio"}],
+            "format":{"duration":"4"}}"#;
+        let m = parse(Path::new("/v/c.mkv"), json).unwrap();
+        assert_eq!(
+            (m.width, m.height),
+            (1920, 1080),
+            "the screen is the picture"
+        );
+        let cam = m.own_camera().expect("a camera track");
+        assert_eq!(cam.stream, 1);
+        let l = cam.layout();
+        assert_eq!((l.corner, l.content), ((false, false), (960, 720)));
+        assert_eq!(l.shape, crate::camera::Shape::Circle);
+        let both = json.replace("burned=0", "burned=1");
+        assert!(parse(Path::new("/v/d.mkv"), &both)
+            .unwrap()
+            .own_camera()
+            .is_none());
     }
 
     #[test]

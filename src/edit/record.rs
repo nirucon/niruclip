@@ -14,6 +14,11 @@ pub const SOUND: [&str; 4] = ["None", "Microphone", "Desktop", "Both"];
 pub const CAMERA: [&str; 2] = ["Off", "In a corner"];
 pub const CORNER: [&str; 4] = ["Top left", "Top right", "Bottom left", "Bottom right"];
 pub const SIZE: [&str; 3] = ["Small", "Medium", "Large"];
+pub const TRACK: [&str; 3] = [
+    "In the picture",
+    "Its own track (move or hide it when editing)",
+    "Both",
+];
 pub const COUNTDOWN: [u64; 5] = [0, 3, 5, 10, 15];
 pub const PLACE: [&str; 2] = ["At the end", "At the playhead"];
 
@@ -40,6 +45,9 @@ pub struct Choices {
     pub countdown: usize,
     #[serde(default)]
     pub place: usize,
+    /// The camera in the picture, on its own track, or both.
+    #[serde(default = "one")]
+    pub track: usize,
 }
 
 fn one() -> usize {
@@ -64,6 +72,7 @@ impl Default for Choices {
             size: 1,
             countdown: 2,
             place: 0,
+            track: 1,
         }
     }
 }
@@ -77,6 +86,7 @@ pub enum Row {
     Camera,
     Corner,
     Size,
+    Track,
     Countdown,
     Place,
 }
@@ -131,6 +141,7 @@ impl Form {
             if c.camera == 1 {
                 rows.push(Row::Corner);
                 rows.push(Row::Size);
+                rows.push(Row::Track);
             }
         }
         rows.push(Row::Countdown);
@@ -147,6 +158,7 @@ impl Form {
             Row::Camera => "Camera",
             Row::Corner => "Corner",
             Row::Size => "Camera size",
+            Row::Track => "Camera track",
             Row::Countdown => "Countdown",
             Row::Place => "Put it",
         }
@@ -184,6 +196,7 @@ impl Form {
             Row::Camera => (list(&CAMERA), c.camera),
             Row::Corner => (list(&CORNER), c.corner),
             Row::Size => (list(&SIZE), c.size),
+            Row::Track => (list(&TRACK), c.track),
             Row::Countdown => (
                 COUNTDOWN
                     .iter()
@@ -228,6 +241,7 @@ impl Form {
             Row::Camera => c.camera = i,
             Row::Corner => c.corner = i,
             Row::Size => c.size = i,
+            Row::Track => c.track = i,
             Row::Countdown => c.countdown = i,
             Row::Place => c.place = i,
         }
@@ -286,6 +300,8 @@ pub fn args(c: &Choices) -> Vec<String> {
             );
             a.push("--webcam-size".into());
             a.push(["small", "medium", "large"][c.size.min(2)].into());
+            a.push("--camera-track".into());
+            a.push(["burned", "separate", "both"][c.track.min(2)].into());
         } else {
             a.push("off".into());
         }
@@ -461,11 +477,12 @@ mod tests {
             size: 2,
             countdown: 2,
             place: 0,
+            track: 1,
         };
         assert_eq!(
             args(&c).join(" "),
             "--full --audio both --mic alsa_input.usb-RODE --screen DP-2-1 --webcam corner \
-             --corner top-right --webcam-size large --countdown 5"
+             --corner top-right --webcam-size large --camera-track separate --countdown 5"
         );
         assert_eq!(pre_delay(&c), 0);
     }

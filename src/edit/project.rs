@@ -9,7 +9,9 @@ use std::path::{Path, PathBuf};
 
 /// 2: nine title positions (was top, middle, bottom), styled titles, zoom,
 /// hidden areas, voice sound, captions, logo and loudness.
-pub const SCHEMA: u32 = 2;
+/// 3: picture-in-picture (the recording's camera track or another file),
+/// text effects, more looks and a free text position.
+pub const SCHEMA: u32 = 3;
 
 /// The path of the built-in title card "media": a plain colour.
 pub const CARD: &str = "niruclip:card";
@@ -40,6 +42,25 @@ pub struct Media {
     /// cut, move and speed change.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub captions: Vec<Caption>,
+    /// A NIRUCLIP recording with the camera on a video track of its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub camera: Option<CameraTrack>,
+}
+
+/// The camera of a recording, on its own video track.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct CameraTrack {
+    /// Which video stream of the file (0 is the screen).
+    pub stream: usize,
+    /// How it was placed when recorded (the recorder's NIRUCLIP_CAMERA tag).
+    #[serde(default)]
+    pub layout: String,
+}
+
+impl CameraTrack {
+    pub fn layout(&self) -> crate::camera::TrackLayout {
+        crate::camera::TrackLayout::parse(&self.layout)
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -62,7 +83,14 @@ impl Media {
             still: true,
             tracks: Vec::new(),
             captions: Vec::new(),
+            camera: None,
         }
+    }
+
+    /// The camera track, when the screen picture does not have the camera
+    /// drawn in already.
+    pub fn own_camera(&self) -> Option<&CameraTrack> {
+        self.camera.as_ref().filter(|c| !c.layout().burned)
     }
 
     pub fn is_card(&self) -> bool {
@@ -233,6 +261,23 @@ pub struct Effects {
     pub hide_start: f64,
     #[serde(default)]
     pub hide_length: f64,
+    /// How the text comes and goes: 0 appears (or fades, with a fade time),
+    /// 1 slides up, 2 slides in from the left, 3 pops, 4 types itself.
+    #[serde(default)]
+    pub text_anim: u8,
+    /// The second colour of the lower third, neon and marker looks.
+    #[serde(default = "accent")]
+    pub text_accent: u32,
+    /// With position 9 (free): the text's centre x and top y, percent.
+    #[serde(default = "free_place")]
+    pub text_xy: [f64; 2],
+}
+
+fn accent() -> u32 {
+    0xffd84d
+}
+fn free_place() -> [f64; 2] {
+    [50.0, 70.0]
 }
 
 fn white() -> u32 {
@@ -285,6 +330,9 @@ impl Default for Effects {
             hide_area: [0.0; 4],
             hide_start: 0.0,
             hide_length: 0.0,
+            text_anim: 0,
+            text_accent: 0xffd84d,
+            text_xy: [50.0, 70.0],
         }
     }
 }
@@ -359,11 +407,75 @@ pub struct Clip {
     /// with both on their own tracks.
     #[serde(default = "one")]
     pub desktop_volume: f64,
+    #[serde(default, skip_serializing_if = "is_default_pip")]
+    pub pip: Pip,
+}
+
+fn is_default_pip(p: &Pip) -> bool {
+    *p == Pip::default()
 }
 
 fn transition_length() -> f64 {
     0.8
 }
+
+/// Picture-in-picture over a clip: the recording's own camera track, or a
+/// picture or film of the project.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Pip {
+    /// 0 the recording's camera when it has a track of its own, 1 off,
+    /// 2 the picture or film `media`.
+    #[serde(default)]
+    pub mode: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media: Option<usize>,
+    /// Centre x, centre y and width in percent of the frame; a width of 0
+    /// is where and how large it was recorded.
+    #[serde(default)]
+    pub area: [f64; 3],
+    /// 0 as recorded, 1 rounded, 2 circle, 3 rectangle.
+    #[serde(default)]
+    pub shape: u8,
+    /// 0 as recorded, then the colours of PIP_BORDERS.
+    #[serde(default)]
+    pub border: u8,
+    #[serde(default)]
+    pub shadow: bool,
+    /// 0 none, 1 fade, 2 slide in from its side.
+    #[serde(default)]
+    pub effect: u8,
+    #[serde(default)]
+    pub start: f64,
+    /// 0: to the end of the clip.
+    #[serde(default)]
+    pub length: f64,
+}
+
+impl Default for Pip {
+    fn default() -> Self {
+        Self {
+            mode: 0,
+            media: None,
+            area: [0.0; 3],
+            shape: 0,
+            border: 0,
+            shadow: false,
+            effect: 0,
+            start: 0.0,
+            length: 0.0,
+        }
+    }
+}
+
+/// Border choices: (colour, name); index 0 is "as recorded".
+pub const PIP_BORDERS: [(Option<u32>, &str); 6] = [
+    (None, "As recorded"),
+    (None, "None"),
+    (Some(0xffffff), "White"),
+    (Some(0x111111), "Black"),
+    (Some(0xffd84d), "Yellow"),
+    (Some(0x7aa2f7), "Blue"),
+];
 
 impl Clip {
     pub fn new(media: usize, start: f64, end: f64) -> Self {
@@ -381,6 +493,7 @@ impl Clip {
             effects: Effects::default(),
             voice: 0,
             desktop_volume: 1.0,
+            pip: Pip::default(),
         }
     }
 
@@ -580,9 +693,30 @@ impl Project {
             clip.desktop_volume = clip.desktop_volume.clamp(0.0, 4.0);
             clip.voice = clip.voice.min(3);
             let e = &mut clip.effects;
-            e.text_position = e.text_position.min(8);
+            e.text_position = e.text_position.min(9);
             e.font_style = e.font_style.min(3);
-            e.text_look = e.text_look.min(3);
+            e.text_look = e.text_look.min(6);
+            e.text_anim = e.text_anim.min(4);
+            e.text_xy = [
+                e.text_xy[0].clamp(0.0, 100.0),
+                e.text_xy[1].clamp(0.0, 100.0),
+            ];
+            let pip = &mut clip.pip;
+            if pip.media.is_some_and(|m| m >= n) {
+                pip.media = None;
+            }
+            if pip.mode == 2 && pip.media.is_none() {
+                pip.mode = 0;
+            }
+            pip.mode = pip.mode.min(2);
+            pip.shape = pip.shape.min(3);
+            pip.border = pip.border.min((PIP_BORDERS.len() - 1) as u8);
+            pip.effect = pip.effect.min(2);
+            pip.area = [
+                pip.area[0].clamp(0.0, 100.0),
+                pip.area[1].clamp(0.0, 100.0),
+                pip.area[2].clamp(0.0, 90.0),
+            ];
             e.hide = e.hide.min(3);
             for area in [&mut e.zoom_area, &mut e.hide_area] {
                 area[0] = area[0].clamp(0.0, 100.0);

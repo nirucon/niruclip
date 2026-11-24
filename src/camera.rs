@@ -1035,6 +1035,18 @@ pub fn shape_filters(
     overlay: &OverlayBox,
     rgb: (u8, u8, u8),
 ) -> Vec<String> {
+    shape_filters_tagged(input, output, overlay, rgb, "nc")
+}
+
+/// The same with its own label prefix, so several shaped pictures fit in
+/// one graph (the editor's picture-in-picture in many clips).
+pub fn shape_filters_tagged(
+    input: &str,
+    output: &str,
+    overlay: &OverlayBox,
+    rgb: (u8, u8, u8),
+    tag: &str,
+) -> Vec<String> {
     let (w, h, r, b) = (
         overlay.width,
         overlay.height,
@@ -1045,13 +1057,13 @@ pub fn shape_filters(
     let mut current = input.to_string();
     if r > 0 {
         filters.push(format!(
-            "color=c=black:s={w}x{h}:r=1:d=1,format=gray,geq=lum='{};255*clip({r}-ld(2)+0.5,0,1)'[nc_mask]",
+            "color=c=black:s={w}x{h}:r=1:d=1,format=gray,geq=lum='{};255*clip({r}-ld(2)+0.5,0,1)'[{tag}_mask]",
             distance_expr(r)
         ));
         filters.push(format!(
-            "[{current}]format=yuva420p[nc_cam];[nc_cam][nc_mask]alphamerge[nc_shaped]"
+            "[{current}]format=yuva420p[{tag}_cam];[{tag}_cam][{tag}_mask]alphamerge[{tag}_shaped]"
         ));
-        current = "nc_shaped".into();
+        current = format!("{tag}_shaped");
     }
     if b > 0 {
         let inner = r.saturating_sub(b);
@@ -1068,10 +1080,10 @@ pub fn shape_filters(
         };
         let (red, green, blue) = rgb;
         filters.push(format!(
-            "color=c=black:s={w}x{h}:r=1:d=1,format=rgba,geq=r={red}:g={green}:b={blue}:a='{ring}'[nc_ring]"
+            "color=c=black:s={w}x{h}:r=1:d=1,format=rgba,geq=r={red}:g={green}:b={blue}:a='{ring}'[{tag}_ring]"
         ));
         filters.push(format!(
-            "[{current}][nc_ring]overlay=0:0:format=auto[{output}]"
+            "[{current}][{tag}_ring]overlay=0:0:format=auto[{output}]"
         ));
     } else if current != input {
         filters.push(format!("[{current}]null[{output}]"));
@@ -1079,6 +1091,133 @@ pub fn shape_filters(
         filters.push(format!("[{input}]null[{output}]"));
     }
     filters
+}
+
+// ---------------------------------------------------------------------------
+// The camera on a track of its own.
+// ---------------------------------------------------------------------------
+
+/// How a camera on its own track was placed when it was recorded (the
+/// `NIRUCLIP_CAMERA` tag of that track), to put it back the same way.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TrackLayout {
+    /// (right, bottom)
+    pub corner: (bool, bool),
+    /// Overlay height as a share of the picture height.
+    pub share: f64,
+    pub shape: Shape,
+    pub border: Option<(u8, u8, u8)>,
+    /// The screen picture already has the camera drawn in.
+    pub burned: bool,
+    /// The camera picture inside the letterboxed track.
+    pub content: (u32, u32),
+}
+
+impl Default for TrackLayout {
+    fn default() -> Self {
+        Self {
+            corner: (true, true),
+            share: 0.26,
+            shape: Shape::Rounded,
+            border: None,
+            burned: false,
+            content: (1280, 720),
+        }
+    }
+}
+
+impl TrackLayout {
+    pub fn parse(tag: &str) -> Self {
+        let mut l = Self::default();
+        for part in tag.split(';') {
+            let Some((k, v)) = part.split_once('=') else {
+                continue;
+            };
+            match k.trim() {
+                "corner" => {
+                    l.corner = match v {
+                        "top-left" => (false, false),
+                        "top-right" => (true, false),
+                        "bottom-left" => (false, true),
+                        _ => (true, true),
+                    }
+                }
+                "size" => {
+                    l.share = match v {
+                        "small" => 0.20,
+                        "large" => 0.34,
+                        _ => 0.26,
+                    }
+                }
+                "shape" => l.shape = Shape::parse(v).unwrap_or(Shape::Rounded),
+                "border" => l.border = parse_hex(v),
+                "burned" => l.burned = v == "1",
+                "content" => {
+                    if let Some((w, h)) = v.split_once('x') {
+                        if let (Ok(w), Ok(h)) = (w.parse::<u32>(), h.parse::<u32>()) {
+                            if w >= 16 && h >= 16 {
+                                l.content = (w, h);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        l
+    }
+}
+
+/// The camera picture inside a `track` (w, h) letterboxed track for a
+/// camera of `camera` (w, h).
+pub fn track_content(camera: (u32, u32), track: (u32, u32)) -> (u32, u32) {
+    let (cw, ch) = camera;
+    let (tw, th) = track;
+    if cw == 0 || ch == 0 {
+        return track;
+    }
+    if cw as f64 / ch as f64 > tw as f64 / th as f64 {
+        (tw, even(tw as f64 * ch as f64 / cw as f64).min(th))
+    } else {
+        (even(th as f64 * cw as f64 / ch as f64).min(tw), th)
+    }
+}
+
+/// Filters that put a camera track (`cam`, the letterboxed track) back
+/// over `base` (`out` w, h) as it was recorded; the result is `output`.
+pub fn composite_filters(
+    layout: &TrackLayout,
+    out: (u32, u32),
+    base: &str,
+    cam: &str,
+    output: &str,
+    tag: &str,
+) -> Vec<String> {
+    let (cw, ch) = layout.content;
+    let overlay = overlay_box(
+        out,
+        (cw, ch),
+        layout.share,
+        layout.shape,
+        layout.corner,
+        layout.border.is_some(),
+    );
+    let (ow, oh) = (overlay.width, overlay.height);
+    let mut f = vec![format!(
+        "[{cam}]crop={cw}:{ch}:(iw-{cw})/2:(ih-{ch})/2,scale={ow}:{oh}:force_original_aspect_ratio=increase:flags=bicubic,crop={ow}:{oh},setsar=1[{tag}_wc]"
+    )];
+    f.extend(shape_filters_tagged(
+        &format!("{tag}_wc"),
+        &format!("{tag}_wco"),
+        &overlay,
+        layout.border.unwrap_or((0, 0, 0)),
+        tag,
+    ));
+    f.push(format!(
+        "[{base}][{tag}_wco]overlay={}:{}:format=auto[{output}]",
+        overlay.x, overlay.y
+    ));
+    f
 }
 
 // ---------------------------------------------------------------------------
