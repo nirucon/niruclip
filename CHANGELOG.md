@@ -3,7 +3,12 @@
 All notable changes to NIRUCLIP. Earlier releases are described in their
 GitHub release notes and commit messages.
 
-## 0.13.0 (2026-11-25)
+## 0.13.1 (2026-11-25)
+
+The 0.13.0 tag was not released (a test needed ffmpeg on the build machine).
+Everything below ships in 0.13.1.
+
+## 0.13.0 (2026-11-25, not released)
 
 ### Added
 - **The camera plays live**: Space shows the camera over the film where and

@@ -669,9 +669,11 @@ mod tests {
             "{}",
             t.url
         );
-        // Waiting for the copy: the plain picture meanwhile.
+        // Waiting for the copy: the plain picture meanwhile (made by
+        // ffmpeg when there is one), never the copy.
         let t = timeline(&p, &mut Waiting).unwrap();
-        assert!(t.url.contains(".png,length="), "{}", t.url);
+        assert!(!t.url.contains("card-card.mkv"), "{}", t.url);
+        assert!(t.url.contains(",length=5.000000;"), "{}", t.url);
     }
 
     #[test]
