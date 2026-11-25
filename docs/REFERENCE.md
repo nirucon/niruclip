@@ -67,6 +67,15 @@ and the editor put it back as recorded. When the camera is lost the track
 goes on in black, made from the screen stream, so every segment has the same
 tracks and they join.
 
+In the editor's live preview the camera plays from a copy of that track in
+`~/.cache/niruclip/live/`: a stream copy when the camera fills the track, or
+cut to the camera picture (x264 ultrafast) when it is letterboxed. mpv plays
+an EDL with two streams, the cameras of every clip cut to match (a tiny
+black filler where a clip has none) and the film, and a `lavfi-complex`
+graph scales the first and lays it over the second for each clip's window.
+The overlay is a rectangle; the shape, border, shadow and effects are drawn
+by ffmpeg in the rendered preview (P), the placing view (E) and the export.
+
 ### Camera health
 
 - **Before recording:** a camera that another program is streaming from is

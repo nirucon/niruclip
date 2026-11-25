@@ -165,23 +165,33 @@ niruclip edit --export film.niruclip --limit 10 --captions burn   # fit 10 MB, c
 ```
 
 The window has the media you imported on the left, the preview in the
-middle, the settings of the selected clip on the right and the timeline at
-the bottom, with lanes for the picture, its sound and music. It follows the
-NIRUX theme and is made for the keyboard; F1 shows every key.
+middle with the transport bar under it, the settings of the selected clip
+on the right and the timeline at the bottom. The timeline has five lanes:
+titles, camera, picture, sound and music. It follows the NIRUX theme and
+is made for the keyboard; F1 shows every key.
+
+The transport bar has buttons to go to the start, the previous cut or
+marker, play, the next cut or marker and the end, the time with frames
+(`00:01:23:12`), and switches for loop, snapping and full screen.
 
 | Keys | What |
 |---|---|
 | Space, J K L | Play or pause; back 2 s, pause, play (L again: faster) |
 | ← →, Shift+← → | One frame, one second |
-| ↑ ↓, Home End | Previous or next cut, start or end |
+| ↑ ↓, Home End | Previous or next cut or marker, start or end |
 | S | Split the clip at the playhead |
 | I, O, X, C | Mark the start and end of a part, cut it out, or keep only it |
-| Delete | Remove the clip (or the marked part) |
+| Delete | Remove the chosen clips (or the marked part, or the chosen title or camera) |
+| Ctrl+click, Shift+click | Choose more clips; panel changes then apply to all of them |
+| Ctrl+C, Ctrl+X, Ctrl+V, Ctrl+A | Copy, cut, paste at the playhead, choose all |
 | Alt+← → | Move the clip earlier or later |
-| M, T | Mute the clip, write a title over it (`|` starts a new line) |
+| M, T | Mute the chosen clips, write a title over the clip (`|` starts a new line) |
+| B | Set or remove a marker (a chapter in the export) |
 | E | Place the title and the camera on the picture (drag, wheel to size) |
 | Ctrl+T | A title card: text on a colour |
-| P | Preview with effects and transitions |
+| P | Preview with titles, effects and transitions |
+| R, N | Loop the film (or the marked part), snapping on or off |
+| F, F11 | The picture full screen (Esc or a double click comes back) |
 | Tab | Timeline, settings panel, media list |
 | Ctrl+O, Ctrl+I, Ctrl+M | Open, import, add music |
 | Ctrl+S, Ctrl+E, Ctrl+Z | Save, export, undo (Ctrl+Y redo) |
@@ -193,6 +203,29 @@ NIRUX theme and is made for the keyboard; F1 shows every key.
 With the mouse: drag media from the list to the timeline, drag clips to
 reorder them, drag their edges to trim, Shift+drag on the ruler to mark a
 part, the wheel scrolls the timeline (Ctrl+wheel zooms).
+
+**The lanes.** The title and the camera of each clip are bars of their own
+above the picture, as connected clips: they belong to their clip and move
+with it when you cut, move or delete. Drag their ends to change when they
+come and go, drag the middle to move them within the clip, click one to see
+its settings, double-click to place it on the picture, and Delete removes
+the title or turns the camera off (a faint bar is left, double-click it to
+turn the camera on again). A double click on the title lane over a clip
+writes a title. Each lane has a switch: titles and camera can be hidden and
+sound and music muted, in the preview and the export alike.
+
+**Sound.** A line across each clip's sound is its volume: drag it up or
+down (a double click sets 100 %). The place where the sound changes from
+one clip to the next can be dragged off the cut: to the left the next
+clip's sound starts early (a J cut), to the right the previous clip's sound
+runs on (an L cut). Sound cut in the panel does the same with numbers.
+
+**Markers** (B) are set at the playhead and shown as flags on the ruler.
+Click one to go there, double-click to name it, right-click to remove it.
+They follow their clip. In the export they become chapters in MP4, MKV and
+WebM files, and a `.chapters.txt` beside the film lists them as a video
+site reads them in a description (`0:00 Intro`). As those sites ask, each
+chapter is at least 10 seconds.
 
 **What a clip can do**: speed (0.25 to 4 times, the sound follows),
 volume and mute, fade in and out, a transition from the clip before (cross
@@ -260,9 +293,13 @@ password field, for as long as needed.
 strength (Ctrl+F).
 
 **Preview**: the timeline plays live in mpv, on the graphics card, with
-every cut. Speed changes, effects and transitions are shown as they will be
-exported when you press P, which renders a few seconds around the playhead
-(or the marked part) in the background.
+every cut, and with the camera where and when each clip shows it (as a
+rectangle; its shape, border and shadow show in P and E). The camera plays
+from a copy of its track made once in the background and kept in
+`~/.cache/niruclip/live/`. Speed changes, titles, effects, transitions,
+J and L cuts and music are shown as they will be exported when you press P,
+which renders a few seconds around the playhead (or the marked part) in
+the background.
 
 **Import**: anything ffmpeg reads. Video: mkv, mp4, m4v, mov, webm, avi,
 wmv, flv, mpg, ts, m2ts, 3gp, ogv, gif. Sound: mp3, wav, flac, ogg, opus,
@@ -414,7 +451,7 @@ the [reference](docs/REFERENCE.md#environment-overrides).
 | `~/Videos/NIRUCLIP-*.mkv` | Recordings (`*.part.mkv` while recording); `--export` writes `.mp4`/`.gif` next to them |
 | `~/.config/niruclip/edit.toml` | Editor folders, last export format, recent projects |
 | `~/.local/state/niruclip/autosave.niruclip` | The editor's unsaved project, offered on the next start |
-| `~/.cache/niruclip/` | Editor thumbnails and sound waves (safe to delete) |
+| `~/.cache/niruclip/` | Editor thumbnails, sound waves and the live camera copies (safe to delete) |
 | `$XDG_RUNTIME_DIR/niruclip-PID.pgm` | A 128x96 grey copy of the current camera frame while recording (tmpfs, removed at the end) |
 
 Recordings, partials and profiles are user data. NIRUCLIP never deletes a

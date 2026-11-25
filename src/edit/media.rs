@@ -24,6 +24,26 @@ pub struct Thumbs {
 pub enum Ready {
     Thumbs(PathBuf, Thumbs),
     Peaks(PathBuf, Vec<u8>),
+    /// A side file for the live preview is made (or could not be).
+    Proxy(bool),
+}
+
+/// Side files the live preview plays from, made once by ffmpeg.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ProxyKind {
+    /// Video stream `stream` alone, cut to the camera inside the track
+    /// (`content` of the 1280x720 letterbox).
+    Video { stream: usize, content: (u32, u32) },
+    /// The picture with silence under it (`still`: a picture shown for
+    /// `length` seconds), so the preview has sound from the start.
+    Silent { still: bool, length: f64 },
+    /// A title card's colour with silence, `length` seconds.
+    Card {
+        colour: u32,
+        w: u32,
+        h: u32,
+        length: f64,
+    },
 }
 
 pub struct Cache {
@@ -31,6 +51,10 @@ pub struct Cache {
     pub thumbs: HashMap<PathBuf, Thumbs>,
     pub peaks: HashMap<PathBuf, Vec<u8>>,
     asked: HashMap<PathBuf, ()>,
+    /// Proxies being made or failed, so each is tried once.
+    proxies: HashMap<PathBuf, bool>,
+    /// A proxy arrived since the last `take_proxy_ready`.
+    proxy_ready: bool,
     tx: Sender<Ready>,
     pub rx: Receiver<Ready>,
 }
@@ -65,6 +89,8 @@ impl Cache {
             thumbs: HashMap::new(),
             peaks: HashMap::new(),
             asked: HashMap::new(),
+            proxies: HashMap::new(),
+            proxy_ready: false,
             tx,
             rx,
         }
@@ -114,6 +140,91 @@ impl Cache {
         }
     }
 
+    /// A proxy of `path` when it is made; else start making it (once) and
+    /// answer None. Its arrival on `rx` makes `collect` return true.
+    pub fn proxy(&mut self, path: &Path, kind: &ProxyKind) -> Option<PathBuf> {
+        let name = match kind {
+            ProxyKind::Video { stream, content } => {
+                format!("{}-v{stream}-{}x{}.mkv", key(path), content.0, content.1)
+            }
+            ProxyKind::Silent { still, length } => {
+                format!(
+                    "{}-s{}-{:.0}.mkv",
+                    key(path),
+                    u8::from(*still),
+                    length * 1000.0
+                )
+            }
+            ProxyKind::Card {
+                colour,
+                w,
+                h,
+                length,
+            } => format!(
+                "card-{:06x}-{w}x{h}-{:.0}.mkv",
+                colour & 0xffffff,
+                length * 1000.0
+            ),
+        };
+        let file = self.dir.join("live").join(name);
+        if file.is_file() {
+            return Some(file);
+        }
+        if self.proxies.contains_key(&file) {
+            return None;
+        }
+        self.proxies.insert(file.clone(), true);
+        let tx = self.tx.clone();
+        let (path, kind) = (path.to_path_buf(), kind.clone());
+        std::thread::spawn(move || {
+            let ok = make_proxy(&path, &kind, &file);
+            let _ = tx.send(Ready::Proxy(ok));
+        });
+        None
+    }
+
+    /// A long, tiny black picture for the stretches without a camera.
+    pub fn filler(&mut self) -> Option<PathBuf> {
+        let file = self.dir.join("live").join("filler-16x16-6h.mkv");
+        if file.is_file() {
+            return Some(file);
+        }
+        if self.proxies.contains_key(&file) {
+            return None;
+        }
+        self.proxies.insert(file.clone(), true);
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let tmp = file.with_extension("part.mkv");
+            let ok = file
+                .parent()
+                .is_some_and(|d| std::fs::create_dir_all(d).is_ok())
+                && ffmpeg(&[
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &format!("color=c=black:s=16x16:r=1:d={FILLER_SECONDS}"),
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "ultrafast",
+                    "-tune",
+                    "stillimage",
+                    "-pix_fmt",
+                    "yuv420p",
+                    &tmp.display().to_string(),
+                ])
+                && std::fs::rename(&tmp, &file).is_ok();
+            let _ = std::fs::remove_file(&tmp);
+            let _ = tx.send(Ready::Proxy(ok));
+        });
+        None
+    }
+
+    pub fn take_proxy_ready(&mut self) -> bool {
+        std::mem::take(&mut self.proxy_ready)
+    }
+
     /// Take what the workers finished. True when something arrived.
     pub fn collect(&mut self) -> bool {
         let mut any = false;
@@ -126,10 +237,150 @@ impl Cache {
                 Ready::Peaks(p, v) => {
                     self.peaks.insert(p, v);
                 }
+                Ready::Proxy(ok) => self.proxy_ready |= ok,
             }
         }
         any
     }
+}
+
+/// Seconds of the filler picture; longer stretches use it more than once.
+pub const FILLER_SECONDS: f64 = 21600.0;
+
+fn ffmpeg(args: &[&str]) -> bool {
+    Command::new("ffmpeg")
+        .args(["-hide_banner", "-nostdin", "-loglevel", "error", "-y"])
+        .args(["-threads", "2"])
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn make_proxy(path: &Path, kind: &ProxyKind, file: &Path) -> bool {
+    if let Some(d) = file.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let tmp = file.with_extension("part.mkv");
+    let (input, output) = (path.display().to_string(), tmp.display().to_string());
+    let ok = match kind {
+        ProxyKind::Video { stream, content } => {
+            let map = format!("0:v:{stream}");
+            let (tw, th) = crate::CAMERA_TRACK_SIZE;
+            let (cw, ch) = *content;
+            if (cw, ch) == (tw, th) || cw == 0 || ch == 0 {
+                // The camera fills its track: copy it, no new encoding.
+                ffmpeg(&["-i", &input, "-map", &map, "-c", "copy", &output])
+            } else {
+                let crop = format!("crop={cw}:{ch}:(iw-{cw})/2:(ih-{ch})/2");
+                ffmpeg(&[
+                    "-i",
+                    &input,
+                    "-map",
+                    &map,
+                    "-vf",
+                    &crop,
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "ultrafast",
+                    "-crf",
+                    "30",
+                    "-g",
+                    "30",
+                    &output,
+                ])
+            }
+        }
+        ProxyKind::Silent { still, length } => {
+            let t = format!("{length:.3}");
+            if *still {
+                ffmpeg(&[
+                    "-loop",
+                    "1",
+                    "-framerate",
+                    "2",
+                    "-t",
+                    &t,
+                    "-i",
+                    &input,
+                    "-f",
+                    "lavfi",
+                    "-t",
+                    &t,
+                    "-i",
+                    "anullsrc=r=48000:cl=stereo",
+                    "-vf",
+                    "scale='min(1280,iw)':-2,format=yuv420p",
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "ultrafast",
+                    "-tune",
+                    "stillimage",
+                    "-c:a",
+                    "aac",
+                    "-shortest",
+                    &output,
+                ])
+            } else {
+                ffmpeg(&[
+                    "-i",
+                    &input,
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "anullsrc=r=48000:cl=stereo",
+                    "-map",
+                    "0:v:0",
+                    "-map",
+                    "1:a",
+                    "-c:v",
+                    "copy",
+                    "-c:a",
+                    "aac",
+                    "-shortest",
+                    &output,
+                ])
+            }
+        }
+        ProxyKind::Card {
+            colour,
+            w,
+            h,
+            length,
+        } => {
+            let t = format!("{length:.3}");
+            ffmpeg(&[
+                "-f",
+                "lavfi",
+                "-i",
+                &format!("color=c=0x{:06x}:s={w}x{h}:r=2:d={t}", colour & 0xffffff),
+                "-f",
+                "lavfi",
+                "-t",
+                &t,
+                "-i",
+                "anullsrc=r=48000:cl=stereo",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-tune",
+                "stillimage",
+                "-c:a",
+                "aac",
+                "-shortest",
+                &output,
+            ])
+        }
+    };
+    let ok = ok && std::fs::rename(&tmp, file).is_ok();
+    let _ = std::fs::remove_file(&tmp);
+    ok
 }
 
 fn thumb_step(duration: f64) -> f64 {
@@ -330,5 +581,98 @@ mod tests {
     fn the_thumbnail_step_keeps_the_count_small() {
         assert!((thumb_step(30.0) - 1.0).abs() < 1e-9);
         assert!((thumb_step(3600.0) - 30.0).abs() < 1e-9);
+    }
+
+    /// The live preview's side files with the real ffmpeg.
+    #[test]
+    #[ignore = "needs ffmpeg and ffprobe"]
+    fn real_ffmpeg_makes_the_live_side_files() {
+        let dir = std::env::temp_dir().join(format!("niruclip-live-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rec = dir.join("rec.mkv");
+        assert!(Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=s=640x360:r=30:d=3",
+                "-f",
+                "lavfi",
+                "-i",
+                "smptebars=s=960x720:r=30:d=3,pad=1280:720:160:0",
+                "-map",
+                "0:v",
+                "-map",
+                "1:v",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast"
+            ])
+            .arg(&rec)
+            .status()
+            .unwrap()
+            .success());
+        let info = |f: &Path, what: &str| {
+            String::from_utf8(
+                Command::new("ffprobe")
+                    .args(["-v", "error", "-show_entries", what, "-of", "csv=p=0"])
+                    .arg(f)
+                    .output()
+                    .unwrap()
+                    .stdout,
+            )
+            .unwrap()
+        };
+        let cam = dir.join("cam.mkv");
+        assert!(make_proxy(
+            &rec,
+            &ProxyKind::Video {
+                stream: 1,
+                content: (960, 720)
+            },
+            &cam
+        ));
+        assert_eq!(
+            info(&cam, "stream=codec_type,width,height").trim(),
+            "video,960,720"
+        );
+        let full = dir.join("full.mkv");
+        assert!(make_proxy(
+            &rec,
+            &ProxyKind::Video {
+                stream: 1,
+                content: (1280, 720)
+            },
+            &full
+        ));
+        assert_eq!(info(&full, "stream=width,height").trim(), "1280,720");
+        let silent = dir.join("silent.mkv");
+        assert!(make_proxy(
+            &rec,
+            &ProxyKind::Silent {
+                still: false,
+                length: 3.0
+            },
+            &silent
+        ));
+        assert!(info(&silent, "stream=codec_type").contains("audio"));
+        let card = dir.join("card.mkv");
+        assert!(make_proxy(
+            Path::new("card"),
+            &ProxyKind::Card {
+                colour: 0x203040,
+                w: 320,
+                h: 180,
+                length: 2.5
+            },
+            &card
+        ));
+        let d: f64 = info(&card, "format=duration").trim().parse().unwrap();
+        assert!((d - 2.5).abs() < 0.3, "{d}");
+        assert!(!dir.join("cam.part.mkv").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

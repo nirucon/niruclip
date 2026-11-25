@@ -322,6 +322,10 @@ fn ranged(project: &Project, range: Option<(f64, f64)>) -> Project {
     let mut p = project.clone();
     if let Some((a, b)) = range {
         p.keep_range(a, b);
+        // The first clip has no cut before it to move its sound over.
+        if let Some(c) = p.clips.first_mut() {
+            c.audio_offset = 0.0;
+        }
         // Music moves with the cut.
         p.music = project
             .music
@@ -556,6 +560,10 @@ fn build(
     let mut graph = String::new();
     let mut input = 0usize;
     let mut lengths = Vec::new();
+    // J and L cuts: each clip's sound plays over its own stretch, so the
+    // picture and the sound are joined each on their own.
+    let spans = project.sound_spans();
+    let split_av = project.has_split_cuts();
     // Burnt-in captions take the bottom: titles there sit above them.
     let lift = if film_only && settings.captions == 1 && project.caption_count() > 0 {
         let share = [4.2, 5.2, 6.5][project.caption_size.min(2) as usize];
@@ -568,7 +576,7 @@ fn build(
         let length = clip.length();
         lengths.push(length);
         let source = clip.end - clip.start;
-        let sound = media.has_audio && !clip.mute && !media.still;
+        let sound = media.has_audio && !clip.mute && !media.still && !project.mute_sound;
         let needed = want_video || (want_audio && sound);
         let index = input;
         if needed {
@@ -627,7 +635,7 @@ fn build(
                     chain,
                     ",tpad=stop_mode=clone:stop_duration=1,trim=duration={length:.6},setpts=PTS-STARTPTS"
                 );
-                if let Some(src) = pip_source(project, clip) {
+                if let Some(src) = pip_source(project, clip).filter(|_| !project.hide_camera) {
                     // The picture-in-picture comes from this clip's own file
                     // (the camera track) or an input of its own.
                     let label = match &src {
@@ -673,7 +681,9 @@ fn build(
                     ));
                     let _ = write!(chain, ";[po{i}]null");
                 }
-                chain.push_str(&title(&clip.effects, settings, lift, temp, w, h, length)?);
+                if !project.hide_titles || media.is_card() {
+                    chain.push_str(&title(&clip.effects, settings, lift, temp, w, h, length)?);
+                }
                 fades(&mut chain, clip, length, "fade");
                 // setpts leaves the rate unknown; xfade needs it constant.
                 let _ = write!(chain, ",fps={fps},settb=AVTB[v{i}];");
@@ -687,14 +697,56 @@ fn build(
         }
         // Sound.
         if want_audio {
+            // This clip's sound: its own stretch of the film, which a J or L
+            // cut moves off the picture's.
+            let (sa, sb) = if split_av { spans[i] } else { (0.0, length) };
+            let alength = if split_av { sb - sa } else { length };
+            let head = if split_av && i > 0 {
+                clip.audio_offset
+            } else {
+                0.0
+            };
+            // Sound from before or after the clip's own part of the file
+            // needs an input of its own; a later start just skips.
+            let tail = sb - (sa + head + length);
+            let moved = split_av && (head > 1e-6 || tail > 1e-6);
+            let skip = if split_av && !moved {
+                (-head).max(0.0)
+            } else {
+                0.0
+            };
             if sound {
                 let tempo = atempo(clip.speed);
+                // A moved sound reads its own stretch of the file.
+                let mut silence = 0.0;
+                let aindex = if moved {
+                    let mut from = clip.start - head * clip.speed;
+                    if from < 0.0 {
+                        silence = -from / clip.speed.max(0.01);
+                        from = 0.0;
+                    }
+                    args.extend([
+                        "-ss".into(),
+                        format!("{from:.6}"),
+                        "-t".into(),
+                        format!("{:.6}", alength * clip.speed + 0.1),
+                        "-i".into(),
+                        media.path.display().to_string(),
+                    ]);
+                    input += 1;
+                    input - 1
+                } else {
+                    index
+                };
                 let prep = |track: usize| {
-                    let mut c = format!("[{index}:a:{track}]asetpts=PTS-STARTPTS");
+                    let mut c = format!("[{aindex}:a:{track}]asetpts=PTS-STARTPTS");
                     if !tempo.is_empty() {
                         let _ = write!(c, ",{tempo}");
                     }
                     c.push_str(",aformat=sample_rates=48000:channel_layouts=stereo");
+                    if skip > 1e-6 {
+                        let _ = write!(c, ",atrim=start={skip:.6},asetpts=PTS-STARTPTS");
+                    }
                     c
                 };
                 let voice = voice_chain(clip.voice);
@@ -726,14 +778,18 @@ fn build(
                 if (clip.volume - 1.0).abs() > 1e-6 {
                     let _ = write!(chain, ",volume={:.4}", clip.volume);
                 }
-                let _ = write!(chain, ",apad,atrim=duration={length:.6}");
-                fades(&mut chain, clip, length, "afade");
+                if silence > 0.0 {
+                    let ms = (silence * 1000.0).round() as u64;
+                    let _ = write!(chain, ",adelay={ms}|{ms}");
+                }
+                let _ = write!(chain, ",apad,atrim=duration={alength:.6}");
+                fades(&mut chain, clip, alength, "afade");
                 let _ = write!(chain, "[a{i}];");
                 graph.push_str(&chain);
             } else {
                 let _ = write!(
                     graph,
-                    "anullsrc=r=48000:cl=stereo,atrim=duration={length:.6}[a{i}];"
+                    "anullsrc=r=48000:cl=stereo,atrim=duration={alength:.6}[a{i}];"
                 );
             }
         }
@@ -762,6 +818,12 @@ fn build(
             }
             _ => {
                 match (want_video, want_audio) {
+                    (true, true) if split_av => {
+                        let _ = write!(
+                            graph,
+                            "[{v}][v{i}]concat=n=2:v=1:a=0[{nv}];[{a}][a{i}]concat=n=2:v=0:a=1[{na}];"
+                        );
+                    }
                     (true, true) => {
                         let _ = write!(
                             graph,
@@ -783,7 +845,7 @@ fn build(
         a = na;
     }
     // Music, lowered while the film speaks.
-    if music && want_audio && !project.music.is_empty() {
+    if music && want_audio && !project.music.is_empty() && !project.mute_music {
         let mut lanes = String::new();
         for (j, m) in project.music.iter().enumerate() {
             let media = &project.media[m.media];
@@ -914,6 +976,31 @@ fn build(
             subtitle_input = Some(input);
         }
     }
+    // Markers become chapters: in the file, and as a list to paste into
+    // a video's description.
+    let mut chapter_input = None;
+    if *purpose == Purpose::Film && !settings.draft {
+        let chapters = project.chapters(10.0);
+        if !chapters.is_empty() {
+            let list = settings.output.with_extension("chapters.txt");
+            std::fs::write(&list, chapter_list(&chapters))
+                .map_err(|e| format!("could not write {}: {e}", list.display()))?;
+            extra.push(list);
+            if matches!(
+                format,
+                Format::Mp4 | Format::Mp4Small | Format::Mkv | Format::WebM
+            ) {
+                let meta = settings
+                    .work
+                    .join(format!("chapters-{}.txt", std::process::id()));
+                std::fs::write(&meta, ffmetadata(&chapters))
+                    .map_err(|e| format!("could not write {}: {e}", meta.display()))?;
+                temp.push(meta.clone());
+                args.extend(["-i".into(), meta.display().to_string()]);
+                chapter_input = Some(input + usize::from(subtitle_input.is_some()));
+            }
+        }
+    }
     // Output stage.
     let vout = if format == Format::Gif && want_video {
         let _ = write!(
@@ -941,6 +1028,9 @@ fn build(
                     _ => "mov_text",
                 };
                 args.extend(["-map".into(), format!("{s}:s"), "-c:s".into(), codec.into()]);
+            }
+            if let Some(c) = chapter_input {
+                args.extend(["-map_chapters".into(), c.to_string()]);
             }
             codec(&mut args, format, settings.draft);
             args.extend(["-t".into(), format!("{total:.6}")]);
@@ -1752,6 +1842,47 @@ pub fn srt_text(captions: &[(f64, f64, String)]) -> String {
     out
 }
 
+/// Chapters as a video site reads them in a description: "0:00 Start".
+pub fn chapter_list(chapters: &[(f64, f64, String)]) -> String {
+    let mut out = String::new();
+    for (a, _, name) in chapters {
+        let t = a.max(0.0).floor() as u64;
+        let (h, m, s) = (t / 3600, t / 60 % 60, t % 60);
+        let stamp = if h > 0 {
+            format!("{h}:{m:02}:{s:02}")
+        } else {
+            format!("{m}:{s:02}")
+        };
+        let _ = writeln!(out, "{stamp} {name}");
+    }
+    out
+}
+
+/// Chapters in ffmpeg's metadata format.
+fn ffmetadata(chapters: &[(f64, f64, String)]) -> String {
+    let escape = |t: &str| {
+        let mut o = String::new();
+        for ch in t.chars() {
+            if matches!(ch, '=' | ';' | '#' | '\\' | '\n') {
+                o.push('\\');
+            }
+            o.push(ch);
+        }
+        o
+    };
+    let mut out = String::from(";FFMETADATA1\n");
+    for (a, b, name) in chapters {
+        let _ = write!(
+            out,
+            "[CHAPTER]\nTIMEBASE=1/1000\nSTART={}\nEND={}\ntitle={}\n",
+            (a * 1000.0).round() as u64,
+            (b * 1000.0).round() as u64,
+            escape(name)
+        );
+    }
+    out
+}
+
 fn fades(chain: &mut String, clip: &Clip, length: f64, filter: &str) {
     let fin = clip.fade_in.min(length * 0.5);
     let fout = clip.fade_out.min(length * 0.5);
@@ -1925,6 +2056,92 @@ mod tests {
         assert!(graph(plan.main()).contains("concat=n=2:v=1:a=1[j1v][j1a]"));
         assert!(joined.contains("-map [j1v] -map [j1a]"));
         assert!(joined.ends_with("/out/film.mp4"));
+    }
+
+    #[test]
+    fn j_and_l_cuts_move_the_sound_off_the_picture() {
+        // J: the second clip's sound starts a second before its picture.
+        let mut p = project();
+        p.clips[1].start = 1.0;
+        p.clips[1].audio_offset = 1.0;
+        let plan = super::plan(&p, &settings(Format::Mp4)).unwrap();
+        assert!((plan.duration - 15.0).abs() < 1e-6);
+        let joined = plan.main().join(" ");
+        let g = graph(plan.main());
+        // Its sound reads from a second earlier, from an input of its own.
+        assert!(
+            joined.contains("-ss 0.000000 -t 6.100000 -i /v/1.mkv"),
+            "{joined}"
+        );
+        assert!(g.contains("[2:a:0]asetpts"), "{g}");
+        assert!(g.contains("atrim=duration=6.000000[a1]"), "{g}");
+        // The first clip's sound gives way a second early.
+        assert!(g.contains("atrim=duration=9.000000[a0]"), "{g}");
+        // Picture and sound are joined each on their own.
+        assert!(g.contains("[v0][v1]concat=n=2:v=1:a=0[j1v]"), "{g}");
+        assert!(g.contains("[a0][a1]concat=n=2:v=0:a=1[j1a]"), "{g}");
+        // Before the start of the file there is silence.
+        p.clips[1].start = 0.0;
+        let plan2 = super::plan(&p, &settings(Format::Mp4)).unwrap();
+        assert!(graph(plan2.main()).contains("adelay=1000|1000"));
+
+        // L: the first clip's sound runs two seconds into the second.
+        let mut p = project();
+        p.clips[1].audio_offset = -2.0;
+        let plan = super::plan(&p, &settings(Format::Mp4)).unwrap();
+        let joined = plan.main().join(" ");
+        let g = graph(plan.main());
+        assert!(
+            joined.contains("-ss 0.000000 -t 12.100000 -i /v/0.mkv"),
+            "{joined}"
+        );
+        assert!(g.contains("atrim=duration=12.000000[a0]"), "{g}");
+        assert!(g.contains("[2:a:0]asetpts=PTS-STARTPTS,aformat=sample_rates=48000:channel_layouts=stereo,atrim=start=2.000000"), "{g}");
+        assert!(g.contains("atrim=duration=4.000000[a1]"), "{g}");
+    }
+
+    #[test]
+    fn lanes_switched_off_stay_out_of_the_export() {
+        let mut p = project();
+        p.clips[0].effects.text = "Hello".into();
+        p.hide_titles = true;
+        p.mute_sound = true;
+        let plan = plan(&p, &settings(Format::Mp4)).unwrap();
+        let g = graph(plan.main());
+        assert!(!g.contains("drawtext"), "{g}");
+        assert!(g.contains("anullsrc"), "{g}");
+        assert!(!g.contains("[0:a:0]"), "{g}");
+    }
+
+    #[test]
+    fn markers_become_chapters() {
+        let mut p = project();
+        p.clips[0].start = 1.0;
+        p.add_marker(3.0, "Intro".into());
+        p.add_marker(12.0, String::new());
+        let chapters = p.chapters(1.0);
+        assert_eq!(chapters.len(), 3);
+        assert_eq!(chapters[0], (0.0, 3.0, "Start".into()));
+        assert_eq!(chapters[1].2, "Intro");
+        assert_eq!(chapters[2].2, "Chapter 3");
+        assert_eq!(
+            chapter_list(&chapters),
+            "0:00 Start\n0:03 Intro\n0:12 Chapter 3\n"
+        );
+        let meta = ffmetadata(&[(0.0, 3.5, "A=b; c".into())]);
+        assert!(meta.starts_with(";FFMETADATA1\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=3500\n"));
+        assert!(meta.contains("title=A\\=b\\; c"), "{meta}");
+        // In the file, from an input of its own; a list beside it.
+        let dir = std::env::temp_dir().join(format!("niruclip-chapters-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("film.mp4");
+        let set = Settings::new(Format::Mp4, out.clone(), dir.clone());
+        let plan = plan(&p, &set).unwrap();
+        let joined = plan.main().join(" ");
+        assert!(joined.contains("-map_chapters 2"), "{joined}");
+        let list = std::fs::read_to_string(out.with_extension("chapters.txt")).unwrap();
+        assert!(list.starts_with("0:00 Intro\n"), "{list}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2185,6 +2402,101 @@ mod tests {
     }
     /// Picture-in-picture and every text look and effect through a real
     /// ffmpeg: `cargo test -- --ignored real_ffmpeg_pip`. With
+    /// J and L cuts, lanes switched off and chapters with the real ffmpeg:
+    /// the film keeps its length and its chapters are in the file.
+    #[test]
+    #[ignore = "needs ffmpeg and ffprobe"]
+    fn real_ffmpeg_j_and_l_cuts_and_chapters() {
+        let dir = std::env::temp_dir().join(format!("niruclip-jl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut project = Project {
+            loudness: 0,
+            duck: 0,
+            ..Project::default()
+        };
+        for (k, f) in [440, 880, 660].iter().enumerate() {
+            let file = dir.join(format!("c{k}.mkv"));
+            assert!(std::process::Command::new("ffmpeg")
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "testsrc2=s=640x360:r=30:d=12",
+                    "-f",
+                    "lavfi",
+                    "-i"
+                ])
+                .arg(format!("sine=f={f}:d=12"))
+                .args(["-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac"])
+                .arg(&file)
+                .status()
+                .unwrap()
+                .success());
+            let m = project.add_media(super::super::probe::probe(&file).unwrap());
+            project.append(m, None);
+        }
+        project.clips[1].start = 1.0;
+        project.clips[1].audio_offset = 1.5;
+        project.clips[2].audio_offset = -2.0;
+        project.clips[0].effects.text = "Hidden".into();
+        project.hide_titles = true;
+        project.repair();
+        assert_eq!(project.clips[1].audio_offset, 1.5);
+        project.add_marker(0.0, "Opening".into());
+        project.add_marker(15.0, "Last part".into());
+        let out = dir.join("film.mp4");
+        let plan = plan(
+            &project,
+            &Settings::new(Format::Mp4, out.clone(), dir.clone()),
+        )
+        .unwrap();
+        for step in &plan.steps {
+            let st = std::process::Command::new("ffmpeg")
+                .args(&step.args)
+                .stdout(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            assert!(st.success(), "{}", step.args.join(" "));
+        }
+        let probe = |what: &[&str]| {
+            String::from_utf8(
+                std::process::Command::new("ffprobe")
+                    .args(["-v", "error"])
+                    .args(what)
+                    .arg(&out)
+                    .output()
+                    .unwrap()
+                    .stdout,
+            )
+            .unwrap()
+        };
+        let d: f64 = probe(&["-show_entries", "format=duration", "-of", "csv=p=0"])
+            .trim()
+            .parse()
+            .unwrap();
+        assert!((d - 35.0).abs() < 0.15, "{d}");
+        let a: f64 = probe(&[
+            "-select_streams",
+            "a",
+            "-show_entries",
+            "stream=duration",
+            "-of",
+            "csv=p=0",
+        ])
+        .trim()
+        .parse()
+        .unwrap();
+        assert!((a - 35.0).abs() < 0.15, "sound {a}");
+        let chapters = probe(&["-show_chapters", "-of", "csv=p=0"]);
+        assert_eq!(chapters.lines().count(), 2, "{chapters}");
+        assert!(chapters.contains("Last part"), "{chapters}");
+        let list = std::fs::read_to_string(out.with_extension("chapters.txt")).unwrap();
+        assert_eq!(list, "0:00 Opening\n0:15 Last part\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// NIRUCLIP_TEST_SHOTS=DIR a frame of each clip is kept there.
     #[test]
     #[ignore = "needs ffmpeg and ffprobe"]

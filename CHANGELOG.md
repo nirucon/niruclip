@@ -3,6 +3,38 @@
 All notable changes to NIRUCLIP. Earlier releases are described in their
 GitHub release notes and commit messages.
 
+## 0.13.0 (2026-11-25)
+
+### Added
+- **The camera plays live**: Space shows the camera over the film where and
+  when each clip has it, without rendering. It plays from a copy of the
+  camera track made once in the background.
+- **Title and camera lanes**: each clip's title and camera are bars of
+  their own above the picture that move with their clip. Drag their ends
+  and middle to time them, click for their settings, double-click to place
+  them, Delete removes the title or turns the camera off. A double click on
+  the title lane writes a title.
+- **Lane switches**: hide the titles or the camera, mute the sound or the
+  music, in the preview and the export.
+- **Transport bar**: start, previous and next cut or marker, play, end, the
+  time with frames, loop (R), snapping (N) and full screen (F, F11).
+- **Several clips at once**: Ctrl+click and Shift+click choose clips, Ctrl+A
+  all of them; panel changes, mute, duplicate and delete apply to all.
+  Copy, cut and paste (Ctrl+C, X, V) at the playhead.
+- **Markers** (B): named flags on the ruler that follow their clip, jumped
+  to with the arrows and the transport buttons; chapters in MP4, MKV and
+  WebM exports and a `.chapters.txt` list beside the film.
+- **J and L cuts**: drag where the sound changes over off the cut, or set
+  Sound cut in the panel: the next clip's sound comes early, or the
+  previous one's runs on.
+- **Volume line**: drag the line across a clip's sound to set its level,
+  shown in percent and decibels.
+
+### Fixed
+- A film starting with a title card, a picture or a video without sound
+  played silently in the live preview: the first piece now plays from a
+  copy with silence under it.
+
 ## 0.12.0 (2026-11-24)
 
 ### Added

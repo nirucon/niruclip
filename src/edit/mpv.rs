@@ -4,10 +4,12 @@
 //! sends it commands. It runs as its own process, so the static recorder
 //! binary needs no video libraries, and a crash in a decoder cannot take
 //! the editor with it.
-use super::project::Project;
+use super::export::{pip_box, pip_source, PipSource};
+use super::media::{ProxyKind, FILLER_SECONDS};
+use super::project::{window, Media, Project};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{channel, Receiver};
 use std::time::{Duration, Instant};
@@ -152,10 +154,21 @@ impl Mpv {
         self.send(serde_json::json!({ "command": ["set_property", name, value] }));
     }
 
-    pub fn load(&mut self, url: &str, at: f64, pause: bool) {
+    /// Load `url` at `at` seconds, with the filters `graph` laying a
+    /// picture-in-picture over it ("" for none).
+    pub fn load(&mut self, url: &str, at: f64, pause: bool, graph: &str) {
+        self.set_graph(graph);
         self.set("pause", serde_json::Value::from(pause));
         self.set("start", serde_json::Value::from(format!("{at:.3}")));
         self.send(serde_json::json!({ "command": ["loadfile", url, "replace"] }));
+    }
+
+    pub fn set_graph(&mut self, graph: &str) {
+        self.set("lavfi-complex", serde_json::Value::from(graph));
+    }
+
+    pub fn mute(&mut self, mute: bool) {
+        self.set("mute", serde_json::Value::from(mute));
     }
 
     pub fn seek(&mut self, at: f64) {
@@ -206,52 +219,299 @@ impl Drop for Mpv {
 /// EDL plays the cuts back to back at normal speed: speed changes and
 /// transitions are shown as plain cuts until a rendered preview is asked
 /// for. `map` holds (film start, EDL start, length in film seconds, speed).
+///
+/// With a picture-in-picture somewhere, the EDL has two streams: first the
+/// camera (or chosen film) of every clip, cut to match, then the film.
+/// `graph` puts the first over the second where and when each clip shows
+/// it; it is empty for a plain timeline.
 pub struct Timeline {
     pub url: String,
     pub map: Vec<(f64, f64, f64, f64)>,
+    pub graph: String,
 }
 
-pub fn timeline(project: &Project) -> Option<Timeline> {
+/// Where the live preview finds its side files (the media cache).
+pub trait Live {
+    fn proxy(&mut self, path: &Path, kind: &ProxyKind) -> Option<PathBuf>;
+    fn filler(&mut self) -> Option<PathBuf>;
+}
+
+impl Live for super::media::Cache {
+    fn proxy(&mut self, path: &Path, kind: &ProxyKind) -> Option<PathBuf> {
+        super::media::Cache::proxy(self, path, kind)
+    }
+    fn filler(&mut self) -> Option<PathBuf> {
+        super::media::Cache::filler(self)
+    }
+}
+
+fn entry(url: &mut String, path: &str, start: Option<f64>, length: f64) {
+    if !url.ends_with("edl://") {
+        url.push(';');
+    }
+    match start {
+        Some(s) => url.push_str(&format!(
+            "%{}%{path},start={s:.6},length={length:.6}",
+            path.len()
+        )),
+        None => url.push_str(&format!("%{}%{path},length={length:.6}", path.len())),
+    }
+}
+
+/// The size of a title card picture in the preview.
+fn card_size(project: &Project) -> (u32, u32) {
+    let (w, h) = if project.width > 0 {
+        (project.width, project.height)
+    } else {
+        (1920, 1080)
+    };
+    let ph = ((f64::from(h) * 320.0 / f64::from(w.max(1))).round() as u32 / 2 * 2).max(2);
+    (320, ph)
+}
+
+pub fn timeline(project: &Project, live: &mut dyn Live) -> Option<Timeline> {
     if project.clips.is_empty() {
         return None;
     }
     let starts = project.starts();
-    let mut url = String::from("edl://");
+    // The first piece decides which tracks the whole EDL has: when it has
+    // no sound but a later one does, it plays from a copy with silence.
+    let first = &project.media[project.clips[0].media];
+    let silent_first = !first.has_audio
+        && project
+            .clips
+            .iter()
+            .any(|c| project.media[c.media].has_audio && !project.media[c.media].still);
+    // Whether the film stream has a sound track (from its first piece).
+    let mut sound = first.has_audio && !first.still;
+    let mut film = String::from("edl://");
     let mut map = Vec::new();
     let mut edl = 0.0;
     for (i, clip) in project.clips.iter().enumerate() {
         let media = &project.media[clip.media];
-        let path = if media.is_card() {
-            // mpv's EDL takes no lavfi source: a small picture in the colour.
-            let (w, h) = if project.width > 0 {
-                (project.width, project.height)
-            } else {
-                (1920, 1080)
-            };
-            card_picture(clip.effects.card_colour, w, h)
-                .map(|p| p.display().to_string())
-                .unwrap_or_default()
-        } else {
-            media.path.display().to_string()
-        };
         let source = clip.end - clip.start;
-        if i > 0 {
-            url.push(';');
-        }
-        if media.still {
-            url.push_str(&format!("%{}%{},length={source:.6}", path.len(), path));
+        let silent = i == 0 && silent_first;
+        if media.is_card() {
+            let (w, h) = card_size(project);
+            let colour = clip.effects.card_colour;
+            let file = if silent {
+                live.proxy(
+                    Path::new("card"),
+                    &ProxyKind::Card {
+                        colour,
+                        w,
+                        h,
+                        length: source,
+                    },
+                )
+            } else {
+                None
+            };
+            match file {
+                Some(f) => {
+                    sound = true;
+                    entry(&mut film, &f.display().to_string(), Some(0.0), source)
+                }
+                None => {
+                    // mpv's EDL takes no lavfi source: a small picture in
+                    // the colour.
+                    let path = card_picture(colour, w, h)
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default();
+                    entry(&mut film, &path, None, source);
+                }
+            }
         } else {
-            url.push_str(&format!(
-                "%{}%{},start={:.6},length={source:.6}",
-                path.len(),
-                path,
-                clip.start
-            ));
+            let proxy = if silent {
+                live.proxy(
+                    &media.path,
+                    &ProxyKind::Silent {
+                        still: media.still,
+                        length: source,
+                    },
+                )
+            } else {
+                None
+            };
+            if proxy.is_some() {
+                sound = true;
+            }
+            match (proxy, media.still) {
+                (Some(f), true) => entry(&mut film, &f.display().to_string(), Some(0.0), source),
+                (Some(f), false) => entry(
+                    &mut film,
+                    &f.display().to_string(),
+                    Some(clip.start),
+                    source,
+                ),
+                (None, true) => entry(&mut film, &media.path.display().to_string(), None, source),
+                (None, false) => entry(
+                    &mut film,
+                    &media.path.display().to_string(),
+                    Some(clip.start),
+                    source,
+                ),
+            }
         }
         map.push((starts[i], edl, clip.length(), clip.speed));
         edl += source;
     }
-    Some(Timeline { url, map })
+    let (camera, graph) = if project.hide_camera {
+        (String::new(), String::new())
+    } else {
+        pip_stream(project, live, &map, sound)
+    };
+    if graph.is_empty() {
+        return Some(Timeline {
+            url: film,
+            map,
+            graph: String::new(),
+        });
+    }
+    let url = format!(
+        "edl://!new_stream;{};!new_stream;{}",
+        camera.trim_start_matches("edl://"),
+        film.trim_start_matches("edl://")
+    );
+    Some(Timeline { url, map, graph })
+}
+
+/// The picture size of a clip's piece in the preview.
+fn piece_size(project: &Project, media: &Media) -> (u32, u32) {
+    if media.is_card() {
+        card_size(project)
+    } else if media.width > 0 && media.height > 0 {
+        (media.width, media.height)
+    } else {
+        (1920, 1080)
+    }
+}
+
+/// Where a picture-in-picture shows: (from, to) in EDL seconds and its
+/// x, y, width and height on the piece.
+type Show = (f64, f64, u32, u32, u32, u32);
+
+/// The picture-in-picture stream (as EDL entries) and the filters that
+/// lay it over the film. Empty when no clip shows one, or its side files
+/// are still being made.
+fn pip_stream(
+    project: &Project,
+    live: &mut dyn Live,
+    map: &[(f64, f64, f64, f64)],
+    sound: bool,
+) -> (String, String) {
+    let sources: Vec<Option<PipSource>> = project
+        .clips
+        .iter()
+        .map(|c| pip_source(project, c))
+        .collect();
+    if sources.iter().all(Option::is_none) {
+        return (String::new(), String::new());
+    }
+    let Some(filler) = live.filler() else {
+        return (String::new(), String::new());
+    };
+    let filler = filler.display().to_string();
+    let mut url = String::from("edl://");
+    let pad = |url: &mut String, mut length: f64| {
+        while length > 1e-6 {
+            let l = length.min(FILLER_SECONDS);
+            entry(url, &filler, Some(0.0), l);
+            length -= l;
+        }
+    };
+    // (from, to, x, y, w, h) in EDL seconds and the piece's pixels.
+    let mut shows: Vec<Show> = Vec::new();
+    for (i, clip) in project.clips.iter().enumerate() {
+        let source = clip.end - clip.start;
+        let edl0 = map[i].1;
+        let media = &project.media[clip.media];
+        let piece = match &sources[i] {
+            Some(PipSource::Camera { stream, layout }) => live
+                .proxy(
+                    &media.path,
+                    &ProxyKind::Video {
+                        stream: *stream,
+                        content: layout.content,
+                    },
+                )
+                .map(|f| (f.display().to_string(), Some(clip.start), source)),
+            Some(PipSource::File { media: k }) => {
+                let m = &project.media[*k];
+                if m.still {
+                    Some((m.path.display().to_string(), None, source))
+                } else {
+                    live.proxy(
+                        &m.path,
+                        &ProxyKind::Video {
+                            stream: 0,
+                            content: (0, 0),
+                        },
+                    )
+                    .map(|f| (f.display().to_string(), Some(0.0), source.min(m.duration)))
+                }
+            }
+            None => None,
+        };
+        match piece {
+            Some((path, start, length)) if length > 0.01 => {
+                entry(&mut url, &path, start, length);
+                pad(&mut url, source - length);
+                let src = sources[i].as_ref().expect("a source");
+                let (fw, fh) = piece_size(project, media);
+                let (b, _) = pip_box(project, clip, src, fw, fh);
+                // The preview shows the whole picture, never squeezed: a
+                // circle is drawn as its square's width.
+                let content = match src {
+                    PipSource::Camera { layout, .. } => layout.content,
+                    PipSource::File { media: k } => {
+                        let m = &project.media[*k];
+                        (m.width.max(2), m.height.max(2))
+                    }
+                };
+                let bw = b.width.max(2);
+                let bh = ((f64::from(bw) * f64::from(content.1) / f64::from(content.0.max(1)))
+                    .round() as u32
+                    / 2
+                    * 2)
+                .clamp(2, fh);
+                let cy = b.y + b.height / 2;
+                let y = cy.saturating_sub(bh / 2).min(fh.saturating_sub(bh));
+                let (a, z) = window(clip.pip.start, clip.pip.length, clip.length());
+                shows.push((edl0 + a * clip.speed, edl0 + z * clip.speed, b.x, y, bw, bh));
+            }
+            _ => pad(&mut url, source),
+        }
+    }
+    if shows.is_empty() {
+        return (String::new(), String::new());
+    }
+    // One sum per value: each clip's term counts only inside its window.
+    let sum = |base: u32, pick: &dyn Fn(&Show) -> u32| {
+        let mut e = format!("{base}");
+        for s in &shows {
+            let v = i64::from(pick(s)) - i64::from(base);
+            if v != 0 {
+                e.push_str(&format!("+gte(t,{:.3})*lt(t,{:.3})*{v}", s.0, s.1));
+            }
+        }
+        e
+    };
+    let on: Vec<String> = shows
+        .iter()
+        .map(|s| format!("gte(t,{:.3})*lt(t,{:.3})", s.0, s.1))
+        .collect();
+    let graph = format!(
+        "[vid1]scale=w='{}':h='{}':eval=frame,setsar=1[pip];\
+         [vid2][pip]overlay=x='{}':y='{}':eval=frame:enable='{}'[vo]{}",
+        sum(2, &|s| s.4),
+        sum(2, &|s| s.5),
+        sum(0, &|s| s.2),
+        sum(0, &|s| s.3),
+        on.join("+"),
+        if sound { ";[aid1]anull[ao]" } else { "" },
+    );
+    (url, graph)
 }
 
 /// A picture of a title card's colour in the film's shape, made once.
@@ -309,8 +569,110 @@ impl Timeline {
 
 #[cfg(test)]
 mod tests {
-    use super::super::project::{Media, Project};
+    use super::super::project::{CameraTrack, Media, Project};
     use super::*;
+
+    /// Side files that are all made already, at made-up paths.
+    struct Ready;
+    impl Live for Ready {
+        fn proxy(&mut self, path: &Path, kind: &ProxyKind) -> Option<PathBuf> {
+            let tag = match kind {
+                ProxyKind::Video { stream, .. } => format!("v{stream}"),
+                ProxyKind::Silent { .. } => "s".into(),
+                ProxyKind::Card { .. } => "card".into(),
+            };
+            Some(PathBuf::from(format!(
+                "/c/{}-{tag}.mkv",
+                path.file_stem()?.to_string_lossy()
+            )))
+        }
+        fn filler(&mut self) -> Option<PathBuf> {
+            Some(PathBuf::from("/c/filler.mkv"))
+        }
+    }
+
+    /// Nothing is made yet.
+    struct Waiting;
+    impl Live for Waiting {
+        fn proxy(&mut self, _: &Path, _: &ProxyKind) -> Option<PathBuf> {
+            None
+        }
+        fn filler(&mut self) -> Option<PathBuf> {
+            None
+        }
+    }
+
+    fn recording(p: &mut Project, name: &str, camera: bool) -> usize {
+        p.add_media(Media {
+            path: PathBuf::from(format!("/v/{name}.mkv")),
+            duration: 20.0,
+            has_video: true,
+            has_audio: true,
+            width: 1920,
+            height: 1080,
+            fps: 30.0,
+            camera: camera.then(|| CameraTrack {
+                stream: 1,
+                layout: "corner=br;size=0.26;shape=rounded;border=none;burned=0;content=1280x720"
+                    .into(),
+            }),
+            ..Media::default()
+        })
+    }
+
+    #[test]
+    fn the_camera_plays_live_over_the_film() {
+        let mut p = Project::default();
+        let rec = recording(&mut p, "rec", true);
+        let plain = recording(&mut p, "plain", false);
+        p.append(rec, None);
+        p.append(plain, None);
+        p.clips[0].end = 6.0;
+        p.clips[1].end = 4.0;
+        p.clips[0].pip.start = 1.0;
+        p.clips[0].pip.length = 3.0;
+        let t = timeline(&p, &mut Ready).unwrap();
+        // The camera stream first (vid1), the film second (vid2).
+        assert_eq!(
+            t.url,
+            "edl://!new_stream;%13%/c/rec-v1.mkv,start=0.000000,length=6.000000;\
+             %13%/c/filler.mkv,start=0.000000,length=4.000000;!new_stream;\
+             %10%/v/rec.mkv,start=0.000000,length=6.000000;\
+             %12%/v/plain.mkv,start=0.000000,length=4.000000"
+        );
+        assert!(t.graph.starts_with("[vid1]scale="), "{}", t.graph);
+        assert!(t.graph.contains("[vid2][pip]overlay="), "{}", t.graph);
+        assert!(t.graph.contains("gte(t,1.000)*lt(t,4.000)"), "{}", t.graph);
+        assert!(t.graph.ends_with("[aid1]anull[ao]"), "{}", t.graph);
+        // Hidden camera, or side files still being made: the plain film.
+        p.hide_camera = true;
+        assert!(timeline(&p, &mut Ready).unwrap().graph.is_empty());
+        p.hide_camera = false;
+        let t = timeline(&p, &mut Waiting).unwrap();
+        assert!(t.graph.is_empty() && !t.url.contains("new_stream"));
+        // Switched off on the clip: no camera.
+        p.clips[0].pip.mode = 1;
+        assert!(timeline(&p, &mut Ready).unwrap().graph.is_empty());
+    }
+
+    #[test]
+    fn a_silent_first_piece_plays_from_a_copy_with_sound() {
+        let mut p = Project::default();
+        let card = p.card();
+        let rec = recording(&mut p, "rec", false);
+        p.append(card, None);
+        p.append(rec, None);
+        let t = timeline(&p, &mut Ready).unwrap();
+        assert!(
+            t.url
+                .starts_with("edl://%16%/c/card-card.mkv,start=0.000000"),
+            "{}",
+            t.url
+        );
+        // Waiting for the copy: the plain picture meanwhile.
+        let t = timeline(&p, &mut Waiting).unwrap();
+        assert!(t.url.contains(".png,length="), "{}", t.url);
+    }
 
     #[test]
     fn the_edl_holds_every_cut_and_maps_speed() {
@@ -330,7 +692,7 @@ mod tests {
         p.split(10.0);
         p.clips[0].start = 2.0;
         p.clips[1].speed = 2.0;
-        let t = timeline(&p).unwrap();
+        let t = timeline(&p, &mut Ready).unwrap();
         assert_eq!(
             t.url,
             "edl://%10%/v/a b.mkv,start=2.000000,length=8.000000;%10%/v/a b.mkv,start=10.000000,length=10.000000"

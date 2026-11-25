@@ -35,6 +35,7 @@ const K_END: u32 = 0xff57;
 const K_INSERT: u32 = 0xff63;
 const K_F1: u32 = 0xffbe;
 const K_F2: u32 = 0xffbf;
+const K_F11: u32 = 0xffc8;
 const K_KP_ADD: u32 = 0xffab;
 const K_KP_SUB: u32 = 0xffad;
 
@@ -109,6 +110,13 @@ enum Action {
     AreaWhole,
     FontAccept,
     PlaceReset,
+    GoStart,
+    GoEnd,
+    PrevCut,
+    NextCut,
+    Loop,
+    Snap,
+    FullScreen,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -144,6 +152,18 @@ enum Hit {
     AreaImage,
     /// The rendered picture in the placing view.
     PlaceImage,
+    /// A clip's title (0) or picture-in-picture (1) on its lane.
+    Window(usize, u8, Edge),
+    /// A clip with a camera track that is switched off: its ghost.
+    CameraOff(usize),
+    /// A lane's switch: 0 titles, 1 camera, 2 sound, 3 music.
+    LaneOff(u8),
+    /// The place where the sound changes over into clip `i` (J and L cuts).
+    SoundCut(usize),
+    /// A clip's volume line.
+    Volume(usize),
+    /// A marker: clip and its index there.
+    Marker(usize, usize),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -172,6 +192,27 @@ enum Drag {
     },
     Scrub,
     Range(f64),
+    /// A title (0) or picture-in-picture (1) window of clip `i`, from
+    /// (a0, z0) seconds into the clip.
+    Window {
+        i: usize,
+        what: u8,
+        edge: Edge,
+        a0: f64,
+        z0: f64,
+        x0: i32,
+    },
+    SoundCut {
+        i: usize,
+        o0: f64,
+        x0: i32,
+    },
+    Volume {
+        i: usize,
+        v0: f64,
+        y0: i32,
+        h: i32,
+    },
     Clip {
         i: usize,
         x0: i32,
@@ -230,6 +271,7 @@ enum Param {
     FadeOut,
     Voice,
     DesktopVolume,
+    SoundCut,
     Transition,
     TransitionLength,
     CardColour,
@@ -280,7 +322,7 @@ enum Param {
 }
 
 /// Every clip setting, in the order the panel shows them.
-const ALL_CLIP_PARAMS: [Param; 51] = [
+const ALL_CLIP_PARAMS: [Param; 52] = [
     Param::Speed,
     Param::Volume,
     Param::Mute,
@@ -288,6 +330,7 @@ const ALL_CLIP_PARAMS: [Param; 51] = [
     Param::FadeOut,
     Param::Voice,
     Param::DesktopVolume,
+    Param::SoundCut,
     Param::Transition,
     Param::TransitionLength,
     Param::CardColour,
@@ -348,6 +391,7 @@ fn clip_params(c: &Clip, m: &Media) -> Vec<Param> {
             Param::Volume | Param::Mute => m.has_audio && !m.still,
             Param::Voice => m.has_audio && !m.still,
             Param::DesktopVolume => m.split_tracks().is_some(),
+            Param::SoundCut => m.has_audio && !m.still && c.transition.is_none(),
             Param::TransitionLength => c.transition.is_some(),
             Param::CardColour => card,
             Param::Brightness
@@ -511,7 +555,7 @@ impl Param {
     fn group(self) -> &'static str {
         match self {
             Param::Speed | Param::Volume | Param::Mute | Param::FadeIn | Param::FadeOut => "Clip",
-            Param::Voice | Param::DesktopVolume => "Sound",
+            Param::Voice | Param::DesktopVolume | Param::SoundCut => "Sound",
             Param::Transition | Param::TransitionLength => "Transition into this clip",
             Param::CardColour => "Title card",
             Param::Brightness
@@ -561,6 +605,7 @@ impl Param {
             Param::FadeOut | Param::MusicFadeOut => "Fade out",
             Param::Voice => "Treatment",
             Param::DesktopVolume => "Desktop",
+            Param::SoundCut => "Sound cut",
             Param::Transition => "Kind",
             Param::TransitionLength => "Length",
             Param::CardColour => "Background",
@@ -621,6 +666,7 @@ impl Param {
             Param::Speed => (0.25, 4.0, 0.25),
             Param::Volume => (0.0, 4.0, 0.1),
             Param::DesktopVolume => (0.0, 2.0, 0.05),
+            Param::SoundCut => (-5.0, 5.0, 0.1),
             Param::MusicVolume => (0.0, 2.0, 0.05),
             Param::Mute | Param::Mirror => (0.0, 1.0, 1.0),
             Param::FadeIn | Param::FadeOut | Param::MusicFadeIn | Param::MusicFadeOut => {
@@ -741,6 +787,7 @@ impl Param {
             Param::FadeOut => c.fade_out,
             Param::Voice => f64::from(c.voice),
             Param::DesktopVolume => c.desktop_volume,
+            Param::SoundCut => c.audio_offset,
             Param::Transition => c
                 .transition
                 .and_then(|t| Transition::ALL.iter().position(|x| *x == t))
@@ -798,6 +845,7 @@ impl Param {
             Param::FadeOut => c.fade_out = v,
             Param::Voice => c.voice = v.round() as u8,
             Param::DesktopVolume => c.desktop_volume = v,
+            Param::SoundCut => c.audio_offset = if v.abs() < 0.05 { 0.0 } else { v },
             Param::Transition => {
                 let i = v.round() as usize;
                 c.transition = if i == 0 {
@@ -878,6 +926,9 @@ impl Param {
         match self {
             Param::Speed => format!("{v:.2}×"),
             Param::Volume | Param::DesktopVolume => format!("{:.0} %", v * 100.0),
+            Param::SoundCut if v > 0.0 => format!("J: {v:.1} s early"),
+            Param::SoundCut if v < 0.0 => format!("L: previous runs {:.1} s on", -v),
+            Param::SoundCut => "With the picture".into(),
             Param::Mute => if c.mute { "Muted" } else { "On" }.into(),
             Param::FadeIn | Param::FadeOut | Param::TransitionLength => format!("{v:.2} s"),
             Param::Voice => export::VOICE[c.voice.min(3) as usize].into(),
@@ -1047,6 +1098,8 @@ enum TextTarget {
     ExportName,
     /// A caption, by its place in the film's list.
     Caption(usize),
+    /// A marker: clip and its index there.
+    Marker(usize, usize),
 }
 
 struct ExportForm {
@@ -1148,6 +1201,15 @@ struct State {
     mark_in: Option<f64>,
     mark_out: Option<f64>,
     selected: Option<usize>,
+    /// More clips chosen with Ctrl or Shift: edits apply to all of them.
+    picked: std::collections::BTreeSet<usize>,
+    /// Clips copied or cut, with their media (and a picture-in-picture's).
+    clipboard: Vec<(Clip, Media, Option<Media>)>,
+    /// On the selected clip: its title (0) or picture-in-picture (1) lane.
+    lane_sel: Option<u8>,
+    looping: bool,
+    snapping: bool,
+    fullscreen: bool,
     music_selected: Option<usize>,
     bin_selected: usize,
     param_row: usize,
@@ -1166,6 +1228,7 @@ struct State {
     preview: Preview,
     timeline: Option<Timeline>,
     loaded_url: String,
+    loaded_graph: String,
     cache: Cache,
     mpv: Option<Mpv>,
     work: PathBuf,
@@ -1203,6 +1266,8 @@ struct Layout {
     transport: Rect,
     timeline: Rect,
     ruler: Rect,
+    lane_title: Rect,
+    lane_camera: Rect,
     lane_video: Rect,
     lane_audio: Rect,
     lane_music: Rect,
@@ -1213,7 +1278,7 @@ fn layout(w: i32, h: i32, s: i32) -> Layout {
     let top_h = s * 5 / 2;
     let side_l = (s * 17).min(w / 5).max(s * 10);
     let side_r = (s * 21).min(w / 4).max(s * 13);
-    let tl_h = (s * 13).min(h * 2 / 5);
+    let tl_h = (s * 17).min(h * 9 / 20);
     let tr_h = s * 5 / 2;
     let mid_h = (h - top_h - tl_h - tr_h).max(s * 4);
     let top = Rect::new(0, 0, w, top_h);
@@ -1224,12 +1289,16 @@ fn layout(w: i32, h: i32, s: i32) -> Layout {
     let timeline = Rect::new(0, h - tl_h, w, tl_h);
     let ruler_h = s * 3 / 2;
     let lanes = tl_h - ruler_h - s / 2;
-    let lv = lanes * 46 / 100;
-    let la = lanes * 27 / 100;
-    let lm = lanes - lv - la;
-    let track_x = s * 5;
+    let lt = lanes * 12 / 100;
+    let lk = lanes * 13 / 100;
+    let lv = lanes * 33 / 100;
+    let la = lanes * 23 / 100;
+    let lm = lanes - lt - lk - lv - la;
+    let track_x = s * 6;
     let ruler = Rect::new(track_x, timeline.y, w - track_x, ruler_h);
-    let lane_video = Rect::new(track_x, ruler.y + ruler_h + s / 4, w - track_x, lv);
+    let lane_title = Rect::new(track_x, ruler.y + ruler_h + s / 4, w - track_x, lt);
+    let lane_camera = Rect::new(track_x, lane_title.y + lt, w - track_x, lk);
+    let lane_video = Rect::new(track_x, lane_camera.y + lk, w - track_x, lv);
     let lane_audio = Rect::new(track_x, lane_video.y + lv, w - track_x, la);
     let lane_music = Rect::new(track_x, lane_audio.y + la, w - track_x, lm);
     Layout {
@@ -1240,6 +1309,8 @@ fn layout(w: i32, h: i32, s: i32) -> Layout {
         transport,
         timeline,
         ruler,
+        lane_title,
+        lane_camera,
         lane_video,
         lane_audio,
         lane_music,
@@ -1256,6 +1327,24 @@ fn clock(t: f64) -> String {
     } else {
         format!("{m:02}:{s:02}.{c:02}")
     }
+}
+
+/// Hours, minutes, seconds and frames: "00:01:23:12".
+fn timecode(t: f64, fps: f64) -> String {
+    let fps = if fps > 0.0 { fps } else { 30.0 };
+    let frames = (t.max(0.0) * fps + 1e-6).floor() as u64;
+    let per = fps.round().max(1.0) as u64;
+    let secs = (t.max(0.0) + 1e-6).floor() as u64;
+    let f = frames
+        .saturating_sub((secs as f64 * fps).round() as u64)
+        .min(per - 1);
+    format!(
+        "{:02}:{:02}:{:02}:{:02}",
+        secs / 3600,
+        secs / 60 % 60,
+        secs % 60,
+        f
+    )
 }
 
 pub fn run(files: Vec<PathBuf>) -> Result<(), String> {
@@ -1309,6 +1398,8 @@ pub fn run(files: Vec<PathBuf>) -> Result<(), String> {
     let net_wm_name = atom("_NET_WM_NAME")?;
     let utf8 = atom("UTF8_STRING")?;
     let net_wm_pid = atom("_NET_WM_PID")?;
+    let net_wm_state = atom("_NET_WM_STATE")?;
+    let net_wm_state_fullscreen = atom("_NET_WM_STATE_FULLSCREEN")?;
     let _ = c.change_property32(
         PropMode::REPLACE,
         win,
@@ -1379,6 +1470,12 @@ pub fn run(files: Vec<PathBuf>) -> Result<(), String> {
         mark_in: None,
         mark_out: None,
         selected: None,
+        picked: std::collections::BTreeSet::new(),
+        clipboard: Vec::new(),
+        lane_sel: None,
+        looping: false,
+        snapping: true,
+        fullscreen: false,
         music_selected: None,
         bin_selected: 0,
         param_row: 0,
@@ -1397,6 +1494,7 @@ pub fn run(files: Vec<PathBuf>) -> Result<(), String> {
         preview: Preview::Timeline,
         timeline: None,
         loaded_url: String::new(),
+        loaded_graph: String::new(),
         cache: Cache::new(),
         mpv: None,
         work: work.clone(),
@@ -1423,6 +1521,7 @@ pub fn run(files: Vec<PathBuf>) -> Result<(), String> {
     let mut video_mapped = false;
     let mut main_hidden = false;
     let mut video_geometry = Rect::default();
+    let mut full = false;
     let mut title = String::new();
     let fd = {
         use std::os::fd::AsRawFd;
@@ -1550,29 +1649,51 @@ pub fn run(files: Vec<PathBuf>) -> Result<(), String> {
             video_mapped = show_video;
             dirty = true;
         }
-        if l.video != video_geometry {
-            video_geometry = l.video;
+        // Full screen: the window asks for the whole screen and the picture
+        // takes all of it.
+        if st.fullscreen != full {
+            full = st.fullscreen;
+            let ev = ClientMessageEvent::new(
+                32,
+                win,
+                net_wm_state,
+                [u32::from(full), net_wm_state_fullscreen, 0, 1, 0],
+            );
+            let _ = c.send_event(
+                false,
+                screen.root,
+                EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
+                ev,
+            );
+            let _ = c.flush();
+            if full {
+                st.say("Full screen: click plays or pauses, Esc or a double click comes back");
+            }
+        }
+        let video_rect = if full { Rect::new(0, 0, w, h) } else { l.video };
+        if video_rect != video_geometry {
+            video_geometry = video_rect;
             refresh = true;
             let _ = c.configure_window(
                 video,
                 &ConfigureWindowAux::new()
-                    .x(l.video.x)
-                    .y(l.video.y)
-                    .width(l.video.w.max(1) as u32)
-                    .height(l.video.h.max(1) as u32),
+                    .x(video_rect.x)
+                    .y(video_rect.y)
+                    .width(video_rect.w.max(1) as u32)
+                    .height(video_rect.h.max(1) as u32),
             );
         }
         if st.nudge && video_mapped {
             st.nudge = false;
             let _ = c.configure_window(
                 video,
-                &ConfigureWindowAux::new().width((l.video.w - 1).max(1) as u32),
+                &ConfigureWindowAux::new().width((video_rect.w - 1).max(1) as u32),
             );
             let _ = c.sync();
             std::thread::sleep(Duration::from_millis(30));
             let _ = c.configure_window(
                 video,
-                &ConfigureWindowAux::new().width(l.video.w.max(1) as u32),
+                &ConfigureWindowAux::new().width(video_rect.w.max(1) as u32),
             );
             refresh = true;
         }
@@ -1709,6 +1830,8 @@ impl State {
                 self.music_selected = None;
             }
         }
+        let n = self.project.clips.len();
+        self.picked.retain(|i| *i < n);
         let d = self.project.duration();
         self.playhead = self.playhead.min(d);
         self.preview = Preview::Timeline;
@@ -1717,16 +1840,32 @@ impl State {
 
     /// Load the timeline in mpv when it changed.
     fn reload(&mut self, force: bool) {
-        self.timeline = mpv::timeline(&self.project);
-        let url = self
+        self.timeline = mpv::timeline(&self.project, &mut self.cache);
+        let (url, graph) = self
             .timeline
             .as_ref()
-            .map(|t| t.url.clone())
+            .map(|t| (t.url.clone(), t.graph.clone()))
             .unwrap_or_default();
+        let mute = self.project.mute_sound;
+        if let Some(m) = &mut self.mpv {
+            m.mute(mute);
+        }
         if !force && url == self.loaded_url {
+            if graph != self.loaded_graph {
+                // Only the camera's place changed: new filters, same film.
+                self.loaded_graph = graph.clone();
+                if let Some(m) = &mut self.mpv {
+                    m.set_graph(&graph);
+                }
+                if !self.playing {
+                    let at = self.playhead;
+                    self.seek(at);
+                }
+            }
             return;
         }
         self.loaded_url = url.clone();
+        self.loaded_graph = graph.clone();
         let at = self
             .timeline
             .as_ref()
@@ -1737,7 +1876,7 @@ impl State {
             if url.is_empty() {
                 m.stop();
             } else {
-                m.load(&url, at, !playing);
+                m.load(&url, at, !playing, &graph);
             }
         }
     }
@@ -1796,6 +1935,13 @@ impl State {
     /// Handle what arrived from mpv, the caches and the jobs.
     fn pump(&mut self) -> bool {
         let mut any = self.cache.collect();
+        if self.cache.take_proxy_ready()
+            && self.drag.is_none()
+            && matches!(self.preview, Preview::Timeline)
+        {
+            // A side file for the live camera is ready: play with it.
+            self.reload(false);
+        }
         let mut events = Vec::new();
         if let Some(m) = &self.mpv {
             while let Ok(e) = m.events.try_recv() {
@@ -1817,12 +1963,26 @@ impl State {
                             .map(|tl| tl.to_film(t))
                             .unwrap_or(0.0),
                     };
+                    if self.looping && self.playing && matches!(self.preview, Preview::Timeline) {
+                        let (a, b) = self.loop_range();
+                        if self.playhead >= b - 0.03 || self.playhead < a - 0.5 {
+                            self.seek(a);
+                        }
+                    }
                 }
                 mpv::Event::Pause(p) => {
                     self.playing = !p;
                     if p {
                         self.nudge = true;
                     }
+                }
+                mpv::Event::Ended if self.looping && matches!(self.preview, Preview::Timeline) => {
+                    let (a, _) = self.loop_range();
+                    self.seek(a);
+                    if let Some(m) = &mut self.mpv {
+                        m.pause(false);
+                    }
+                    self.playing = true;
                 }
                 mpv::Event::Ended => {
                     if self.playing {
@@ -1930,9 +2090,10 @@ impl State {
                     Ok(()) => {
                         self.preview = Preview::Rendered { offset };
                         self.loaded_url.clear();
+                        self.loaded_graph.clear();
                         let at = (self.playhead - offset).max(0.0);
                         if let Some(m) = &mut self.mpv {
-                            m.load(&file.display().to_string(), at, false);
+                            m.load(&file.display().to_string(), at, false, "");
                         }
                         self.playing = true;
                         self.say("Rendered preview with effects and transitions. Any edit returns to the live timeline.");
@@ -2453,7 +2614,11 @@ impl State {
         match self.target() {
             Some(i) => {
                 let c = &self.project.clips[i];
-                clip_params(c, &self.project.media[c.media])
+                let mut v = clip_params(c, &self.project.media[c.media]);
+                if i == 0 {
+                    v.retain(|p| *p != Param::SoundCut);
+                }
+                v
             }
             None => Vec::new(),
         }
@@ -2484,6 +2649,7 @@ impl State {
             return;
         }
         let (lo, hi, step) = param.limits(&self.project.clips[i]);
+        let all = self.also(i, param);
         self.change(|p| {
             let c = &mut p.clips[i];
             let mut v = param.get(c) + delta * step;
@@ -2493,6 +2659,10 @@ impl State {
                 v = lo + (v - lo).rem_euclid(n);
             }
             param.set(c, v);
+            // The other chosen clips take the same value.
+            for j in all {
+                param.set(&mut p.clips[j], v);
+            }
         });
         if param == Param::Transition && i == 0 && self.project.clips[0].transition.is_some() {
             self.say("The first clip has nothing to blend from: use Fade in instead.");
@@ -2593,8 +2763,29 @@ impl State {
         }
         let Some(i) = self.target() else { return };
         if let Some(param) = self.params().get(row).copied() {
-            self.change(|p| param.set(&mut p.clips[i], value));
+            let all = self.also(i, param);
+            self.change(|p| {
+                param.set(&mut p.clips[i], value);
+                for j in all {
+                    param.set(&mut p.clips[j], value);
+                }
+            });
         }
+    }
+
+    /// The other chosen clips a setting applies to as well.
+    fn also(&self, i: usize, param: Param) -> Vec<usize> {
+        if param.opens() || matches!(param, Param::Pip | Param::Title) {
+            return Vec::new();
+        }
+        self.selection()
+            .into_iter()
+            .filter(|&j| j != i)
+            .filter(|&j| {
+                let c = &self.project.clips[j];
+                clip_params(c, &self.project.media[c.media]).contains(&param)
+            })
+            .collect()
     }
 
     fn edit_title(&mut self, i: usize) {
@@ -3392,6 +3583,24 @@ impl State {
             self.music_selected = None;
             return;
         }
+        if let (Some(i), Some(what)) = (self.selected, self.lane_sel) {
+            // On a lane: the title goes, or the camera is switched off.
+            if what == 0 {
+                self.change(|p| p.clips[i].effects.text.clear());
+                self.say("Title removed (Ctrl+Z brings it back)");
+            } else {
+                self.change(|p| p.clips[i].pip.mode = 1);
+                self.say("Camera off for this clip (double-click its ghost to turn it on)");
+            }
+            self.lane_sel = None;
+            return;
+        }
+        let n = self.selection().len();
+        if n > 1 {
+            self.remove_selection();
+            self.say(format!("{n} clips removed (Ctrl+Z brings them back)"));
+            return;
+        }
         if let Some(i) = self.target() {
             self.change(|p| {
                 p.clips.remove(i);
@@ -3402,9 +3611,27 @@ impl State {
     }
 
     fn duplicate(&mut self) {
+        let sel = self.selection();
+        if sel.len() > 1 {
+            let last = *sel.last().expect("a clip");
+            let n = sel.len();
+            self.change(|p| {
+                for (k, &i) in sel.iter().enumerate() {
+                    let mut c = p.clips[i].clone();
+                    if k == 0 {
+                        c.audio_offset = 0.0;
+                    }
+                    p.clips.insert(last + 1 + k, c);
+                }
+            });
+            self.picked = (last + 1..last + n).collect();
+            self.selected = Some(last + n);
+            return;
+        }
         if let Some(i) = self.target() {
             self.change(|p| {
-                let c = p.clips[i].clone();
+                let mut c = p.clips[i].clone();
+                c.audio_offset = 0.0;
                 p.clips.insert(i + 1, c);
             });
             self.selected = Some(i + 1);
@@ -3421,10 +3648,182 @@ impl State {
         self.selected = Some(j as usize);
     }
 
+    /// Every chosen clip, in order: the selected one and those picked
+    /// with Ctrl or Shift.
+    fn selection(&self) -> Vec<usize> {
+        let n = self.project.clips.len();
+        let mut v: Vec<usize> = self.picked.iter().copied().filter(|i| *i < n).collect();
+        if let Some(i) = self.selected.filter(|i| *i < n) {
+            if !v.contains(&i) {
+                v.push(i);
+            }
+        }
+        v.sort_unstable();
+        v
+    }
+
+    /// Show a clip's title (0) or picture-in-picture (1) settings.
+    fn show_group(&mut self, what: u8) {
+        let want = if what == 0 { Param::Title } else { Param::Pip };
+        if let Some(row) = self.params().iter().position(|p| *p == want) {
+            self.param_row = row;
+            self.focus = Focus::Inspector;
+        }
+    }
+
+    /// To the next (or previous) cut or marker.
+    fn jump(&mut self, forward: bool) {
+        let mut points = self.cut_points();
+        points.extend(self.project.film_markers().into_iter().map(|m| m.0));
+        points.sort_by(f64::total_cmp);
+        let t = if forward {
+            points
+                .iter()
+                .find(|p| **p > self.playhead + 1e-3)
+                .copied()
+                .unwrap_or(self.project.duration())
+        } else {
+            points
+                .iter()
+                .rev()
+                .find(|p| **p < self.playhead - 1e-3)
+                .copied()
+                .unwrap_or(0.0)
+        };
+        self.seek(t);
+    }
+
+    /// The part that loops: the marked part, else the whole film.
+    fn loop_range(&self) -> (f64, f64) {
+        match (self.mark_in, self.mark_out) {
+            (Some(a), Some(b)) if (b - a).abs() > 0.1 => (a.min(b), a.max(b)),
+            _ => (0.0, self.project.duration()),
+        }
+    }
+
+    fn toggle_loop(&mut self) {
+        self.looping = !self.looping;
+        self.say(if !self.looping {
+            "Loop off"
+        } else if self.mark_in.is_some() && self.mark_out.is_some() {
+            "Loop on: the marked part plays over and over"
+        } else {
+            "Loop on: the film plays over and over (I and O loop a part)"
+        });
+    }
+
+    fn toggle_snap(&mut self) {
+        self.snapping = !self.snapping;
+        self.say(if self.snapping {
+            "Snapping on: edges catch cuts, markers and the playhead"
+        } else {
+            "Snapping off"
+        });
+    }
+
+    /// Set a marker at the playhead, or remove the one there.
+    fn toggle_marker(&mut self) {
+        let near = self
+            .project
+            .film_markers()
+            .into_iter()
+            .find(|m| (m.0 - self.playhead).abs() < self.frame() * 2.0);
+        if let Some((_, _, i, k)) = near {
+            self.change(|p| {
+                p.clips[i].markers.remove(k);
+            });
+            self.say("Marker removed");
+            return;
+        }
+        let at = self.playhead;
+        let mut done = None;
+        self.change(|p| done = p.add_marker(at, String::new()));
+        if done.is_some() {
+            self.say("Marker set: double-click it to name it, it becomes a chapter");
+        } else {
+            self.warn("Put the playhead inside a clip to set a marker.");
+        }
+    }
+
+    /// Copy the chosen clips (and what they show).
+    fn copy(&mut self) -> usize {
+        let sel = self.selection();
+        self.clipboard = sel
+            .iter()
+            .map(|&i| {
+                let c = self.project.clips[i].clone();
+                let m = self.project.media[c.media].clone();
+                let pip = c.pip.media.and_then(|k| self.project.media.get(k).cloned());
+                (c, m, pip)
+            })
+            .collect();
+        sel.len()
+    }
+
+    /// Remove the chosen clips.
+    fn remove_selection(&mut self) {
+        let sel = self.selection();
+        if sel.is_empty() {
+            return;
+        }
+        self.change(|p| {
+            for &i in sel.iter().rev() {
+                p.clips.remove(i);
+            }
+        });
+        self.picked.clear();
+        self.selected = None;
+        self.lane_sel = None;
+    }
+
+    /// Put the copied clips in at the playhead (a clip there is split).
+    fn paste(&mut self) {
+        if self.clipboard.is_empty() {
+            self.warn("Nothing copied: choose clips and press Ctrl+C.");
+            return;
+        }
+        let at = self.playhead;
+        let items = self.clipboard.clone();
+        let mut first = 0;
+        let n = items.len();
+        self.change(|p| {
+            let starts = p.starts();
+            let index = match p.locate(at) {
+                None => 0,
+                Some((i, local)) if local < 0.05 => i,
+                Some((i, local)) if p.clips[i].length() - local < 0.05 => i + 1,
+                Some((i, _)) if at >= starts[i] + p.clips[i].length() - 1e-6 => i + 1,
+                Some(_) => p.split(at).unwrap_or(p.clips.len()),
+            };
+            first = index;
+            for (k, (clip, media, pip)) in items.into_iter().enumerate() {
+                let mut clip = clip;
+                clip.media = p.add_media(media);
+                clip.pip.media = pip.map(|m| p.add_media(m));
+                if k == 0 {
+                    clip.audio_offset = 0.0;
+                }
+                p.clips.insert(index + k, clip);
+            }
+        });
+        self.picked = (first..first + n).collect();
+        self.selected = Some(first + n - 1);
+        self.picked.remove(&(first + n - 1));
+        self.say(format!("Pasted {n} clip{}", if n == 1 { "" } else { "s" }));
+    }
+
     fn cut_points(&self) -> Vec<f64> {
         let mut v = self.project.starts();
         v.push(self.project.duration());
         v
+    }
+
+    fn project_fps(&self) -> f64 {
+        if self.project.fps > 0.0 {
+            self.project.fps
+        } else {
+            30.0
+        }
     }
 
     fn frame(&self) -> f64 {
@@ -3465,10 +3864,14 @@ impl State {
     }
 
     fn snap(&self, l: &Layout, t: f64) -> f64 {
+        if !self.snapping {
+            return t;
+        }
         let tol = 8.0 / self.zoom;
         let mut best = t;
         let mut dist = tol;
         let mut points = self.cut_points();
+        points.extend(self.project.film_markers().into_iter().map(|m| m.0));
         points.push(self.playhead);
         points.extend(self.mark_in);
         points.extend(self.mark_out);
@@ -3535,6 +3938,16 @@ impl State {
                                 self.open_captions();
                                 if let Overlay::Captions(f) = &mut self.overlay {
                                     f.selected = k;
+                                }
+                            }
+                            TextTarget::Marker(i, k) => {
+                                if self
+                                    .project
+                                    .clips
+                                    .get(i)
+                                    .is_some_and(|c| k < c.markers.len())
+                                {
+                                    self.change(|p| p.clips[i].markers[k].name = value);
                                 }
                             }
                             TextTarget::ExportName => {
@@ -3823,6 +4236,35 @@ impl State {
                     }
                 }
                 Some('d') => self.duplicate(),
+                Some('c') => {
+                    let n = self.copy();
+                    if n > 0 {
+                        self.say(format!(
+                            "Copied {n} clip{}: Ctrl+V puts them in at the playhead",
+                            if n == 1 { "" } else { "s" }
+                        ));
+                    }
+                }
+                Some('x') => {
+                    let n = self.copy();
+                    if n > 0 {
+                        self.remove_selection();
+                        self.say(format!(
+                            "Cut {n} clip{}: Ctrl+V puts them back in at the playhead",
+                            if n == 1 { "" } else { "s" }
+                        ));
+                    }
+                }
+                Some('v') => self.paste(),
+                Some('a') => {
+                    let n = self.project.clips.len();
+                    if n > 0 {
+                        self.picked = (0..n - 1).collect();
+                        self.selected = Some(n - 1);
+                        self.music_selected = None;
+                        self.say(format!("All {n} clips chosen"));
+                    }
+                }
                 Some(',') => self.overlay = Overlay::Settings,
                 Some('t') => self.add_card(),
                 Some('f') => self.overlay = Overlay::Film { row: 0 },
@@ -3834,6 +4276,8 @@ impl State {
         }
         match sym {
             K_F1 => self.overlay = Overlay::Help,
+            K_F11 => self.fullscreen = !self.fullscreen,
+            K_ESCAPE if self.fullscreen => self.fullscreen = false,
             K_TAB => {
                 self.focus = match self.focus {
                     Focus::Timeline => Focus::Inspector,
@@ -3857,6 +4301,8 @@ impl State {
                     self.mark_out = None;
                 } else {
                     self.selected = None;
+                    self.picked.clear();
+                    self.lane_sel = None;
                     self.music_selected = None;
                 }
             }
@@ -3921,24 +4367,7 @@ impl State {
                     self.seek(self.playhead + d * step);
                 }
             }
-            K_UP | K_DOWN => {
-                let points = self.cut_points();
-                let t = if sym == K_UP {
-                    points
-                        .iter()
-                        .rev()
-                        .find(|p| **p < self.playhead - 1e-3)
-                        .copied()
-                        .unwrap_or(0.0)
-                } else {
-                    points
-                        .iter()
-                        .find(|p| **p > self.playhead + 1e-3)
-                        .copied()
-                        .unwrap_or(self.project.duration())
-                };
-                self.seek(t);
-            }
+            K_UP | K_DOWN => self.jump(sym == K_DOWN),
             K_KP_ADD => self.zoom *= 1.5,
             K_KP_SUB => self.zoom = (self.zoom / 1.5).max(0.5),
             _ => match sym_char(sym) {
@@ -3985,10 +4414,19 @@ impl State {
                 Some('p') | Some('P') => self.render_preview(),
                 Some('m') | Some('M') => {
                     if let Some(i) = self.target() {
-                        let muted = self.project.clips[i].mute;
-                        self.change(|p| p.clips[i].mute = !muted);
+                        let muted = !self.project.clips[i].mute;
+                        let sel = self.selection();
+                        self.change(|p| {
+                            for j in sel {
+                                p.clips[j].mute = muted;
+                            }
+                        });
                     }
                 }
+                Some('b') | Some('B') => self.toggle_marker(),
+                Some('n') | Some('N') => self.toggle_snap(),
+                Some('r') | Some('R') => self.toggle_loop(),
+                Some('f') | Some('F') => self.fullscreen = !self.fullscreen,
                 Some('t') | Some('T') => {
                     if let Some(i) = self.target() {
                         self.edit_title(i);
@@ -4127,6 +4565,16 @@ impl State {
                 }
             }
             Action::FontAccept => self.accept_font(),
+            Action::GoStart => self.seek(0.0),
+            Action::GoEnd => {
+                let d = self.project.duration();
+                self.seek(d);
+            }
+            Action::PrevCut => self.jump(false),
+            Action::NextCut => self.jump(true),
+            Action::Loop => self.toggle_loop(),
+            Action::Snap => self.toggle_snap(),
+            Action::FullScreen => self.fullscreen = !self.fullscreen,
             Action::Recover => {
                 let path = autosave_path();
                 self.open_project(&path);
@@ -4157,6 +4605,28 @@ impl State {
             } else {
                 hit.map(|h| (h, Instant::now()))
             };
+        }
+        // Full screen: the picture covers everything. A click plays or
+        // pauses, a double click (or Esc) comes back.
+        if self.fullscreen {
+            match button {
+                1 if double => self.fullscreen = false,
+                1 => {
+                    let on = !self.playing;
+                    self.play(on);
+                }
+                4..=7 => {
+                    self.play(false);
+                    let d = if button == 4 || button == 6 {
+                        -1.0
+                    } else {
+                        1.0
+                    };
+                    self.seek(self.playhead + d * if shift { 1.0 } else { self.frame() });
+                }
+                _ => {}
+            }
+            return;
         }
         // Wheel.
         if matches!(button, 4..=7) {
@@ -4189,6 +4659,16 @@ impl State {
             return;
         }
         if button == 3 {
+            // Right click on a marker removes it.
+            if let Some(Hit::Marker(i, k)) = hit {
+                self.change(|p| {
+                    if k < p.clips[i].markers.len() {
+                        p.clips[i].markers.remove(k);
+                    }
+                });
+                self.say("Marker removed");
+                return;
+            }
             // Right click on a clip: select and split there.
             if let Some(Hit::Clip(i, _)) = hit {
                 self.selected = Some(i);
@@ -4382,9 +4862,44 @@ impl State {
                     self.seek(t);
                 }
             }
+            Some(Hit::Clip(i, edge)) if ctrl || shift => {
+                // Ctrl adds or takes away one clip, Shift a run of them.
+                self.focus = Focus::Timeline;
+                self.music_selected = None;
+                self.lane_sel = None;
+                let _ = edge;
+                if shift {
+                    let from = self.selected.unwrap_or(i);
+                    let (a, b) = (from.min(i), from.max(i));
+                    self.picked.extend(a..=b);
+                    self.selected = Some(i);
+                } else if self.picked.remove(&i) || self.selected == Some(i) {
+                    if self.selected == Some(i) {
+                        self.selected = self.picked.iter().next_back().copied();
+                        if let Some(n) = self.selected {
+                            self.picked.remove(&n);
+                        }
+                    }
+                } else {
+                    if let Some(old) = self.selected {
+                        self.picked.insert(old);
+                    }
+                    self.selected = Some(i);
+                }
+                let n = self.selection().len();
+                if n > 1 {
+                    self.say(format!(
+                        "{n} clips chosen: panel changes apply to all of them"
+                    ));
+                }
+            }
             Some(Hit::Clip(i, edge)) => {
                 self.focus = Focus::Timeline;
+                if !self.picked.contains(&i) {
+                    self.picked.clear();
+                }
                 self.selected = Some(i);
+                self.lane_sel = None;
                 self.music_selected = None;
                 let before = self.project.clone();
                 self.history.record(&before);
@@ -4442,6 +4957,116 @@ impl State {
                     },
                 });
             }
+            Some(Hit::Window(i, what, edge)) => {
+                self.focus = Focus::Timeline;
+                self.selected = Some(i);
+                self.picked.clear();
+                self.music_selected = None;
+                self.lane_sel = Some(what);
+                self.show_group(what);
+                if double {
+                    self.open_place(i, what);
+                    return;
+                }
+                let c = &self.project.clips[i];
+                let (a0, z0) = if what == 0 {
+                    super::project::window(c.effects.text_start, c.effects.text_length, c.length())
+                } else {
+                    super::project::window(c.pip.start, c.pip.length, c.length())
+                };
+                let before = self.project.clone();
+                self.history.record(&before);
+                self.drag = Some(Drag::Window {
+                    i,
+                    what,
+                    edge,
+                    a0,
+                    z0,
+                    x0: x,
+                });
+            }
+            Some(Hit::CameraOff(i)) => {
+                self.selected = Some(i);
+                self.picked.clear();
+                self.lane_sel = Some(1);
+                self.show_group(1);
+                if double {
+                    self.change(|p| p.clips[i].pip.mode = 0);
+                    self.say("Camera on for this clip");
+                }
+            }
+            Some(Hit::LaneOff(k)) => {
+                let label = ["Titles", "Camera", "Sound", "Music"][k as usize];
+                let mut now = false;
+                self.change(|p| {
+                    let flag = match k {
+                        0 => &mut p.hide_titles,
+                        1 => &mut p.hide_camera,
+                        2 => &mut p.mute_sound,
+                        _ => &mut p.mute_music,
+                    };
+                    *flag = !*flag;
+                    now = !*flag;
+                });
+                self.say(format!(
+                    "{label} {} in the preview and the export",
+                    if now { "on" } else { "off" }
+                ));
+            }
+            Some(Hit::SoundCut(i)) => {
+                self.focus = Focus::Timeline;
+                self.selected = Some(i);
+                self.picked.clear();
+                self.lane_sel = None;
+                let before = self.project.clone();
+                self.history.record(&before);
+                if double {
+                    self.change(|p| p.clips[i].audio_offset = 0.0);
+                    self.say("The sound cuts with the picture again");
+                    return;
+                }
+                self.drag = Some(Drag::SoundCut {
+                    i,
+                    o0: self.project.clips[i].audio_offset,
+                    x0: x,
+                });
+            }
+            Some(Hit::Volume(i)) => {
+                self.selected = Some(i);
+                self.picked.clear();
+                let before = self.project.clone();
+                self.history.record(&before);
+                if double {
+                    self.change(|p| p.clips[i].volume = 1.0);
+                    return;
+                }
+                self.drag = Some(Drag::Volume {
+                    i,
+                    v0: self.project.clips[i].volume,
+                    y0: y,
+                    h: (l.lane_audio.h - 10).max(8),
+                });
+            }
+            Some(Hit::Marker(i, k)) => {
+                let t = self
+                    .project
+                    .film_markers()
+                    .into_iter()
+                    .find(|m| m.2 == i && m.3 == k)
+                    .map(|m| m.0);
+                if let Some(t) = t {
+                    self.play(false);
+                    self.seek(t);
+                }
+                if double {
+                    let name = self.project.clips[i].markers[k].name.clone();
+                    self.overlay = Overlay::TextInput {
+                        title: "Marker name (a chapter in the export)".into(),
+                        text: name,
+                        target: TextTarget::Marker(i, k),
+                    };
+                }
+            }
             Some(Hit::Block) => {
                 if matches!(self.overlay, Overlay::Settings | Overlay::Help) {
                     // The dimmed area beside a small dialog closes it.
@@ -4449,7 +5074,18 @@ impl State {
             }
             Some(Hit::Lane) => {
                 self.focus = Focus::Timeline;
+                // A double click on the title lane over a clip writes a title.
+                if double && l.lane_title.has(x, y) {
+                    let t = self.x_time(l, x);
+                    if let Some((i, _)) = self.project.locate(t) {
+                        self.selected = Some(i);
+                        self.edit_title(i);
+                        return;
+                    }
+                }
                 self.selected = None;
+                self.picked.clear();
+                self.lane_sel = None;
                 self.music_selected = None;
                 self.play(false);
                 let t = self.x_time(l, x);
@@ -4504,6 +5140,67 @@ impl State {
             }
             Drag::Scrub => {
                 self.seek(t);
+            }
+            Drag::Window {
+                i,
+                what,
+                edge,
+                a0,
+                z0,
+                x0,
+            } => {
+                let Some(c) = self.project.clips.get(i) else {
+                    return;
+                };
+                let len = c.length();
+                let start = self.project.starts()[i];
+                let dt = f64::from(x - x0) / self.zoom;
+                let snap = |st: &Self, v: f64| st.snap(l, start + v) - start;
+                let min = 0.2f64.min(len);
+                let (a, z) = match edge {
+                    Edge::Left => (snap(self, a0 + dt).clamp(0.0, z0 - min), z0),
+                    Edge::Right => (a0, snap(self, z0 + dt).clamp(a0 + min, len)),
+                    Edge::Body => {
+                        let d = z0 - a0;
+                        let a = snap(self, a0 + dt).clamp(0.0, (len - d).max(0.0));
+                        (a, a + d)
+                    }
+                };
+                // Running to the clip's end keeps following it (length 0).
+                let length = if z >= len - 0.02 { 0.0 } else { z - a };
+                let c = &mut self.project.clips[i];
+                if what == 0 {
+                    c.effects.text_start = a;
+                    c.effects.text_length = length;
+                } else {
+                    c.pip.start = a;
+                    c.pip.length = length;
+                }
+            }
+            Drag::SoundCut { i, o0, x0 } => {
+                if i >= self.project.clips.len() {
+                    return;
+                }
+                let start = self.project.starts()[i];
+                let dt = f64::from(x - x0) / self.zoom;
+                // Dragging left makes the sound come early (J), right late (L).
+                let at = self.snap(l, start - o0 + dt);
+                let (lo, hi) = self.project.audio_offset_limits(i);
+                let o = (start - at).clamp(lo, hi);
+                self.project.clips[i].audio_offset = if o.abs() < 0.02 { 0.0 } else { o };
+                let shown = self.project.clips[i].audio_offset;
+                self.say(match shown {
+                    o if o > 0.0 => format!("J cut: the sound comes {o:.2} s before the picture"),
+                    o if o < 0.0 => format!("L cut: the sound runs {:.2} s past the picture", -o),
+                    _ => "The sound cuts with the picture".into(),
+                });
+            }
+            Drag::Volume { i, v0, y0, h } => {
+                let dv = f64::from(y0 - y) / f64::from(h.max(1)) * 2.0;
+                let v = ((v0 + dv) * 100.0).round() / 100.0;
+                if let Some(c) = self.project.clips.get_mut(i) {
+                    c.volume = v.clamp(0.0, 4.0);
+                }
             }
             Drag::Range(a) => {
                 let t = self.snap(l, t);
@@ -4604,7 +5301,8 @@ impl State {
         if let Some(m) = &mut self.mpv {
             if self.loaded_url != url {
                 self.loaded_url = url;
-                m.load(&path, source, true);
+                self.loaded_graph.clear();
+                m.load(&path, source, true, "");
             } else {
                 m.seek(source);
             }
@@ -4634,6 +5332,9 @@ impl State {
                 self.after_change();
                 self.refresh_place();
             }
+            Drag::Window { .. } | Drag::SoundCut { .. } | Drag::Volume { .. } => {
+                self.after_change();
+            }
             Drag::TrimLeft { .. }
             | Drag::TrimRight { .. }
             | Drag::Music { .. }
@@ -4643,6 +5344,10 @@ impl State {
                 self.reload(true);
             }
             Drag::Clip { i, moved, .. } => {
+                if !moved {
+                    // A plain click on one of several chosen clips picks it alone.
+                    self.picked.clear();
+                }
                 if moved && l.timeline.has(x, y) {
                     let to = self.drop_index(l, x);
                     let to = if to > i { to - 1 } else { to };
@@ -5110,7 +5815,10 @@ fn draw_inspector(p: &mut Painter, st: &State, l: &Layout, t: &Theme, s: i32) {
         t,
         r,
         s,
-        &format!("CLIP {} OF {}", i + 1, st.project.clips.len()),
+        &match st.selection().len() {
+            n if n > 1 => format!("CLIP {} OF {} · {n} CHOSEN", i + 1, st.project.clips.len()),
+            _ => format!("CLIP {} OF {}", i + 1, st.project.clips.len()),
+        },
         focused,
     );
     p.tx.fit(
@@ -5422,18 +6130,32 @@ fn draw_transport(p: &mut Painter, st: &State, l: &Layout, t: &Theme, s: i32) {
     p.cv.fill(r.x, r.y, r.w, r.h, t.surface);
     p.cv.fill(r.x, r.y, r.w, 1, t.border);
     let y = r.y + (r.h - s * 17 / 10) / 2;
-    let mut x = r.x + s;
-    let play = if st.playing {
-        "❚❚ Pause"
-    } else {
-        "▶ Play"
-    };
-    x += button(p, t, x, y, play, Action::Play, s, true) + s;
+    let mut x = r.x + s / 2;
+    let play = if st.playing { "❚❚" } else { "▶" };
+    for (label, a, primary) in [
+        ("|◀", Action::GoStart, false),
+        ("◀◀", Action::PrevCut, false),
+        (play, Action::Play, true),
+        ("▶▶", Action::NextCut, false),
+        ("▶|", Action::GoEnd, false),
+    ] {
+        x += button(p, t, x, y, label, a, s, primary) + s / 4;
+    }
+    x += s / 2;
     let d = st.project.duration();
-    let time = format!("{} / {}", clock(st.playhead), clock(d));
+    let fps = st.project_fps();
+    let time = format!("{} / {}", timecode(st.playhead, fps), timecode(d, fps));
     let tw = p.tx.width(&time, t.size);
     p.tx.draw(&mut p.cv, x, y + s / 5, &time, t.size, t.foreground);
     x += tw + s;
+    for (label, a, on) in [
+        ("↻ Loop", Action::Loop, st.looping),
+        ("Snap", Action::Snap, st.snapping),
+        ("Full", Action::FullScreen, false),
+    ] {
+        x += button(p, t, x, y, label, a, s, on) + s / 4;
+    }
+    x += s / 2;
     if st.rate > 1.0 && st.playing {
         p.tx.draw(
             &mut p.cv,
@@ -5488,7 +6210,7 @@ fn draw_transport(p: &mut Painter, st: &State, l: &Layout, t: &Theme, s: i32) {
         let size = (s as u32 * 9 / 10).max(10);
         let bw = p.tx.width(label, size) + s;
         rx -= bw;
-        if rx < r.x + s * 22 {
+        if rx < x {
             break;
         }
         button(p, t, rx, y, label, a, s, primary);
@@ -5512,21 +6234,49 @@ fn draw_timeline(p: &mut Painter, st: &State, l: &Layout, t: &Theme, s: i32) {
     p.cv.fill(r.x, r.y, r.w, r.h, t.surface);
     p.cv.fill(r.x, r.y, r.w, 1, t.border);
     let small = t.size * 8 / 10;
-    // Lane labels.
-    for (lane, label) in [
-        (l.lane_video, "Video"),
-        (l.lane_audio, "Sound"),
-        (l.lane_music, "Music"),
+    // Lane labels, with a switch on the lanes that can be turned off.
+    let pr = &st.project;
+    for (lane, label, switch) in [
+        (l.lane_title, "Titles", Some((0u8, !pr.hide_titles))),
+        (l.lane_camera, "Camera", Some((1, !pr.hide_camera))),
+        (l.lane_video, "Video", None),
+        (l.lane_audio, "Sound", Some((2, !pr.mute_sound))),
+        (l.lane_music, "Music", Some((3, !pr.mute_music))),
     ] {
         p.cv.fill(0, lane.y, l.track_x - 2, lane.h - 2, t.raised);
-        p.tx.draw(
+        let ty = lane.y + (lane.h - 2) / 2 - s / 2;
+        p.tx.fit(
             &mut p.cv,
-            s / 2,
-            lane.y + lane.h / 2 - s / 2,
+            s / 3,
+            ty,
             label,
             small,
             t.muted,
+            l.track_x - s * 2,
         );
+        if let Some((k, on)) = switch {
+            let bw = s * 3 / 2;
+            let bh = (lane.h - 6).clamp(4, s * 5 / 4);
+            let bx = l.track_x - bw - s / 4;
+            let by = lane.y + (lane.h - 2 - bh) / 2;
+            p.cv.round(bx, by, bw, bh, s / 4, if on { t.success } else { t.border });
+            let mark = match (k, on) {
+                (0 | 1, true) => "●",
+                (0 | 1, false) => "○",
+                (_, true) => "♪",
+                (_, false) => "×",
+            };
+            let mw = p.tx.width(mark, small);
+            p.tx.draw(
+                &mut p.cv,
+                bx + (bw - mw) / 2,
+                by + (bh - small as i32 * 5 / 4) / 2,
+                mark,
+                small,
+                t.background,
+            );
+            p.hits.push((Rect::new(bx, by, bw, bh), Hit::LaneOff(k)));
+        }
         p.cv.fill(lane.x, lane.y, lane.w, lane.h - 2, t.background);
         p.hits.push((lane, Hit::Lane));
     }
@@ -5557,6 +6307,7 @@ fn draw_timeline(p: &mut Painter, st: &State, l: &Layout, t: &Theme, s: i32) {
     }
     // Clips.
     let starts = st.project.starts();
+    let spans = st.project.sound_spans();
     let lv = l.lane_video;
     let la = l.lane_audio;
     let target = st.target();
@@ -5568,7 +6319,7 @@ fn draw_timeline(p: &mut Painter, st: &State, l: &Layout, t: &Theme, s: i32) {
             continue;
         }
         let w = (x1 - x0).max(2);
-        let sel = st.selected == Some(i);
+        let sel = st.selected == Some(i) || st.picked.contains(&i);
         // Video strip.
         let vy = lv.y + 2;
         let vh = lv.h - 6;
@@ -5655,40 +6406,154 @@ fn draw_timeline(p: &mut Painter, st: &State, l: &Layout, t: &Theme, s: i32) {
             Rect::new(x1 - edge, lv.y, edge, lv.h),
             Hit::Clip(i, Edge::Right),
         ));
-        // Sound wave.
+        // Sound wave, over the clip's own stretch of sound (a J or L cut
+        // moves it off the picture).
+        let (sa, sb) = spans[i];
+        let (ax0, ax1) = (st.time_x(l, sa), st.time_x(l, sb));
+        let aw = (ax1 - ax0).max(2);
         let ay = la.y + 2;
         let ah = la.h - 6;
         p.cv.round(
-            x0,
+            ax0,
             ay,
-            w,
+            aw,
             ah,
             s / 4,
             if sel { t.selected } else { t.raised },
         );
+        let mut volume_hit = None;
         if m.has_audio && !m.still {
-            let colour = if c.mute { t.muted } else { t.success };
+            let colour = if c.mute || st.project.mute_sound {
+                t.muted
+            } else {
+                t.success
+            };
             if let Some(peaks) = st.cache.peaks.get(&m.path) {
+                let (from, speed, start, dur) = (sa - starts[i], c.speed, c.start, m.duration);
                 draw_wave(
                     p,
                     st,
                     peaks,
-                    x0,
-                    x1,
+                    ax0,
+                    ax1,
                     ay,
                     ah,
                     colour,
-                    |local| c.source_at(local),
+                    |local| (start + (local + from) * speed).clamp(0.0, dur),
                     c.volume,
                     l,
                 );
             }
             if c.mute {
-                p.tx.draw(&mut p.cv, x0 + s / 3, ay + 2, "muted", small, t.foreground);
+                p.tx.draw(&mut p.cv, ax0 + s / 3, ay + 2, "muted", small, t.foreground);
+            } else {
+                // The volume line: 100 % at the middle, 200 % at the top.
+                let vy = ay + ah - ((c.volume.min(2.0) / 2.0) * f64::from(ah - 4)) as i32 - 2;
+                let hot = matches!(st.drag, Some(Drag::Volume { i: d, .. }) if d == i);
+                p.cv.fill(ax0 + 2, vy - 1, aw - 4, 3, t.background);
+                p.cv.fill(ax0 + 2, vy, aw - 4, if hot { 2 } else { 1 }, t.warning);
+                if hot || (sel && aw > s * 6) {
+                    let label = volume_label(c.volume);
+                    let lw = p.tx.width(&label, small);
+                    p.tx.draw(
+                        &mut p.cv,
+                        ax1 - lw - s / 3,
+                        (vy - s * 5 / 4).max(ay),
+                        &label,
+                        small,
+                        t.warning,
+                    );
+                }
+                volume_hit = Some(Rect::new(ax0, vy - 3, aw, 7));
             }
         }
-        p.hits
-            .push((Rect::new(x0, la.y, w, la.h), Hit::Clip(i, Edge::Body)));
+        p.hits.push((
+            Rect::new(ax0.max(x0), la.y, (ax1.min(x1) - ax0.max(x0)).max(2), la.h),
+            Hit::Clip(i, Edge::Body),
+        ));
+        if let Some(r) = volume_hit {
+            p.hits.push((r, Hit::Volume(i)));
+        }
+        // The sound's cut into this clip can move: a J or L cut.
+        if i > 0 && c.transition.is_none() {
+            let o = c.audio_offset;
+            if o.abs() > 1e-6 {
+                let tag = if o > 0.0 { "J" } else { "L" };
+                p.cv.fill(ax0 - 1, la.y, 2, la.h - 2, t.warning);
+                p.tx.draw(
+                    &mut p.cv,
+                    ax0 + 3,
+                    ay + ah - s * 5 / 4,
+                    tag,
+                    small,
+                    t.warning,
+                );
+            }
+            let hw = (s / 2).max(6);
+            p.hits
+                .push((Rect::new(ax0 - hw / 2, la.y, hw, la.h), Hit::SoundCut(i)));
+        }
+        // Titles and the picture-in-picture, on their lanes.
+        let len = c.length();
+        let card = m.is_card();
+        if !card && !c.effects.text.trim().is_empty() {
+            let e = &c.effects;
+            let (a, z) = super::project::window(e.text_start, e.text_length, len);
+            let label = e.text.replace('\n', " ");
+            let on = st.selected == Some(i) && st.lane_sel == Some(0);
+            lane_item(
+                p,
+                st,
+                l,
+                t,
+                s,
+                l.lane_title,
+                starts[i] + a,
+                starts[i] + z,
+                &label,
+                i,
+                0,
+                on,
+                st.project.hide_titles,
+            );
+        }
+        if export::pip_source(&st.project, c).is_some() {
+            let (a, z) = super::project::window(c.pip.start, c.pip.length, len);
+            let label = pip_label(&st.project, c);
+            let on = st.selected == Some(i) && st.lane_sel == Some(1);
+            lane_item(
+                p,
+                st,
+                l,
+                t,
+                s,
+                l.lane_camera,
+                starts[i] + a,
+                starts[i] + z,
+                &label,
+                i,
+                1,
+                on,
+                st.project.hide_camera,
+            );
+        } else if c.pip.mode == 1 && !card && !m.still && m.own_camera().is_some() {
+            // The camera is there but off: a ghost to turn it back on.
+            let lk = l.lane_camera;
+            let gy = lk.y + 2;
+            let gh = lk.h - 6;
+            p.cv.blend(x0, gy, w, gh, t.border, 90);
+            p.tx.fit(
+                &mut p.cv,
+                x0 + s / 3,
+                gy + (gh - small as i32 * 5 / 4) / 2,
+                "camera off (double-click)",
+                small,
+                t.muted,
+                w - s / 2,
+            );
+            p.hits
+                .push((Rect::new(x0, lk.y, w, lk.h), Hit::CameraOff(i)));
+        }
         let _ = target;
     }
     // Captions, as thin bars along the bottom of the sound lane.
@@ -5764,6 +6629,40 @@ fn draw_timeline(p: &mut Painter, st: &State, l: &Layout, t: &Theme, s: i32) {
             Hit::Music(j, Edge::Right),
         ));
     }
+    // Markers: flags on the ruler and a line down the lanes.
+    for (tm, name, ci, k) in st.project.film_markers() {
+        let x = st.time_x(l, tm);
+        if x < ru.x - s * 4 || x > ru.x + ru.w {
+            continue;
+        }
+        let colour = 0x00ff9f43;
+        p.cv.blend(
+            x,
+            l.lane_title.y,
+            1,
+            lm.y + lm.h - l.lane_title.y,
+            colour,
+            120,
+        );
+        let label = if name.trim().is_empty() {
+            "◆".to_string()
+        } else {
+            format!("◆ {name}")
+        };
+        let fw = (p.tx.width(&label, small) + s / 2).min(s * 10);
+        p.cv.round(x, ru.y + 1, fw, ru.h - 2, s / 4, colour);
+        p.tx.fit(
+            &mut p.cv,
+            x + s / 4,
+            ru.y + (ru.h - small as i32 * 5 / 4) / 2,
+            &label,
+            small,
+            t.background,
+            fw - s / 3,
+        );
+        p.hits
+            .push((Rect::new(x - 2, ru.y, fw + 2, ru.h), Hit::Marker(ci, k)));
+    }
     // Marked part.
     if let Some(a) = st.mark_in {
         let b = st.mark_out.unwrap_or(st.playhead);
@@ -5793,6 +6692,81 @@ fn draw_timeline(p: &mut Painter, st: &State, l: &Layout, t: &Theme, s: i32) {
         let bw = button(p, t, bx, r.y + 2, label, a, s * 3 / 4, false);
         bx += bw + 2;
     }
+}
+
+/// "100 %" and its decibels: "70 % (−3 dB)".
+fn volume_label(v: f64) -> String {
+    if v <= 0.001 {
+        return "0 % (silent)".into();
+    }
+    let db = 20.0 * v.log10();
+    if db.abs() < 0.05 {
+        "100 %".into()
+    } else {
+        let sign = if db > 0.0 { "+" } else { "\u{2212}" };
+        format!("{:.0} % ({sign}{:.1} dB)", v * 100.0, db.abs())
+    }
+}
+
+/// A clip's title or picture-in-picture on its lane: from `a` to `z` in
+/// the film, with handles at both ends.
+#[allow(clippy::too_many_arguments)]
+fn lane_item(
+    p: &mut Painter,
+    st: &State,
+    l: &Layout,
+    t: &Theme,
+    s: i32,
+    lane: Rect,
+    a: f64,
+    z: f64,
+    label: &str,
+    i: usize,
+    what: u8,
+    on: bool,
+    off: bool,
+) {
+    let x0 = st.time_x(l, a);
+    let x1 = st.time_x(l, z);
+    if x1 < lane.x || x0 > lane.x + lane.w {
+        return;
+    }
+    let w = (x1 - x0).max(4);
+    let y = lane.y + 2;
+    let h = lane.h - 6;
+    let base = if what == 0 { 0x00b48cf2 } else { 0x005fb3d9 };
+    let colour = if off {
+        t.border
+    } else if on {
+        t.accent
+    } else {
+        base
+    };
+    p.cv.round(x0, y, w, h, s / 4, colour);
+    let small = t.size * 8 / 10;
+    let fg = if off { t.muted } else { t.background };
+    p.tx.fit(
+        &mut p.cv,
+        x0 + s / 3,
+        y + (h - small as i32 * 5 / 4) / 2,
+        label,
+        small,
+        fg,
+        w - s / 2,
+    );
+    p.hits.push((
+        Rect::new(x0, lane.y, w, lane.h),
+        Hit::Window(i, what, Edge::Body),
+    ));
+    let edge = (s / 2).min(w / 4).max(3);
+    p.hits.push((
+        Rect::new(x0, lane.y, edge, lane.h),
+        Hit::Window(i, what, Edge::Left),
+    ));
+    p.hits.push((
+        Rect::new(x1 - edge, lane.y, edge, lane.h),
+        Hit::Window(i, what, Edge::Right),
+    ));
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6969,32 +7943,44 @@ fn draw_area(p: &mut Painter, st: &State, l: &Layout, t: &Theme, s: i32) {
 }
 
 const KEYS: &[(&str, &str)] = &[
-    ("Space", "Play or pause"),
-    ("J  K  L", "Back 2 s, pause, play (L again: faster)"),
+    ("Space  K", "Play or pause (K stops)"),
+    ("J  L", "Back 2 s; play, L again: faster"),
     ("← →", "One frame (Shift: one second)"),
-    ("↑ ↓", "Previous or next cut"),
+    ("↑ ↓", "Previous or next cut or marker"),
     ("Home  End", "Start or end of the film"),
     ("S", "Split the clip at the playhead"),
     ("I  O", "Mark the start and end of a part"),
-    ("X  Delete", "Cut the marked part, else remove the clip"),
+    (
+        "X  Delete",
+        "Cut the marked part, else remove the chosen clips",
+    ),
     ("C", "Keep only the marked part"),
+    (
+        "Ctrl/Shift+click",
+        "Choose more clips: panel changes apply to all",
+    ),
+    (
+        "Ctrl+C  X  V  A",
+        "Copy, cut, paste at the playhead, choose all",
+    ),
     ("Alt+← →", "Move the clip earlier or later"),
-    ("M", "Mute or unmute the clip"),
+    ("M", "Mute or unmute the chosen clips"),
+    ("B", "Set or remove a marker (a chapter)"),
     ("T", "Title text over the clip (| for a new line)"),
     ("Ctrl+T", "Title card: text on a colour"),
     ("E", "Place the title and the camera on the picture"),
-    ("P", "Preview with effects and transitions"),
+    ("P", "Preview with titles, effects and transitions"),
+    ("R  N", "Loop the film or the marked part; snapping"),
+    ("F  F11", "Full screen picture (Esc comes back)"),
     ("Tab", "Timeline, settings panel, media list"),
     ("+  −  Z", "Zoom in, out, whole film"),
     ("Ctrl+Z  Ctrl+Y", "Undo, redo"),
-    ("Ctrl+D", "Duplicate the clip"),
+    ("Ctrl+D", "Duplicate the chosen clips"),
     ("Ctrl+O  Ctrl+I  Ctrl+M", "Open, import, add music"),
     ("Ctrl+S  Ctrl+Shift+S", "Save, save as"),
     ("Ctrl+E", "Export (L size limit, U captions)"),
     ("Ctrl+F", "The whole film: loudness, music, logo"),
-    ("Ctrl+K", "Cut pauses"),
-    ("Ctrl+L", "Captions from the speech"),
-    ("Enter", "In the panel: a start or length from the playhead"),
+    ("Ctrl+K  Ctrl+L", "Cut pauses; captions from the speech"),
     (
         "Ctrl+R",
         "Record the screen, a window, an area or the camera",
@@ -7002,8 +7988,9 @@ const KEYS: &[(&str, &str)] = &[
     ("Ctrl+Q", "Quit"),
     (
         "Mouse",
-        "Drag clips to reorder, edges to trim, media to the timeline",
+        "Drag clips, edges, title and camera bars, the sound cut (J/L)",
     ),
+    ("Volume line", "Drag up or down; double-click: 100 %"),
     (
         "Wheel",
         "Scroll the timeline (Ctrl: zoom); over the video: step",
@@ -7012,28 +7999,37 @@ const KEYS: &[(&str, &str)] = &[
 ];
 
 fn draw_help(p: &mut Painter, l: &Layout, t: &Theme, s: i32) {
-    let r = dialog(
-        p,
-        l,
-        t,
-        s,
-        s * 46,
-        s * 3 + KEYS.len() as i32 * s * 3 / 2 + s * 3,
-        "Keys",
-    );
-    let mut y = r.y + s * 3;
-    for (k, what) in KEYS {
-        p.tx.draw(&mut p.cv, r.x + s, y, k, t.size * 9 / 10, t.accent);
+    // One column when it fits the window, else two side by side.
+    let (ww, wh) = (l.timeline.w, l.timeline.y + l.timeline.h);
+    let row = s * 13 / 10;
+    let n = KEYS.len() as i32;
+    let cols = if s * 6 + n * row <= wh - s * 2 { 1 } else { 2 };
+    let per = (n + cols - 1) / cols;
+    let col_w = (s * 46).min((ww - s * 2) / cols);
+    let r = dialog(p, l, t, s, col_w * cols, s * 6 + per * row, "Keys");
+    let key_w = (col_w * 3 / 10).min(s * 13);
+    for (k, (key, what)) in KEYS.iter().enumerate() {
+        let (c, j) = (k as i32 / per, k as i32 % per);
+        let x = r.x + c * col_w;
+        let y = r.y + s * 3 + j * row;
         p.tx.fit(
             &mut p.cv,
-            r.x + s * 13,
+            x + s,
+            y,
+            key,
+            t.size * 9 / 10,
+            t.accent,
+            key_w - s / 2,
+        );
+        p.tx.fit(
+            &mut p.cv,
+            x + s + key_w,
             y,
             what,
             t.size * 9 / 10,
             t.foreground,
-            r.w - s * 14,
+            col_w - key_w - s * 2,
         );
-        y += s * 3 / 2;
     }
 }
 

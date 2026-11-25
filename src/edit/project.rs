@@ -11,7 +11,9 @@ use std::path::{Path, PathBuf};
 /// hidden areas, voice sound, captions, logo and loudness.
 /// 3: picture-in-picture (the recording's camera track or another file),
 /// text effects, more looks and a free text position.
-pub const SCHEMA: u32 = 3;
+/// 4: markers, J and L cuts (sound that starts before or runs past its
+/// picture) and lanes that can be hidden or muted.
+pub const SCHEMA: u32 = 4;
 
 /// The path of the built-in title card "media": a plain colour.
 pub const CARD: &str = "niruclip:card";
@@ -409,6 +411,29 @@ pub struct Clip {
     pub desktop_volume: f64,
     #[serde(default, skip_serializing_if = "is_default_pip")]
     pub pip: Pip,
+    /// Where the sound changes over at the cut into this clip, in film
+    /// seconds against the picture's cut: above 0 this clip's sound starts
+    /// that much early (a J cut), below 0 the previous clip's sound runs on
+    /// into this one (an L cut). Only at a hard cut.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub audio_offset: f64,
+    /// Markers in this clip, at source seconds: they follow every cut and
+    /// move, and become chapters in the export.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub markers: Vec<Marker>,
+}
+
+/// A named place in the film: a chapter.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Marker {
+    /// Source seconds of the clip's media.
+    pub at: f64,
+    #[serde(default)]
+    pub name: String,
+}
+
+fn is_zero(v: &f64) -> bool {
+    v.abs() < 1e-9
 }
 
 fn is_default_pip(p: &Pip) -> bool {
@@ -494,6 +519,8 @@ impl Clip {
             voice: 0,
             desktop_volume: 1.0,
             pip: Pip::default(),
+            audio_offset: 0.0,
+            markers: Vec::new(),
         }
     }
 
@@ -562,6 +589,19 @@ pub struct Project {
     /// Caption text size: 0 small, 1 medium, 2 large.
     #[serde(default = "one_u8")]
     pub caption_size: u8,
+    /// Lanes switched off, in the preview and the export alike.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub hide_titles: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub hide_camera: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub mute_sound: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub mute_music: bool,
+}
+
+fn is_false(v: &bool) -> bool {
+    !*v
 }
 
 fn one_u8() -> u8 {
@@ -620,6 +660,10 @@ impl Default for Project {
             duck: 1,
             logo: None,
             caption_size: 1,
+            hide_titles: false,
+            hide_camera: false,
+            mute_sound: false,
+            mute_music: false,
         }
     }
 }
@@ -724,6 +768,17 @@ impl Project {
                 area[2] = area[2].clamp(0.0, 100.0 - area[0]);
                 area[3] = area[3].clamp(0.0, 100.0 - area[1]);
             }
+        }
+        for i in 0..self.clips.len() {
+            let o = self.audio_offset_limits(i);
+            let c = &mut self.clips[i];
+            c.audio_offset = if c.audio_offset.is_finite() {
+                c.audio_offset.clamp(o.0, o.1)
+            } else {
+                0.0
+            };
+            c.markers.retain(|m| m.at.is_finite());
+            c.markers.sort_by(|a, b| a.at.total_cmp(&b.at));
         }
         self.loudness = self.loudness.min(3);
         self.duck = self.duck.min(2);
@@ -860,6 +915,126 @@ impl Project {
         }
     }
 
+    /// How far the sound may change over early (positive, a J cut) or late
+    /// (negative, an L cut) at the cut into clip `i`: within both clips and
+    /// never at a transition. (0, 0) when it cannot move.
+    pub fn audio_offset_limits(&self, i: usize) -> (f64, f64) {
+        if i == 0 || i >= self.clips.len() || self.clips[i].transition.is_some() {
+            return (0.0, 0.0);
+        }
+        let prev = &self.clips[i - 1];
+        let this = &self.clips[i];
+        // The sound cuts stay in order: leave the neighbouring cuts' own
+        // changes room, and a frame of sound to each clip.
+        let before = if i >= 2 {
+            prev.audio_offset.min(0.0)
+        } else {
+            0.0
+        };
+        let early = (prev.length() + before - 0.04).max(0.0);
+        let next = self
+            .clips
+            .get(i + 1)
+            .filter(|c| c.transition.is_none())
+            .map(|c| c.audio_offset.max(0.0))
+            .unwrap_or(0.0);
+        let late = (this.length() - next - 0.04).max(0.0);
+        (-late.min(10.0), early.min(10.0))
+    }
+
+    /// Where each clip's sound plays in the film: (from, to). Without J
+    /// and L cuts these are the clips' own places.
+    pub fn sound_spans(&self) -> Vec<(f64, f64)> {
+        let starts = self.starts();
+        let n = self.clips.len();
+        (0..n)
+            .map(|i| {
+                let a = starts[i] - self.clips[i].audio_offset;
+                let end = starts[i] + self.clips[i].length();
+                let b = match self.clips.get(i + 1) {
+                    Some(next) if next.transition.is_none() => end - next.audio_offset,
+                    _ => end,
+                };
+                (a, b.max(a))
+            })
+            .collect()
+    }
+
+    pub fn has_split_cuts(&self) -> bool {
+        self.clips.iter().any(|c| c.audio_offset.abs() > 1e-9)
+    }
+
+    /// Every marker that shows in the film: (film time, name, clip, index
+    /// in the clip), in order.
+    pub fn film_markers(&self) -> Vec<(f64, String, usize, usize)> {
+        let starts = self.starts();
+        let mut out = Vec::new();
+        for (i, clip) in self.clips.iter().enumerate() {
+            for (k, m) in clip.markers.iter().enumerate() {
+                if m.at < clip.start - 1e-6 || m.at > clip.end + 1e-6 {
+                    continue;
+                }
+                let t = starts[i] + (m.at - clip.start) / clip.speed.max(0.01);
+                out.push((t, m.name.clone(), i, k));
+            }
+        }
+        out.sort_by(|a, b| a.0.total_cmp(&b.0));
+        out
+    }
+
+    /// Put a marker at a film time; returns its film time.
+    pub fn add_marker(&mut self, time: f64, name: String) -> Option<f64> {
+        let (i, local) = self.locate(time)?;
+        let clip = &mut self.clips[i];
+        let at = clip.source_at(local);
+        if clip.markers.iter().any(|m| (m.at - at).abs() < 0.02) {
+            return None;
+        }
+        clip.markers.push(Marker { at, name });
+        clip.markers.sort_by(|a, b| a.at.total_cmp(&b.at));
+        Some(time)
+    }
+
+    /// The markers as chapters: the first starts at 0, and each is at
+    /// least `min` seconds long (closer ones are skipped).
+    pub fn chapters(&self, min: f64) -> Vec<(f64, f64, String)> {
+        let d = self.duration();
+        let mut marks: Vec<(f64, String)> = Vec::new();
+        for (t, name, _, _) in self.film_markers() {
+            if t >= d - min {
+                continue;
+            }
+            if marks.last().is_some_and(|(p, _)| t - p < min) {
+                continue;
+            }
+            marks.push((t, name));
+        }
+        if marks.is_empty() {
+            return Vec::new();
+        }
+        if marks[0].0 > 0.5 {
+            if marks[0].0 < min {
+                marks[0].0 = 0.0;
+            } else {
+                marks.insert(0, (0.0, "Start".into()));
+            }
+        } else {
+            marks[0].0 = 0.0;
+        }
+        let n = marks.len();
+        (0..n)
+            .map(|k| {
+                let end = if k + 1 < n { marks[k + 1].0 } else { d };
+                let name = if marks[k].1.trim().is_empty() {
+                    format!("Chapter {}", k + 1)
+                } else {
+                    marks[k].1.trim().to_string()
+                };
+                (marks[k].0, end, name)
+            })
+            .collect()
+    }
+
     /// The one title card media of the project.
     pub fn card(&mut self) -> usize {
         if let Some(i) = self.media.iter().position(Media::is_card) {
@@ -904,6 +1079,7 @@ impl Project {
         right.start = cut;
         right.transition = None;
         right.fade_in = 0.0;
+        right.audio_offset = 0.0;
         self.clips[i].end = cut;
         self.clips[i].fade_out = 0.0;
         self.clips.insert(i + 1, right);
@@ -1104,5 +1280,45 @@ mod tests {
         assert_eq!(window(1.0, 0.0, 5.0), (1.0, 5.0));
         assert_eq!(window(1.0, 2.0, 5.0), (1.0, 3.0));
         assert_eq!(window(7.0, 2.0, 5.0), (5.0, 5.0));
+    }
+
+    #[test]
+    fn sound_cuts_stay_inside_their_neighbours() {
+        let mut p = project(&[10.0, 6.0, 4.0]);
+        assert_eq!(p.audio_offset_limits(0), (0.0, 0.0));
+        let (lo, hi) = p.audio_offset_limits(1);
+        assert!((hi - 9.96).abs() < 1e-9 && (lo + 5.96).abs() < 1e-9);
+        p.clips[1].audio_offset = 2.0;
+        p.clips[2].audio_offset = -1.0;
+        let spans = p.sound_spans();
+        assert_eq!(spans[0], (0.0, 8.0));
+        assert_eq!(spans[1], (8.0, 17.0));
+        assert_eq!(spans[2], (17.0, 20.0));
+        // Far past a neighbour is pulled back; a transition has none.
+        p.clips[2].audio_offset = -9.0;
+        p.repair();
+        assert!((p.clips[2].audio_offset + 3.96).abs() < 1e-9);
+        p.clips[2].transition = Some(Transition::Fade);
+        p.repair();
+        assert_eq!(p.clips[2].audio_offset, 0.0);
+        // A split starts the right half with the picture.
+        p.split(12.0);
+        assert_eq!(p.clips[2].audio_offset, 0.0);
+    }
+
+    #[test]
+    fn markers_follow_their_clip() {
+        let mut p = project(&[10.0, 6.0]);
+        assert!(p.add_marker(12.0, "B".into()).is_some());
+        assert!(p.add_marker(12.0, "again".into()).is_none());
+        p.clips.swap(0, 1);
+        let m = p.film_markers();
+        assert_eq!(m.len(), 1);
+        assert!((m[0].0 - 2.0).abs() < 1e-9 && m[0].1 == "B");
+        // Cut away, it is gone from the film; a split keeps it in its half.
+        p.split(1.0);
+        assert_eq!(p.film_markers().len(), 1);
+        p.clips[1].start = 3.0;
+        assert!(p.film_markers().is_empty());
     }
 }
