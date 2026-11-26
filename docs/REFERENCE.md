@@ -46,14 +46,30 @@ before the screen input.
 
 ### Overlay
 
-The overlay height is a share of the output height: `small` 20 %, `medium`
-26 % (default), `large` 34 %, at the camera's aspect ratio (a circle is a
+The overlay height is a share of the output height: `tiny` 16 %, `small`
+20 %, `medium` 26 % (default), `large` 34 %, at the camera's aspect ratio (a circle is a
 centre crop), never wider than 45 % of the video, with a margin of 2.5 % of
 the height. Shapes are `rounded` (default), `circle` and `rect`; the border
 is a thin ring (about 1 % of the overlay height) in the NIRUX theme accent
 (`camera_border = "theme"`), a fixed colour, or `none`. The shape mask and
 the ring are generated once per recording, so a shaped overlay costs no more
 than a plain one. `--mirror` flips the camera horizontally.
+
+The screen is converted to yuv420p before the overlay and the overlay is
+blended in yuv420p (`overlay=…:format=yuv420`). Until 0.13 the overlay ran
+with `format=auto`, which blended the whole 1080p picture in RGB and
+converted it afterwards: in a 10 s test that cost 25 s of CPU time against 9 s
+now, for the same picture (a 1080p30 screen with a camera went from about 4
+cores to about 1.6 to 2 cores with software encoding).
+
+`--camera-preview` (for presenter views such as NIRUPRES Talk mode) keeps a
+small live colour picture of the camera as it is placed in the recording:
+the overlay's framing, 320 pixels wide, as a binary PPM in the runtime
+directory (tmpfs, next to the live picture check), replaced atomically for
+every camera frame. Its path is the optional `camera_preview` field of the
+state file; the file is removed when the recording ends. It needs a camera
+overlay drawn into the picture (`--webcam corner` with `burned` or `both`),
+and a preview that cannot be written never costs the recording.
 
 ### The camera on its own track
 
@@ -165,9 +181,56 @@ and after two minutes.
 
 `--full` and an overlay use the primary connected RandR output at its real X11
 origin; `--screen OUTPUT` chooses another connected output. `--region` asks for
-a rectangle with `slop`. `--window` currently records a selected static
-rectangle; it does not follow a window that moves or resizes. `--webcam-only`
-does not need a usable X11 screen geometry.
+a rectangle with `slop`. `--window` records a selected static rectangle; it
+does not follow a window that moves or resizes. `--webcam-only` does not need
+a usable X11 screen geometry.
+
+### Window content (`--window-id`)
+
+`--window-id ID` (decimal or `0x` hex, as `xdotool` or `xwininfo` print it)
+records the content of one X window instead of a part of the screen. It is
+what NIRUPRES Talk mode uses to record the slides without the presenter view.
+
+- The window is redirected with the X Composite extension (`Automatic`, so it
+  still shows on screen exactly as before and no compositor is needed) and
+  its off-screen pixmap is read with MIT-SHM (plain GetImage without it).
+  The picture is the window's own, also while it is covered by other windows,
+  on a hidden workspace, partly or wholly outside every screen, or with a
+  presenter view on top of it. Its child windows (an embedded mpv) are part
+  of it. Once a window is redirected its owner is asked to repaint with a
+  synthetic Expose, so a window that was covered does not start with stale
+  content.
+- The X Damage extension tells NIRUCLIP when the window changed: a still slide
+  is read once, not 30 times a second.
+- A grabber thread follows the window and publishes the newest picture; a
+  writer thread sends one raw `bgr0` frame every 1/30 s to ffmpeg through a
+  FIFO in the state directory (`-f rawvideo -use_wallclock_as_timestamps 1`,
+  a 32-packet queue). The frames carry wall-clock timestamps like x11grab,
+  `-ts abs` (camera) and pulse, so window, camera and microphone share one
+  clock. A busy X server only repeats the last picture; it never starves
+  ffmpeg. Every ffmpeg segment (pause and resume, a camera reconnect) opens
+  the FIFO again.
+- The stream keeps the window's size at the start (rounded down to even
+  values; the `share` and `small` presets scale it like a screen). A window
+  that is resized later is fitted into that size, centred with black bars,
+  so the recording never changes size halfway. A window that is unmapped
+  keeps its last picture.
+- When the window is destroyed (or the X connection breaks) the recording
+  stops and is saved like after `--stop`, with the reason in the state file.
+  If NIRUCLIP itself is killed, ffmpeg sees the end of the FIFO and finishes
+  the file, which `--recover` then keeps.
+- The optional state field `window` holds the window id, and
+  `capture_started` the Unix time of the first recorded frame (the zero of the
+  recording's timeline; `started` is when the countdown began). NIRUPRES
+  measures its slide chapters from it.
+- Only 24 and 32 bit windows (the usual TrueColor visuals) are supported; the
+  root window is refused (use `--full`).
+
+Cost at 1080p30 with software encoding (a still window, measured in Xvfb on
+an i7-1165G7): the capture threads use about 6 to 10 % of one core, ffmpeg
+about 135 % without and 156 % with a camera overlay; recording the same
+screen with x11grab costs about 141 % and 197 %. A window whose content
+changes every frame adds the X server's copy (about 10 %).
 
 The `share` (up to 1080p) and `small` (up to 720p) presets avoid upscaling a
 smaller screen. `quality` keeps the screen dimensions, rounded down to even
@@ -245,6 +308,10 @@ preset), the microphone, recorded time (excluding pauses), size so far, encoder 
 fps and the performance counters, a drop warning, the output path, the number of
 segments and the reason. It warns when the captured stream is losing more than
 2 % frames or duplicating more than 5 %; NIRUBAR shows the same warning.
+
+Since 0.14 the optional `window`, `capture_started` and `camera_preview`
+fields describe a window recording, the start of the timeline and the
+camera preview (see [Window content](#window-content---window-id)).
 
 `--status --json` prints the stored session plus the derived
 `elapsed_seconds`, `size_bytes` and `drop_warning` fields (all optional).

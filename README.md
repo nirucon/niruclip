@@ -25,7 +25,9 @@ sources are never changed. See [Editing](#editing).
 
 ## Features
 
-- Full screen, region, window rectangle or camera-only recording.
+- Full screen, region, window rectangle, the content of one window
+  (`--window-id`, also while it is covered or off screen) or camera-only
+  recording.
 - Microphone, desktop audio or both (mixed at unity gain with a peak limiter,
   and also kept on tracks of their own, titled Mic and Desktop, so the
   editor can treat the voice alone).
@@ -123,13 +125,14 @@ niruclip --share
 
 | Option | Values |
 |---|---|
-| Mode | `--full`, `--region`, `--window`, `--webcam-only` |
+| Mode | `--full`, `--region`, `--window`, `--window-id ID`, `--webcam-only` |
 | Audio | `--audio none`, `mic`, `desktop`, `both` |
 | Microphone | `--mic SOURCE` or `default` (default: the system default source); `--list-mics [--json]` |
 | Microphone inputs | `--mic-channels N` (one input as mono), `N,M` (a pair as stereo) or `all` (default: the source as before) |
 | Camera | `--webcam off`, `corner`, `only` |
 | Corner | `--corner top-left`, `top-right`, `bottom-left`, `bottom-right` |
-| Camera size | `--webcam-size small`, `medium` (default), `large`: 20, 26 or 34 % of the video height |
+| Camera size | `--webcam-size tiny`, `small`, `medium` (default), `large`: 16, 20, 26 or 34 % of the video height |
+| Camera preview | `--camera-preview`: a small live picture of the camera for a presenter view (path in `--status --json`) |
 | Camera device | `--camera DEVICE` or `auto` (default: a plugged-in camera (USB, dock) before the computer's own, infrared sensors skipped) |
 | Camera shape | `--camera-shape rounded` (default), `circle`, `rect` |
 | Camera border | `--camera-border theme` (default), `none`, or a hex colour such as `8aa87e` |
@@ -144,8 +147,15 @@ niruclip --share
 | Profile | `--profile NAME` |
 | Notifications | `--no-notify` |
 
-`--full` records the primary RandR output. `--window` currently records a
-selected static rectangle; it does not follow a window that moves or resizes.
+`--full` records the primary RandR output. `--window` records a selected
+static rectangle; it does not follow a window that moves or resizes.
+`--window-id ID` records the content of one X window through the Composite
+extension: the window's own picture, also while other windows cover it or it
+is outside every screen, on the same clock as the camera and the microphone.
+A resized window is fitted into the size it had at the start, and when the
+window closes the recording is saved. NIRUPRES Talk mode uses it to record the
+slides without the presenter view. Details in
+[docs/REFERENCE.md](docs/REFERENCE.md#window-content---window-id).
 
 Recordings go to `~/Videos/NIRUCLIP-YYYY-MM-DD_HH-MM-SS.mkv` unless
 `NIRUCLIP_OUTPUT` or `--output` says otherwise. Existing files are never
@@ -364,7 +374,7 @@ mic = "UMC1820"             # optional; absent means the system default source
 mic_channels = "1,2"        # optional: N (mono), N,M (stereo) or all
 webcam = "off"              # off, corner, only
 corner = "bottom-right"
-webcam_size = "medium"      # small, medium, large
+webcam_size = "medium"      # tiny, small, medium, large
 preset = "share"            # share, small, quality
 countdown = 3
 screen = "DisplayPort-0"    # optional
@@ -509,8 +519,8 @@ and display matrix is run on a graphical test machine.
 ## Status, disclaimer and how it's made
 
 **Status: alpha.** Recording, pause/resume and recovery work on my machines,
-but `--window` is still a static rectangle and the camera/audio matrix depends a
-lot on hardware.
+but `--window` is still a static rectangle (`--window-id` follows one window's
+content) and the camera/audio matrix depends a lot on hardware.
 
 NIRUX and every niru* project are made by me, Nicklas Rudolfsson
 ([@nirucon](https://github.com/nirucon)), for me. They are tailored to my own

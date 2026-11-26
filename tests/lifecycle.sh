@@ -312,7 +312,7 @@ grep -q 'scale=1728:1080' "$TMP/args.log"
 # rounded with a border, 28 px from the top-left corner.
 grep -q 'scale=654:368:force_original_aspect_ratio=increase:flags=bicubic,crop=654:368' "$TMP/args.log"
 grep -q 'alphamerge' "$TMP/args.log"
-grep -q 'overlay=28:28:format=auto' "$TMP/args.log"
+grep -q 'overlay=28:28:format=yuv420' "$TMP/args.log"
 # One capture clock: absolute camera timestamps, -copyts, a global zero shift.
 grep -A1 -x -- '-ts' "$TMP/args.log" | grep -qx abs
 grep -qx -- '-copyts' "$TMP/args.log"

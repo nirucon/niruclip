@@ -2,6 +2,7 @@ mod camera;
 mod edit;
 mod mic;
 mod sound;
+mod window;
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -14,7 +15,7 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const VERSION: &str = "0.13.1";
+const VERSION: &str = "0.14.0";
 const SCHEMA: u32 = 1;
 const ACTIVE_STATES: &[&str] = &[
     "countdown",
@@ -213,6 +214,7 @@ impl Corner {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Size {
+    Tiny,
     Small,
     Medium,
     Large,
@@ -221,17 +223,19 @@ enum Size {
 impl Size {
     fn parse(value: &str) -> Result<Self, String> {
         match value {
+            "tiny" => Ok(Self::Tiny),
             "small" => Ok(Self::Small),
             "medium" => Ok(Self::Medium),
             "large" => Ok(Self::Large),
             _ => Err(format!(
-                "webcam-size must be small, medium or large: {value}"
+                "webcam-size must be tiny, small, medium or large: {value}"
             )),
         }
     }
 
     fn as_str(self) -> &'static str {
         match self {
+            Self::Tiny => "tiny",
             Self::Small => "small",
             Self::Medium => "medium",
             Self::Large => "large",
@@ -241,6 +245,9 @@ impl Size {
     /// Camera overlay height as a share of the output height.
     fn height_share(self) -> f64 {
         match self {
+            // About 16 % of the width of a 16:9 picture: small enough to
+            // stay clear of slide content (NIRUPRES Talk mode).
+            Self::Tiny => 0.16,
             Self::Small => 0.20,
             Self::Medium => 0.26,
             Self::Large => 0.34,
@@ -344,6 +351,15 @@ struct Options {
     countdown: u64,
     output: Option<PathBuf>,
     screen: Option<String>,
+    /// `--window-id`: record this window's content (Composite).
+    window_id: Option<u32>,
+    /// Resolved at start: the FIFO the window frames arrive in and the
+    /// stream size.
+    window_fifo: Option<PathBuf>,
+    window_size: Option<(u32, u32)>,
+    /// `--camera-preview`: keep a small live colour picture of the camera
+    /// (as it is placed in the recording) for a presenter view.
+    camera_preview: bool,
     /// Camera device; None picks the first regular capture camera.
     camera: Option<String>,
     camera_shape: camera::Shape,
@@ -399,6 +415,10 @@ impl Default for Options {
             countdown: 3,
             output: None,
             screen: None,
+            window_id: None,
+            window_fifo: None,
+            window_size: None,
+            camera_preview: false,
             camera: None,
             camera_shape: camera::Shape::Rounded,
             camera_mirror: false,
@@ -1020,6 +1040,18 @@ struct Session {
     /// The microphone in use (audio mic or both) and any fallback.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     mic: Option<mic::MicStatus>,
+    /// `--window-id`: the recorded window (hexadecimal X id).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    window: Option<String>,
+    /// Unix time of the first recorded frame: the zero of the recording's
+    /// timeline (`started` is when the countdown began). Slide markers and
+    /// chapters are measured from here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    capture_started: Option<f64>,
+    /// `--camera-preview`: a small PPM of the camera as it is placed in the
+    /// recording, replaced atomically about 30 times a second.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    camera_preview: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1098,6 +1130,9 @@ impl Session {
             camera: None,
             camera_events: None,
             mic: None,
+            window: None,
+            capture_started: None,
+            camera_preview: None,
         }
     }
 
@@ -1583,6 +1618,8 @@ struct CaptureInputs {
     /// reconnect or reopen in another mode) are scaled and padded to it so
     /// they join losslessly.
     fixed_output: Option<(u32, u32)>,
+    /// `--camera-preview` output (a PPM in the runtime directory).
+    preview: Option<PathBuf>,
 }
 
 /// Packets each live input may queue while the filter graph is busy. 8 (screen)
@@ -1742,6 +1779,13 @@ fn capture_input(resolved: &Options, display: &str) -> Result<CaptureInputs, Str
         };
     let geometry = if resolved.mode == Mode::WebcamOnly {
         None
+    } else if let Some((width, height)) = resolved.window_size {
+        Some(Geometry {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        })
     } else if resolved.mode == Mode::Region || resolved.mode == Mode::Window {
         Some(slop_geometry()?)
     } else {
@@ -1787,7 +1831,13 @@ fn assemble_inputs(
             }
             screen_index = Some(video_inputs);
             video_inputs += 1;
-            argv.extend(screen_input(display, geometry));
+            match &resolved.window_fifo {
+                Some(fifo) => argv.extend(window::ffmpeg_input(
+                    fifo,
+                    (geometry.width, geometry.height),
+                )),
+                None => argv.extend(screen_input(display, geometry)),
+            }
         }
         Mode::WebcamOnly => {
             let found = found
@@ -1808,6 +1858,7 @@ fn assemble_inputs(
         camera_mode,
         camera_status,
         fixed_output: None,
+        preview: None,
     })
 }
 
@@ -2183,14 +2234,29 @@ fn build_plan(
                 border.is_some(),
             );
             let (ow, oh) = (overlay.width, overlay.height);
+            // The screen is converted to the encoder's yuv420p once, before
+            // the overlay: with format=auto the overlay blended the whole
+            // picture in RGB and converted it afterwards, which cost about
+            // 2.5 cores at 1080p30 (measured: 25 s against 9 s of CPU for
+            // 10 s of video) for the same picture.
             filters.push(format!(
-                "[{screen_index}:v]scale={out_width}:{out_height}:flags=bicubic,setsar=1[base]"
+                "[{screen_index}:v]scale={out_width}:{out_height}:flags=bicubic,format=yuv420p,setsar=1[base]"
             ));
             // Fill the box and crop the rest: correct for any camera aspect,
             // and a centre crop for the circle.
-            filters.push(format!(
-                "[{source}]{mirror}scale={ow}:{oh}:force_original_aspect_ratio=increase:flags=bicubic,crop={ow}:{oh},setsar=1[wc]"
-            ));
+            if preview_output(capture) {
+                // The presenter's live picture: the same framing as the
+                // overlay, small and in colour.
+                let (pw, ph) = preview_size(ow, oh);
+                filters.push(format!(
+                    "[{source}]{mirror}scale={ow}:{oh}:force_original_aspect_ratio=increase:flags=bicubic,crop={ow}:{oh},setsar=1,split=2[wc][pvsrc];\
+                     [pvsrc]scale={pw}:{ph}:flags=bilinear,format=rgb24[preview]"
+                ));
+            } else {
+                filters.push(format!(
+                    "[{source}]{mirror}scale={ow}:{oh}:force_original_aspect_ratio=increase:flags=bicubic,crop={ow}:{oh},setsar=1[wc]"
+                ));
+            }
             filters.extend(camera::shape_filters(
                 "wc",
                 "wco",
@@ -2198,7 +2264,7 @@ fn build_plan(
                 border.unwrap_or((0, 0, 0)),
             ));
             filters.push(format!(
-                "[base][wco]overlay={}:{}:format=auto[{vout}]",
+                "[base][wco]overlay={}:{}:format=yuv420[{vout}]",
                 overlay.x, overlay.y
             ));
         } else if resolved.webcam == Webcam::Corner && resolved.camera_track.track() {
@@ -2219,6 +2285,19 @@ fn build_plan(
     finish_plan(
         resolved, capture, partial, probe, encoder, argv, filters, width, height,
     )
+}
+
+/// Whether this segment writes the `--camera-preview` picture: only with a
+/// camera overlay drawn into the picture.
+fn preview_output(capture: &CaptureInputs) -> bool {
+    capture.preview.is_some() && capture.camera_index.is_some() && capture.screen_index.is_some()
+}
+
+/// The preview size: 320 pixels wide (even), the overlay's aspect.
+fn preview_size(width: u32, height: u32) -> (u32, u32) {
+    let pw = 320u32;
+    let ph = even(((pw as f64) * (height.max(1) as f64) / (width.max(1) as f64)).round() as u32);
+    (pw, ph)
 }
 
 /// Whether this recording has the camera on a track of its own.
@@ -2411,6 +2490,22 @@ fn finish_plan(
             path.display().to_string(),
         ]);
     }
+    let overlay_drawn = resolved.webcam == Webcam::Corner && resolved.camera_track.burned();
+    if let (Some(path), true, true) = (&capture.preview, preview_output(capture), overlay_drawn) {
+        argv.extend([
+            "-map".into(),
+            "[preview]".into(),
+            "-f".into(),
+            "image2".into(),
+            "-update".into(),
+            "1".into(),
+            "-atomic_writing".into(),
+            "1".into(),
+            "-c:v".into(),
+            "ppm".into(),
+            path.display().to_string(),
+        ]);
+    }
     Ok(Plan {
         argv,
         env,
@@ -2548,6 +2643,16 @@ fn parse_args(argv: &[String], config: &Config) -> Result<Options, String> {
             "--full" => options.mode = Mode::Full,
             "--region" => options.mode = Mode::Region,
             "--window" => options.mode = Mode::Window,
+            "--window-id" => {
+                let value = next()?;
+                options.window_id = Some(
+                    window::parse_id(&value)
+                        .ok_or_else(|| format!("--window-id needs an X window id: {value}"))?,
+                );
+                options.mode = Mode::Window;
+                index += 1;
+            }
+            "--camera-preview" => options.camera_preview = true,
             "--webcam-only" => {
                 options.mode = Mode::WebcamOnly;
                 options.webcam = Webcam::Only;
@@ -2697,7 +2802,7 @@ fn parse_args(argv: &[String], config: &Config) -> Result<Options, String> {
 fn help() {
     println!(
         "NIRUCLIP {VERSION}\n\
-Usage: niruclip --full|--region|--window|--webcam-only [options]\n\
+Usage: niruclip --full|--region|--window|--window-id ID|--webcam-only [options]\n\
        niruclip --stop | --pause | --resume | --status [--json] | --recover\n\
        niruclip --list-profiles | --save-profile NAME | --list-mics [--json]\n\
        niruclip --check-camera | --preview\n\
@@ -2711,7 +2816,12 @@ Options:\n\
   --list-mics [--json]              list microphones and their channels (* = default)\n\
   --webcam off|corner|only          camera placement\n\
   --corner top-left|top-right|bottom-left|bottom-right\n\
-  --webcam-size small|medium|large  camera height: 20, 26 or 34 % of the video\n\
+  --window-id ID                    record the content of one X window (decimal or\n\
+                                    0x hex), also while it is covered or off screen\n\
+  --webcam-size tiny|small|medium|large  camera height: 16, 20, 26 or 34 %\n\
+                                    of the video\n\
+  --camera-preview                  keep a small live picture of the camera for a\n\
+                                    presenter view (path in --status --json)\n\
   --camera DEVICE|auto              camera device (auto skips IR sensors)\n\
   --camera-shape rounded|circle|rect\n\
   --camera-border theme|none|RRGGBB thin border around the camera\n\
@@ -2812,6 +2922,9 @@ fn status(options: &Options) {
             ", audio {}, preset {}",
             session.audio, session.preset
         ));
+        if let Some(window) = &session.window {
+            mode.push_str(&format!(", window {window}"));
+        }
         println!("mode: {mode}");
     }
     if let Some(elapsed) = elapsed {
@@ -3023,7 +3136,23 @@ fn record(options: Options, camera: &mut Option<CameraRestore>) -> Result<(), St
     let ffmpeg = command_path("ffmpeg", "NIRUCLIP_FFMPEG");
     let mut options = options;
     let mic_status = resolve_microphone(&mut options, &ffmpeg);
-    let capture = capture_input(&options, display.as_deref().unwrap_or_default())?;
+    // --window-id: redirect the window and start reading it before ffmpeg
+    // is planned; the stream size is the window size now.
+    let window_capture = match options.window_id {
+        Some(id) => {
+            let fifo = state_dir().join(format!("window-{}.fifo", std::process::id()));
+            let capture = window::Capture::start(id, &fifo)?;
+            options.window_fifo = Some(capture.fifo.clone());
+            options.window_size = Some(capture.size);
+            Some(capture)
+        }
+        None => None,
+    };
+    let mut capture = capture_input(&options, display.as_deref().unwrap_or_default())?;
+    if options.camera_preview {
+        capture.preview = capture.camera_index.and_then(|_| preview_path());
+    }
+    let _preview_file = RemoveOnDrop(capture.preview.clone());
     let selection = select_encoder(options.encoder, &ffmpeg);
     let probe = capture.camera_index.and_then(|_| probe_path());
     let plan = build_plan(
@@ -3066,6 +3195,12 @@ fn record(options: Options, camera: &mut Option<CameraRestore>) -> Result<(), St
         camera: capture.camera_status.clone(),
         camera_events: None,
         mic: mic_status,
+        window: options.window_id.map(|id| format!("0x{id:x}")),
+        capture_started: None,
+        camera_preview: capture
+            .preview
+            .as_ref()
+            .map(|path| path.display().to_string()),
     };
     write_state(&session)?;
     if let Some(status) = session.camera.as_ref().filter(|status| status.problem()) {
@@ -3140,9 +3275,11 @@ fn record(options: Options, camera: &mut Option<CameraRestore>) -> Result<(), St
         }
     }
     let recovery = options.recovery;
+    let preview_wanted = capture.preview.clone();
     let mut recorder = Recorder {
         options: &options,
         capture,
+        preview_wanted,
         ffmpeg,
         encoder: selection.encoder,
         progress: progress_path.clone(),
@@ -3192,6 +3329,7 @@ fn record(options: Options, camera: &mut Option<CameraRestore>) -> Result<(), St
     }];
     // Before ffmpeg starts, so the chime is never in the recording.
     sound::play(&options, "record-start");
+    let spawned = now();
     let mut child = match recorder.start_segment(&mut session, &partial)? {
         SegmentStart::Running(child) => child,
         SegmentStart::Failed {
@@ -3223,6 +3361,15 @@ fn record(options: Options, camera: &mut Option<CameraRestore>) -> Result<(), St
         // Later segments (a reconnect or a reopen in another mode) keep this
         // size, so every part joins losslessly.
         recorder.capture.fixed_output = Some((session.width, session.height));
+    }
+    // The zero of the timeline: the first window frame ffmpeg read, or
+    // about when ffmpeg opened the screen and camera.
+    session.capture_started = window_capture
+        .as_ref()
+        .and_then(window::Capture::first_frame)
+        .or(Some(spawned));
+    if recorder.capture.preview.is_none() {
+        session.camera_preview = None;
     }
     if SIGNAL.load(Ordering::SeqCst) == 0 {
         session.state = "recording".into();
@@ -3399,6 +3546,18 @@ fn record(options: Options, camera: &mut Option<CameraRestore>) -> Result<(), St
                     );
                     return Err(format!("could not wait for ffmpeg: {error}"));
                 }
+            }
+            if let Some(window) = window_capture.as_ref().filter(|window| window.gone()) {
+                let message = window
+                    .reason()
+                    .unwrap_or_else(|| "the recorded window was closed".into());
+                // Closing the window is how an app such as NIRUPRES ends
+                // its recording too: the same "Saving…" as --stop; the
+                // reason stays in the session (--status).
+                eprintln!("niruclip: {message}; saving");
+                notify(&options, "NIRUCLIP", "Saving…");
+                stop_reason = Some(message);
+                break;
             }
             if disk.due() {
                 match disk.check() {
@@ -4506,6 +4665,8 @@ struct Recorder<'a> {
     display: String,
     /// The probe path to use again when a camera is re-attached.
     probe_wanted: Option<PathBuf>,
+    /// The camera preview path to use again when a camera is re-attached.
+    preview_wanted: Option<PathBuf>,
 }
 
 impl Recorder<'_> {
@@ -4531,6 +4692,7 @@ impl Recorder<'_> {
             status,
         )?;
         self.capture.fixed_output = fixed_output;
+        self.capture.preview = self.preview_wanted.clone().filter(|_| attach);
         self.probe = if attach {
             self.probe_wanted.clone()
         } else {
@@ -4650,6 +4812,23 @@ fn probe_path() -> Option<PathBuf> {
         .chain(std::iter::once(PathBuf::from("/dev/shm")))
         .find(|dir| dir.is_dir() && on_tmpfs(dir))
         .map(|dir| dir.join(format!("niruclip-{}.pgm", std::process::id())))
+}
+
+/// The `--camera-preview` file, next to the live picture check (tmpfs).
+fn preview_path() -> Option<PathBuf> {
+    probe_path()
+        .map(|probe| probe.with_file_name(format!("niruclip-{}-preview.ppm", std::process::id())))
+}
+
+/// Removes a file when the recording ends, however it ends.
+struct RemoveOnDrop(Option<PathBuf>);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        if let Some(path) = &self.0 {
+            let _ = fs::remove_file(path);
+        }
+    }
 }
 
 fn on_tmpfs(dir: &Path) -> bool {
@@ -4986,6 +5165,11 @@ impl Recorder<'_> {
             if let Some(probe) = &self.probe {
                 let _ = fs::remove_file(probe);
             }
+            // ffmpeg runs with -n: a preview left by the previous segment
+            // would stop this one.
+            if let Some(preview) = &self.capture.preview {
+                let _ = fs::remove_file(preview);
+            }
             let plan = build_plan(
                 self.options,
                 &self.capture,
@@ -5040,6 +5224,34 @@ impl Recorder<'_> {
                         session.fallback = Some(reason);
                         retried = true;
                         continue;
+                    }
+                    // Neither may the presenter's camera preview.
+                    if let (Some(preview), false) = (&self.capture.preview, valid) {
+                        let name = preview
+                            .file_name()
+                            .map(|name| name.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                        // Only a failure to write the preview itself; a camera
+                        // that failed to open is handled by the recovery. It is
+                        // left out of this segment only.
+                        let unwritable = log_tail().is_some_and(|log| {
+                            log.contains(&name)
+                                && [
+                                    "Could not open",
+                                    "Error opening output",
+                                    "Permission denied",
+                                    "No such file or directory",
+                                    "Read-only file system",
+                                ]
+                                .iter()
+                                .any(|error| log.contains(error))
+                        });
+                        if unwritable {
+                            eprintln!("niruclip: camera preview unavailable; recording without it");
+                            let _ = fs::remove_file(path);
+                            self.capture.preview = None;
+                            continue;
+                        }
                     }
                     // The live picture check must never cost a recording:
                     // if ffmpeg could not write it, record without it.

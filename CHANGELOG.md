@@ -3,6 +3,33 @@
 All notable changes to NIRUCLIP. Earlier releases are described in their
 GitHub release notes and commit messages.
 
+## 0.14.0 (unreleased)
+
+### Added
+- **Window content capture**: `--window-id ID` records one X window's own
+  picture through the Composite extension (no compositor needed) with
+  MIT-SHM and Damage, also while it is covered by other windows or placed
+  outside every screen. Frames reach ffmpeg as raw video through a FIFO with
+  wall-clock timestamps, on one clock with the camera and the microphone; the
+  camera overlay, pause and resume, camera recovery and disk checks work as
+  with a screen. A resized window is fitted into its starting size with black
+  bars, and a window that closes ends the recording and saves it. NIRUPRES
+  3.1 Talk mode uses it to record only the slides.
+- `--webcam-size tiny`: a camera overlay of 16 % of the picture height.
+- `--camera-preview`: a small live colour picture of the camera as it is
+  placed in the recording, for a presenter view (state field
+  `camera_preview`).
+- State fields (optional): `window`, `capture_started` (the first recorded
+  frame, the zero of the timeline) and `camera_preview`. `--status` shows
+  the recorded window.
+
+### Changed
+- **A camera overlay costs much less CPU.** The screen is converted to
+  yuv420p before the overlay and the overlay is blended in yuv420p; with
+  `format=auto` the whole picture was blended in RGB. A 1080p30 screen with
+  a camera went from about 4 cores to about 2 with software encoding
+  (window capture: about 1.6).
+
 ## 0.13.1 (2026-11-25)
 
 The 0.13.0 tag was not released (a test needed ffmpeg on the build machine).
